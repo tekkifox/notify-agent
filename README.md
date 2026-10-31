@@ -86,12 +86,44 @@ calls a local MCP server, `mcp/oracle_query.py`, which exposes one tool:
 `query(sql)`. The server is Python 3 with `python-oracledb` in **thin mode**, so
 the image contains no Oracle client libraries and no JDK.
 
-The database side is read-only. The Oracle user has `SELECT` only on:
+The database side is read-only. For host statistics, query the view
+`NOTIFY_RO.HOST_STATS_V`. It has one row per sample, roughly every three minutes:
 
-- `ROSSMONEY."host-samples"` — one JSON document per sample in a `DATA` column,
-  roughly 937 rows and growing every three minutes. Fields: `hostLabel`,
-  `sampledAt`, `cpuAvg`, `memoryPercent`, `diskPercent`, `loadAvg`,
-  `processCount`, `networkRxMB`, `networkTxMB`, `swapPercent`.
+| Column | Meaning |
+| --- | --- |
+| `host_label` | Host name, for example `photos.rossmoney.me`. |
+| `sampled_at` | The time column (`TIMESTAMP WITH TIME ZONE`). |
+| `cpu_percent` | CPU usage percentage. |
+| `memory_percent` | Memory usage percentage. |
+| `disk_percent` | Disk usage percentage. |
+| `load_avg` | Load average. |
+| `process_count` | Number of processes. |
+| `swap_percent` | Swap usage percentage; may be null. |
+| `network_rx_mb` | Network received, in MB. |
+| `network_tx_mb` | Network transmitted, in MB. |
+
+Use aggregate functions for anything beyond a single reading. For example, peak
+disk and CPU per host over the last hour:
+
+```sql
+SELECT host_label,
+       MAX(disk_percent) AS max_disk_percent,
+       MAX(cpu_percent) AS max_cpu_percent,
+       COUNT(*) AS samples
+FROM NOTIFY_RO.HOST_STATS_V
+WHERE sampled_at >= SYSTIMESTAMP - INTERVAL '1' HOUR
+GROUP BY host_label
+ORDER BY max_disk_percent DESC;
+```
+
+The raw table `ROSSMONEY."host-samples"` stores each sample as a JSON document
+in a `DATA` column, so its rows are not the statistics shape. Do not query it
+for statistics; the view is the shape to query. The Oracle user has `SELECT`
+only on:
+
+- `NOTIFY_RO.HOST_STATS_V` — one row per sample, roughly every three minutes.
+- `ROSSMONEY."host-samples"` — the backing table; one JSON document per sample
+  in a `DATA` column, roughly 937 rows and growing every three minutes.
 - `ROSSMONEY."archview-sources"` — host/source metadata, 3 rows.
 
 A query against `ROSSMONEY.pages` fails with an Oracle privilege error. That
