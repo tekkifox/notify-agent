@@ -1,0 +1,26 @@
+# Supercronic crontab.
+#
+# Format: one line per schedule.
+#   <five cron fields>  <prompt passed to /app/scripts/run-prompt.sh>
+#
+# The five fields are minute, hour, day-of-month, month, day-of-week.
+# Times use the container's TZ (set TZ in stack.env; default is UTC).
+# Only edit this file and rebuild the image: it is baked in read-only at /app.
+# Schedules are trusted operator configuration, not user input.
+#
+# Working example: daily digest at 09:00.
+0 9 * * * /app/scripts/run-prompt.sh "Compose a short daily digest for the team. Use the heading 'Daily digest', list the standing items: review the board, check overnight alerts, and note any blockers. End with a reminder to update the board. Do not invent news or metrics. Send it now with notify.sh."
+#
+# More examples (uncomment one line per schedule):
+#
+# Weekdays at 17:30 - end-of-day wrap-up.
+# 30 17 * * 1-5 /app/scripts/run-prompt.sh "Compose a brief end-of-day wrap-up asking the team to close out their tasks and flag anything that needs attention tomorrow. Send it now with notify.sh."
+#
+# Every Monday at 08:30 - weekly planning reminder.
+# 30 8 * * 1 /app/scripts/run-prompt.sh "Compose a short Monday planning reminder: pick the top three priorities for the week and post them in the channel. Keep it under 300 characters. Send it now with notify.sh."
+#
+# First day of each month at 10:00 - monthly maintenance note.
+# 0 10 1 * * /app/scripts/run-prompt.sh "Compose a short monthly maintenance reminder to rotate credentials and review notification schedules. Send it now with notify.sh."
+#
+# Every hour at minute 5 - heartbeat (noisy; useful only while testing).
+# 5 * * * * /app/scripts/run-prompt.sh "Compose a one-line heartbeat message saying the notification agent is running. Send it now with notify.sh."
