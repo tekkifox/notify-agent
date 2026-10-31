@@ -342,5 +342,295 @@ class QueryExecutionTests(unittest.TestCase):
         self.assertNotIn("/wallet", text)
 
 
+class SearchInputTests(unittest.TestCase):
+    """Input handling for search_content, without a database."""
+
+    def test_limit_defaults_to_eight(self) -> None:
+        self.assertEqual(oracle_query.DEFAULT_SEARCH_LIMIT, 8)
+        self.assertEqual(oracle_query.clamp_limit(None), 8)
+
+    def test_limit_is_clamped_to_the_hard_ceiling(self) -> None:
+        self.assertEqual(oracle_query.MAX_SEARCH_LIMIT, 20)
+        self.assertEqual(oracle_query.clamp_limit(20), 20)
+        self.assertEqual(oracle_query.clamp_limit(21), 20)
+        self.assertEqual(oracle_query.clamp_limit(1000), 20)
+
+    def test_limit_has_a_floor_of_one(self) -> None:
+        self.assertEqual(oracle_query.clamp_limit(0), 1)
+        self.assertEqual(oracle_query.clamp_limit(-5), 1)
+
+    def test_limit_accepts_integers_and_numeric_strings(self) -> None:
+        self.assertEqual(oracle_query.clamp_limit(5), 5)
+        self.assertEqual(oracle_query.clamp_limit("12"), 12)
+
+    def test_unusable_limit_falls_back_to_the_default(self) -> None:
+        self.assertEqual(oracle_query.clamp_limit("many"), 8)
+        self.assertEqual(oracle_query.clamp_limit(object()), 8)
+        self.assertEqual(oracle_query.clamp_limit(True), 8)
+
+    def test_query_is_trimmed(self) -> None:
+        self.assertEqual(
+            oracle_query.prepare_search_query("  storage servers  "),
+            "storage servers",
+        )
+
+    def test_empty_or_non_string_query_is_rejected(self) -> None:
+        for query in (None, 42, ["storage"], "", "   "):
+            with self.subTest(query=query):
+                with self.assertRaises(oracle_query.SearchInputError):
+                    oracle_query.prepare_search_query(query)
+
+    def test_oversized_query_is_rejected_without_echoing_it(self) -> None:
+        query = "x" * (oracle_query.MAX_SEARCH_QUERY_CHARS + 1)
+        with self.assertRaises(oracle_query.SearchInputError) as caught:
+            oracle_query.prepare_search_query(query)
+        self.assertNotIn(query, str(caught.exception))
+
+    def test_tool_schema(self) -> None:
+        tool = oracle_query.SEARCH_TOOL
+        self.assertEqual(tool["name"], "search_content")
+        self.assertEqual(tool["inputSchema"]["required"], ["query"])
+        limit = tool["inputSchema"]["properties"]["limit"]
+        self.assertEqual(limit["default"], oracle_query.DEFAULT_SEARCH_LIMIT)
+        self.assertEqual(limit["minimum"], 1)
+        self.assertEqual(limit["maximum"], oracle_query.MAX_SEARCH_LIMIT)
+
+    def test_tools_list_exposes_both_tools(self) -> None:
+        with mock.patch.object(oracle_query, "_write") as write:
+            oracle_query._handle(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
+        message = write.call_args.args[0]
+        names = [tool["name"] for tool in message["result"]["tools"]]
+        self.assertEqual(names, ["query", "search_content"])
+
+    def test_query_text_is_never_the_sql(self) -> None:
+        # The search statement is fixed and uses :query as a bind. The text the
+        # model supplies must not be able to change the statement.
+        dangerous = "storage'); DROP TABLE ROSSMONEY.CONTENT_EMBEDDINGS; --"
+        self.assertNotIn(dangerous, oracle_query.SEARCH_SQL)
+        self.assertIn("ADMIN.EMBED_TEXT(:query)", oracle_query.SEARCH_SQL)
+        self.assertIn("FETCH FIRST :limit ROWS ONLY", oracle_query.SEARCH_SQL)
+        self.assertIn("VECTOR_DISTANCE", oracle_query.SEARCH_SQL)
+        self.assertIn("COSINE", oracle_query.SEARCH_SQL)
+
+
+class SearchExecutionTests(unittest.TestCase):
+    """Exercise search_content with a fake driver: binds, caps and errors."""
+
+    COLUMNS = [
+        ("KIND",),
+        ("SLUG",),
+        ("TITLE",),
+        ("SECTION",),
+        ("CHUNK",),
+        ("SOURCE_UPDATED",),
+        ("DISTANCE",),
+    ]
+
+    def _run(
+        self,
+        query: object = "storage servers",
+        limit: object = None,
+        rows: list[tuple[object, ...]] | None = None,
+        connect_error: BaseException | None = None,
+    ) -> tuple[str, bool, object]:
+        if rows is None:
+            rows = [
+                (
+                    "experience",
+                    "cv",
+                    "Platform support",
+                    "summary",
+                    "short chunk",
+                    "2026-01-01T00:00:00",
+                    0.666,
+                )
+            ]
+
+        class FakeCursor:
+            description = self.COLUMNS
+
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+                self.bind_sets: list[object] = []
+                self.fetch_size = 0
+
+            def execute(self, statement: str, binds: object = None) -> None:
+                self.statements.append(statement)
+                self.bind_sets.append(binds)
+
+            def fetchmany(self, size: int) -> list[tuple[object, ...]]:
+                self.fetch_size = size
+                return rows[:size]
+
+            def close(self) -> None:
+                pass
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.call_timeout = None
+                self.rolled_back = False
+                self.closed = False
+                self.cursor_instance = FakeCursor()
+
+            def cursor(self) -> FakeCursor:
+                return self.cursor_instance
+
+            def rollback(self) -> None:
+                self.rolled_back = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake = types.ModuleType("oracledb")
+        fake.defaults = types.SimpleNamespace(fetch_lobs=True)
+        connection = FakeConnection()
+
+        def connect(**kwargs: object) -> FakeConnection:
+            if connect_error is not None:
+                raise connect_error
+            fake.connect_kwargs = kwargs
+            return connection
+
+        fake.connect = connect
+
+        config = oracle_query._Config("user", "password", "dsn", "/wallet")
+        with mock.patch.dict(sys.modules, {"oracledb": fake}), mock.patch.object(
+            oracle_query, "_config", return_value=config
+        ):
+            text, is_error = oracle_query.call_search_content(query, limit)
+        return text, is_error, connection
+
+    def test_query_and_limit_are_bind_variables(self) -> None:
+        query = "storage'); DROP TABLE ROSSMONEY.CONTENT_EMBEDDINGS; --"
+        text, is_error, connection = self._run(query=query, limit=5)
+        self.assertFalse(is_error, text)
+        cursor = connection.cursor_instance
+        self.assertEqual(
+            cursor.statements[0], "SET TRANSACTION READ ONLY"
+        )
+        self.assertEqual(cursor.statements[1], oracle_query.SEARCH_SQL)
+        self.assertNotIn(query, cursor.statements[1])
+        self.assertEqual(cursor.bind_sets[1], {"query": query, "limit": 5})
+        self.assertEqual(cursor.fetch_size, 5)
+        self.assertTrue(connection.rolled_back)
+        self.assertTrue(connection.closed)
+
+    def test_limit_is_clamped_before_it_reaches_the_database(self) -> None:
+        _, _, connection = self._run(limit=500)
+        self.assertEqual(
+            connection.cursor_instance.bind_sets[1]["limit"],
+            oracle_query.MAX_SEARCH_LIMIT,
+        )
+        _, _, connection = self._run(limit=0)
+        self.assertEqual(connection.cursor_instance.bind_sets[1]["limit"], 1)
+        _, _, connection = self._run(limit="many")
+        self.assertEqual(
+            connection.cursor_instance.bind_sets[1]["limit"],
+            oracle_query.DEFAULT_SEARCH_LIMIT,
+        )
+
+    def test_chunks_are_truncated(self) -> None:
+        rows = [
+            (
+                "experience",
+                "cv",
+                "Platform support",
+                "summary",
+                "x" * 4000,
+                "2026-01-01T00:00:00",
+                0.666,
+            ),
+            (
+                "page",
+                "building-dependable-systems",
+                "Building dependable systems",
+                "focus",
+                "short chunk",
+                "2026-01-01T00:00:00",
+                0.747,
+            ),
+        ]
+        text, is_error, _ = self._run(rows=rows)
+        self.assertFalse(is_error, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            len(payload["results"][0]["chunk"]),
+            oracle_query.MAX_CHUNK_CHARS,
+        )
+        self.assertTrue(payload["results"][0]["chunk_truncated"])
+        self.assertEqual(payload["results"][1]["chunk"], "short chunk")
+        self.assertFalse(payload["results"][1]["chunk_truncated"])
+        self.assertIn("truncated", payload["note"])
+        self.assertEqual(payload["results"][0]["title"], "Platform support")
+        self.assertEqual(payload["results"][0]["distance"], 0.666)
+
+    def test_response_size_cap_applies_to_search_results(self) -> None:
+        results = [
+            {
+                "kind": "experience",
+                "title": f"title-{index}",
+                "slug": "cv",
+                "section": "summary",
+                "chunk": "x" * 8192,
+                "chunk_truncated": True,
+                "source_updated": "2026-01-01T00:00:00",
+                "distance": 0.5,
+            }
+            for index in range(oracle_query.MAX_SEARCH_LIMIT)
+        ]
+        text = oracle_query._fit_search_response(results, 20)
+        payload = json.loads(text)
+        self.assertLessEqual(
+            len(text.encode("utf-8")), oracle_query.MAX_RESPONSE_BYTES
+        )
+        self.assertTrue(payload["truncated"])
+        self.assertLess(payload["count"], len(results))
+        self.assertEqual(len(results), oracle_query.MAX_SEARCH_LIMIT)
+
+    def test_errors_are_sanitised(self) -> None:
+        text, is_error, _ = self._run(
+            connect_error=Exception(
+                "ORA-01017: invalid credential password=hunter2 "
+                "dsn=secret-db.example wallet=/wallet"
+            )
+        )
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text), {"error": "oracle error ORA-01017"})
+        for secret in ("hunter2", "secret-db", "dsn", "/wallet"):
+            self.assertNotIn(secret, text)
+
+    def test_unknown_driver_error_is_generic(self) -> None:
+        text, is_error, _ = self._run(
+            connect_error=Exception("password=hunter2 at secret-db")
+        )
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text), {"error": "oracle query failed"})
+        self.assertNotIn("hunter2", text)
+        self.assertNotIn("secret-db", text)
+
+    def test_missing_config_does_not_echo_the_query(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            text, is_error = oracle_query.call_search_content(
+                "my private query"
+            )
+        self.assertTrue(is_error)
+        self.assertIn("not configured", text)
+        self.assertNotIn("my private query", text)
+
+    def test_invalid_input_is_a_tool_error(self) -> None:
+        text, is_error = oracle_query.call_search_content("   ")
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text), {"error": "query is empty"})
+
+        text, is_error = oracle_query.call_search_content(None)
+        self.assertTrue(is_error)
+        self.assertEqual(
+            json.loads(text), {"error": "query must be a string"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

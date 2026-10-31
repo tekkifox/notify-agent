@@ -8,6 +8,11 @@
       "action": "oracle_query",
       "resource": "*",
       "effect": "deny"
+    },
+    {
+      "action": "oracle_search_content",
+      "resource": "*",
+      "effect": "deny"
     }
   ],
   "mcp": {
@@ -33,7 +38,7 @@
   },
   "agent": {
     "notify": {
-      "description": "Composes one notification and sends it through notify.sh. No other tools.",
+      "description": "Composes one notification and sends it through notify.sh. Read-only Oracle tools only.",
       "mode": "primary",
       "steps": 6,
       "prompt": "{file:./prompts/notify.md}",
@@ -56,6 +61,7 @@
         "opencode_list_mcp_resources": "deny",
         "opencode_read_mcp_resource": "deny",
         "oracle_query": "allow",
+        "oracle_search_content": "allow",
         "bash": {
           "*": "deny",
           "/app/scripts/notify.sh -m *": "allow",
