@@ -3,6 +3,34 @@
   "share": "disabled",
   "autoupdate": false,
   "snapshot": false,
+  "permissions": [
+    {
+      "action": "oracle_query",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ],
+  "mcp": {
+    "servers": {
+      "oracle": {
+        "type": "local",
+        "command": ["python3", "/app/mcp/oracle_query.py"],
+        "codemode": false,
+        "timeout": {
+          "startup": 20000,
+          "execution": 60000
+        },
+        "environment": {
+          "ORACLE_USER": "{env:ORACLE_USER}",
+          "ORACLE_PASSWORD": "{env:ORACLE_PASSWORD}",
+          "ORACLE_DSN": "{env:ORACLE_DSN}",
+          "ORACLE_WALLET_DIR": "{env:ORACLE_WALLET_DIR}",
+          "PYTHONPATH": "/opt/mcp-python",
+          "PYTHONUNBUFFERED": "1"
+        }
+      }
+    }
+  },
   "agent": {
     "notify": {
       "description": "Composes one notification and sends it through notify.sh. No other tools.",
@@ -25,6 +53,9 @@
         "lsp": "deny",
         "external_directory": "deny",
         "doom_loop": "deny",
+        "opencode_list_mcp_resources": "deny",
+        "opencode_read_mcp_resource": "deny",
+        "oracle_query": "allow",
         "bash": {
           "*": "deny",
           "/app/scripts/notify.sh -m *": "allow",

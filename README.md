@@ -20,8 +20,10 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
 | `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
-| `opencode.json` | `notify` agent definition: only `notify.sh` may be executed. |
+| `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tool may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
+| `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode). |
+| `tests/test_oracle_guard.py` | SQL-guard tests; no database or driver required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -29,7 +31,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 ```sh
 cp stack.env.example stack.env
 chmod 600 stack.env
-$EDITOR stack.env          # set DISCORD_WEBHOOK_URL and OPENCODE_MODEL
+$EDITOR stack.env          # set DISCORD_WEBHOOK_URL, OPENCODE_MODEL, ORACLE_*
 
 docker compose build
 docker compose up -d
@@ -76,6 +78,103 @@ The image moved from the pinned `1.19.5` CLI to `2.2.1`. OpenCode 2 still reads 
 - `opencode run --pure` was removed. `scripts/run-prompt.sh` now passes `--standalone`, which runs a private server for that one invocation instead of attaching to the shared background service. No plugins are installed in the image, so the run is still reproducible.
 - OpenCode 2 also discovers project configuration from the working directory. The image sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so the pinned `/app/opencode.json` is the only config source and its rules are not layered twice.
 - `opencode debug agent` became `opencode debug agents`; the agent definition is inspectable with `opencode debug agents`.
+
+## Oracle host statistics (MCP)
+
+The `notify` agent can fetch real host statistics instead of inventing them. It
+calls a local MCP server, `mcp/oracle_query.py`, which exposes one tool:
+`query(sql)`. The server is Python 3 with `python-oracledb` in **thin mode**, so
+the image contains no Oracle client libraries and no JDK.
+
+The database side is read-only. The Oracle user has `SELECT` only on:
+
+- `ROSSMONEY."host-samples"` — one JSON document per sample in a `DATA` column,
+  roughly 937 rows and growing every three minutes. Fields: `hostLabel`,
+  `sampledAt`, `cpuAvg`, `memoryPercent`, `diskPercent`, `loadAvg`,
+  `processCount`, `networkRxMB`, `networkTxMB`, `swapPercent`.
+- `ROSSMONEY."archview-sources"` — host/source metadata, 3 rows.
+
+A query against `ROSSMONEY.pages` fails with an Oracle privilege error. That
+boundary is intentional and is not configurable from the agent. The MCP server
+adds its own guard: one statement only, `SELECT` or `WITH` only, no DML/DDL,
+PL/SQL, `EXEC` or second statement; `FETCH FIRST 101 ROWS ONLY` is appended when
+a query has no limit; results are hard-capped at 100 rows and 128 KiB; each
+call has a 15-second timeout. The session also runs `SET TRANSACTION READ ONLY`
+before the query, so a guard bypass still cannot write.
+
+Only the `notify` agent may use the tool. `opencode.json` puts a global
+`permissions` deny on `oracle_query`; the `notify` agent appends an allow after
+it. Every other agent therefore resolves to deny, while the notify agent's
+resolved list ends with `oracle_query: allow`.
+
+### Configuration
+
+Add these to `stack.env` for a plain compose run, or as stack environment
+variables in Portainer:
+
+| Variable | Purpose |
+| --- | --- |
+| `ORACLE_USER` | The read-only database user. |
+| `ORACLE_PASSWORD` | That user's password. |
+| `ORACLE_DSN` | Easy Connect string or TNS alias from the wallet, for example `mydb_high`. |
+| `ORACLE_WALLET_DIR` | In-container wallet directory. `compose.yaml` sets `/wallet`. |
+
+`opencode.json` passes all four through to the MCP process with `{env:...}`
+substitution, so they are never written into the config file. No real values
+belong anywhere in this repository.
+
+### Wallet: mount it, never bake it
+
+The image is public; the wallet is not. Keep the wallet on the host, outside the
+repository, readable by the container's uid `10001`, and mount it read-only at
+`/wallet`:
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0750 /opt/notify-agent/oracle-wallet
+sudo cp cwallet.sso tnsnames.ora sqlnet.ora /opt/notify-agent/oracle-wallet/
+sudo chown -R 10001:10001 /opt/notify-agent/oracle-wallet
+sudo chmod 0500 /opt/notify-agent/oracle-wallet/*
+```
+
+The wallet must be an auto-login wallet (`cwallet.sso`). There is deliberately
+no wallet-password variable: a password-protected wallet would put another
+secret in the container environment.
+
+`compose.yaml` binds `${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}` to
+`/wallet` with `:ro`. For a plain compose run, set the host path in `.env`
+(compose interpolation, **not** `stack.env`):
+
+```sh
+ORACLE_WALLET_HOST_DIR=/opt/notify-agent/oracle-wallet
+```
+
+For the Portainer stack, open **Stacks → notify-agent → Editor** and either add
+a stack environment variable `ORACLE_WALLET_HOST_DIR` with the absolute host
+path, or replace `${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}` with the absolute
+path directly. Keep the `:/wallet:ro` suffix, and keep
+`ORACLE_WALLET_DIR=/wallet` in the stack environment. Portainer substitutes
+stack environment variables while rendering the compose file; `stack.env` only
+supplies container environment variables and cannot choose the bind-mount
+source.
+
+`docker compose config` still validates on a fresh checkout because the mount
+falls back to `./oracle-wallet`. That default directory is gitignored. The
+container refuses to query when `ORACLE_WALLET_DIR` is unset or the directory
+is not mounted.
+
+### Tool guard tests
+
+The guard is unit-tested without a database or the Oracle driver:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The tests assert that a `SELECT` and a `WITH` query pass, and that `INSERT`,
+`UPDATE`, `DELETE`, `DROP`, `BEGIN`, `WITH ... DELETE`, `FOR UPDATE`, two
+statements, trailing junk and an oversized statement are rejected. They also
+assert that the row cap is appended exactly once when a query has no limit and
+that an existing `FETCH FIRST` or `ROWNUM` is respected.
 
 ## Test delivery (sends a real message)
 
@@ -235,10 +334,11 @@ These are enforced in `compose.yaml`, not conventions:
 | Processes | `pids_limit: 200` |
 | Restart | `restart: unless-stopped` |
 | Docker socket | not mounted |
-| Host mounts | none beyond the named volume |
+| Host mounts | named `opencode-data` volume plus the Oracle wallet bind-mounted read-only at `/wallet`; no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
-| Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...` are allowed |
+| Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet contents live on the host and are mounted `:ro` |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...` and the MCP tool `oracle_query` are allowed |
+| Oracle access | read-only database user; MCP guard allows one `SELECT`/`WITH`, caps rows and response size, applies a 15-second timeout |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
 
@@ -252,14 +352,16 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 
 - The Discord webhook secret, which can post to one channel.
 - The provider OAuth token or API key in the `opencode-data` volume.
+- The Oracle password and wallet material.
 - The ability to send messages as the bot/user the credentials represent.
 - Message content and model prompts, which leave the host for the model provider.
 
 **What the agent can do**
 
 - Reach the internet outbound.
-- Read its environment (including the webhook and provider credentials).
+- Read its environment (including the webhook, provider credentials, and Oracle password).
 - Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`.
+- Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the two host-statistics objects.
 - Write only to the named volume and tmpfs.
 
 **What it cannot do**
@@ -267,11 +369,13 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Accept inbound connections (no published ports).
 - Access the Docker socket, the host filesystem, `/etc`, `/home`, or other containers.
 - Gain capabilities or new privileges.
-- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the one allowed `notify.sh` command.
+- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and `oracle_query`.
+- Read the CMS content: the Oracle user has no privilege on it, and the MCP guard refuses anything that is not a single read-only query.
 
 **Scenarios and residual risk**
 
-- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts.
+- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query`: the prompt tells the model to treat those values as data, never as instructions.
+- **Database access.** The Oracle user is read-only and limited to two host-statistics objects. A compromised model can read those statistics but not the CMS content, and cannot write. The wallet is mounted read-only, so the process cannot modify it.
 - **Malicious or compromised model provider.** The provider sees the prompt and the composed message. It can influence message content but not the container's shell surface.
 - **Container compromise.** An attacker who compromises the OpenCode process gets the webhook, provider token, and outbound internet. There is no egress allowlist, so data can be exfiltrated. They still need a container or kernel escape to reach the host.
 - **Docker-host compromise.** Anyone with access to the Docker daemon can read the volume and change the container. Docker is not a security boundary against a hostile host.
@@ -303,7 +407,12 @@ Verified while building this branch:
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`.
+- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` last (over the global deny), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves `oracle_query` to `deny`.
+- The SQL-guard suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 32 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, wallet presence, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`.
+- The MCP stdio handshake in the image returns one tool, `query`, and its guard errors are tool errors rather than protocol failures. A tool call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, or password.
+- OpenCode's own debug log reports `mcp connected server=oracle tools=1` when the server is configured under `mcp.servers`, confirming the V2 shape and `codemode: false` expose the tool directly.
+- Image size, measured with `docker save` and `du -sh /` inside each image: before `205 MB` compressed / `502 MB` root filesystem; after `232 MB` compressed / `593 MB` root filesystem. The increase is Python 3, pip, `python-oracledb` and its wheels. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
+- The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
 
 Not verified, because this repository contains no credentials:
@@ -311,5 +420,6 @@ Not verified, because this repository contains no credentials:
 - `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Discord send (no real webhook was used).
 - A live Composio send (no real API key was used; the Composio path was only exercised against a local stub).
+- A live Oracle query (no credentials or wallet were used; the first mate runs the live query). The guard, protocol, and failure paths were exercised without a database.
 
-Do those three checks on the target host after copying `stack.env` and completing the device flow.
+Do those checks on the target host after copying `stack.env`, mounting the wallet, and completing the device flow.

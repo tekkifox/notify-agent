@@ -9,3 +9,11 @@ state
 data
 *.log
 .DS_Store
+
+# Oracle wallet material must never enter the build context or an image layer.
+oracle-wallet
+wallet
+*.sso
+ewallet.p12
+tnsnames.ora
+sqlnet.ora
