@@ -3,6 +3,13 @@
   "share": "disabled",
   "autoupdate": false,
   "snapshot": false,
+  "permissions": [
+    {
+      "action": "oracle_query",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ],
   "mcp": {
     "servers": {
       "oracle": {

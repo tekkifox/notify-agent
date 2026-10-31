@@ -102,6 +102,11 @@ a query has no limit; results are hard-capped at 100 rows and 128 KiB; each
 call has a 15-second timeout. The session also runs `SET TRANSACTION READ ONLY`
 before the query, so a guard bypass still cannot write.
 
+Only the `notify` agent may use the tool. `opencode.json` puts a global
+`permissions` deny on `oracle_query`; the `notify` agent appends an allow after
+it. Every other agent therefore resolves to deny, while the notify agent's
+resolved list ends with `oracle_query: allow`.
+
 ### Configuration
 
 Add these to `stack.env` for a plain compose run, or as stack environment
@@ -402,7 +407,7 @@ Verified while building this branch:
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query`, and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`.
+- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` last (over the global deny), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves `oracle_query` to `deny`.
 - The SQL-guard suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 32 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, wallet presence, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`.
 - The MCP stdio handshake in the image returns one tool, `query`, and its guard errors are tool errors rather than protocol failures. A tool call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, or password.
 - OpenCode's own debug log reports `mcp connected server=oracle tools=1` when the server is configured under `mcp.servers`, confirming the V2 shape and `codemode: false` expose the tool directly.
