@@ -27,7 +27,8 @@
         "doom_loop": "deny",
         "bash": {
           "*": "deny",
-          "/app/scripts/notify.sh -m *": "allow"
+          "/app/scripts/notify.sh -m *": "allow",
+          "/app/scripts/notify.sh -t * -m *": "allow"
         }
       }
     }
