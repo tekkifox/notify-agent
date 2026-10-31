@@ -4,6 +4,18 @@ stack.env
 .env.*
 !.env.example
 
+# Oracle wallet material: mounted read-only at runtime, never committed
+oracle-wallet/
+wallet/
+*.sso
+ewallet.p12
+tnsnames.ora
+sqlnet.ora
+
+# Python
+__pycache__/
+*.pyc
+
 # Local state / runtime artifacts
 state/
 data/

@@ -37,6 +37,9 @@ services:
       XDG_CONFIG_HOME: /home/agent/.config
       XDG_CACHE_HOME: /home/agent/.cache
       XDG_STATE_HOME: /home/agent/.local/state
+      # In-container path of the read-only Oracle wallet mount below. The MCP
+      # server reads it from this variable; no wallet material is in the image.
+      ORACLE_WALLET_DIR: /wallet
 
     # Root filesystem is immutable. Only the named volume and these tmpfs
     # mounts are writable. OpenCode needs home/cache/state/tmp paths.
@@ -51,6 +54,13 @@ services:
     # Durable auth + sessions. This is the only persistent writable state.
     volumes:
       - opencode-data:/home/agent/.local/share/opencode
+      # Oracle wallet, mounted read-only at runtime. Wallet contents are never
+      # baked into the public image. Set ORACLE_WALLET_HOST_DIR to the host
+      # directory that holds cwallet.sso / tnsnames.ora (default ./oracle-wallet,
+      # which is gitignored). In Portainer, either define the same stack
+      # environment variable or replace the left side with the absolute host
+      # path. The container path must stay /wallet, matching ORACLE_WALLET_DIR.
+      - ${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}:/wallet:ro
 
     # No ports: outbound only. No Docker socket, no host /etc or /home,
     # no privileged mode.

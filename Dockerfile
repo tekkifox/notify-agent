@@ -6,14 +6,19 @@ FROM node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fd
 
 ARG OPENCODE_VERSION=2.2.1
 ARG SUPERCRONIC_VERSION=0.2.51
+ARG ORACLEDB_VERSION=26.1.0
 
 # Runtime tools only. supercronic is a static Go binary, so no Cron daemon and
-# no root-owned cron spool are needed.
+# no root-owned cron spool are needed. python3 is only for the MCP server; the
+# Oracle driver below runs in thin mode, so there is no Oracle client and no
+# JDK in the image.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       jq \
+      python3 \
+      python3-pip \
       tar \
       tzdata \
  && rm -rf /var/lib/apt/lists/*
@@ -30,6 +35,12 @@ RUN set -eux; \
     echo "${sha256}  /usr/local/bin/supercronic" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/supercronic; \
     supercronic -version
+
+# python-oracledb, thin mode only: no Oracle client libraries, no JDK. Installed
+# into /opt so the system Python stays untouched. The MCP server imports it
+# lazily, so the SQL guard and its tests run without a database driver.
+RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \
+      --target /opt/mcp-python "oracledb==${ORACLEDB_VERSION}"
 
 # Fixed unprivileged identity. The numeric uid is what compose enforces.
 RUN groupadd --gid 10001 agent \
@@ -59,12 +70,16 @@ RUN HOME=/opt/opencode \
 WORKDIR /app
 
 COPY --chown=10001:10001 --chmod=0755 scripts/ /app/scripts/
+COPY --chown=10001:10001 --chmod=0755 mcp/ /app/mcp/
 COPY --chown=10001:10001 crontab opencode.json /app/
 COPY --chown=10001:10001 prompts/ /app/prompts/
 
 ENV HOME=/home/agent \
     OPENCODE_CONFIG=/app/opencode.json \
     OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+    PYTHONPATH=/opt/mcp-python \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     XDG_DATA_HOME=/home/agent/.local/share \
     XDG_CONFIG_HOME=/home/agent/.config \
     XDG_CACHE_HOME=/home/agent/.cache \
