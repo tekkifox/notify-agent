@@ -131,14 +131,32 @@ repository, readable by the container's uid `10001`, and mount it read-only at
 
 ```sh
 sudo install -d -o 10001 -g 10001 -m 0750 /opt/notify-agent/oracle-wallet
-sudo cp cwallet.sso tnsnames.ora sqlnet.ora /opt/notify-agent/oracle-wallet/
+sudo cp tnsnames.ora ewallet.pem sqlnet.ora /opt/notify-agent/oracle-wallet/
 sudo chown -R 10001:10001 /opt/notify-agent/oracle-wallet
-sudo chmod 0500 /opt/notify-agent/oracle-wallet/*
+sudo chmod 0400 /opt/notify-agent/oracle-wallet/*
 ```
 
-The wallet must be an auto-login wallet (`cwallet.sso`). There is deliberately
-no wallet-password variable: a password-protected wallet would put another
-secret in the container environment.
+The container needs exactly three files:
+
+| File | Purpose |
+| --- | --- |
+| `tnsnames.ora` | Maps `ORACLE_DSN`, for example `mydb_high`, to the database service. |
+| `ewallet.pem` | The thin-mode TLS wallet. This is the wallet file python-oracledb uses. |
+| `sqlnet.ora` | Oracle Net settings supplied with the wallet. |
+
+Mount the directory read-only with `:ro`. The container never writes to it.
+
+The Java-format files from the same wallet are **not** needed and should not be
+copied: `cwallet.sso`, `ewallet.p12`, `keystore.jks`, `truststore.jks`, and
+`ojdbc.properties`. They are for thick-mode or JDBC clients, not
+python-oracledb thin mode. Leaving `cwallet.sso` or `ewallet.p12` next to
+`ewallet.pem` can make the driver prompt for a PEM pass phrase, which hangs a
+cron container with no terminal. If they are present, the MCP server stages only
+the three thin-mode files for the connection so `ewallet.pem` is preferred, but
+the simplest and safest fix is not to copy them. There is deliberately no
+wallet-password variable: the PEM wallet used here needs no passphrase, and a
+password-protected wallet would put another secret in the container
+environment.
 
 `compose.yaml` binds `${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}` to
 `/wallet` with `:ro`. For a plain compose run, set the host path in `.env`
@@ -408,7 +426,7 @@ Verified while building this branch:
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
 - `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` last (over the global deny), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves `oracle_query` to `deny`.
-- The SQL-guard suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 32 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, wallet presence, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`.
+- The SQL-guard suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 36 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`.
 - The MCP stdio handshake in the image returns one tool, `query`, and its guard errors are tool errors rather than protocol failures. A tool call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, or password.
 - OpenCode's own debug log reports `mcp connected server=oracle tools=1` when the server is configured under `mcp.servers`, confirming the V2 shape and `codemode: false` expose the tool directly.
 - Image size, measured with `docker save` and `du -sh /` inside each image: before `205 MB` compressed / `502 MB` root filesystem; after `232 MB` compressed / `593 MB` root filesystem. The increase is Python 3, pip, `python-oracledb` and its wheels. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
