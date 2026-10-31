@@ -13,7 +13,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 
 | Path | Purpose |
 | --- | --- |
-| `Dockerfile` | Pinned OpenCode `1.19.5`, supercronic `0.2.51`, non-root uid `10001`. |
+| `Dockerfile` | Pinned OpenCode `2.2.1`, supercronic `0.2.51`, non-root uid `10001`. |
 | `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then triggers the Portainer redeploy webhook. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture. |
 | `crontab` | Supercronic schedules. One line per schedule. |
@@ -50,15 +50,32 @@ Production runs the image published from GitHub, not a local build. A push to `m
 
 ## One-time authentication
 
-OpenCode needs a provider login once. The device flow prints a URL and code; complete it in a browser on any machine:
+OpenCode 2 uses a device-code login. It prints a code to approve in a browser on any machine; nothing is typed back into the terminal.
 
 ```sh
-docker compose run --rm agent opencode auth login
+docker compose run --rm agent opencode auth login "OpenCode Console" --method device
 ```
 
-Choose the provider and model you set in `OPENCODE_MODEL` (for example `provider/model`). Credentials are written to the `opencode-data` volume at `/home/agent/.local/share/opencode`, so they survive container recreation and reboots. They do not survive `docker compose down -v`.
+Use the integration name that matches the provider in `OPENCODE_MODEL` (the example is OpenCode's own integration). Approve the code in the browser. The credential is written to the `opencode-data` volume at `/home/agent/.local/share/opencode`, so it survives container recreation and redeploys. It does not survive `docker compose down -v`.
 
-The compose entrypoint dispatcher exists so this command works without an `--entrypoint` override: with arguments it execs the command, with no arguments it execs `supercronic /app/crontab`.
+An API key remains available as a second method:
+
+```sh
+docker compose run --rm agent opencode auth login "OpenCode Console" --method key
+```
+
+`opencode auth login --help` lists the `--method` flag, and an unknown method reports the valid choices: `device, key`.
+
+The compose entrypoint dispatcher exists so these commands work without an `--entrypoint` override: with arguments it execs the command, with no arguments it execs `supercronic /app/crontab`.
+
+### Upgrading from OpenCode 1.x
+
+The image moved from the pinned `1.19.5` CLI to `2.2.1`. OpenCode 2 still reads the V1 configuration shape used by `opencode.json`, so the `notify` agent and its permission allowlist are unchanged. Four details differ:
+
+- OpenCode 2 installs from `https://opencode.ai/v2/install`; the old installer refuses 2.x releases. `opencode --version` now prints `opencode v2.2.1`.
+- `opencode run --pure` was removed. `scripts/run-prompt.sh` now passes `--standalone`, which runs a private server for that one invocation instead of attaching to the shared background service. No plugins are installed in the image, so the run is still reproducible.
+- OpenCode 2 also discovers project configuration from the working directory. The image sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so the pinned `/app/opencode.json` is the only config source and its rules are not layered twice.
+- `opencode debug agent` became `opencode debug agents`; the agent definition is inspectable with `opencode debug agents`.
 
 ## Test delivery (sends a real message)
 
@@ -223,7 +240,7 @@ These are enforced in `compose.yaml`, not conventions:
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
 
-The image installs OpenCode from the official installer pinned to `1.19.5`, verifies supercronic by SHA-256, and pins the base image by digest. OpenCode itself lives under `/opt/opencode`, so the runtime home directory can stay read-only.
+The image installs OpenCode from the official v2 installer pinned to `2.2.1`, verifies supercronic by SHA-256, and pins the base image by digest. OpenCode itself lives under `/opt/opencode`, so the runtime home directory can stay read-only.
 
 ## Threat model
 
@@ -272,20 +289,24 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 Verified while building this branch:
 
 - `docker compose config` validates.
-- The image builds natively and with `--platform linux/amd64` (the target host architecture).
+- The image builds with `--platform linux/amd64` (the target host architecture).
 - `docker run --rm --platform linux/amd64 --entrypoint sh <image> -c 'id; supercronic -version'` prints:
   `uid=10001(agent) gid=10001(agent) groups=10001(agent)` and `v0.2.51`.
-- The same image reports OpenCode `1.19.5`.
+- The same image reports `opencode v2.2.1`.
+- `opencode auth login --help` in the image lists `--method`, and
+  `opencode auth login "OpenCode Console" --method __bogus__` reports
+  `Authentication method not found: __bogus__. Available: device, key`.
 - Running the compose service shows a read-only root filesystem, `CapEff: 0`, `NoNewPrivs: 1`, memory limit `536870912`, pids limit `200`, one writable named volume, and no published ports.
+- A hardened `docker run` with `--read-only`, the same tmpfs mounts, and the data volume resolves the model and reaches model selection under `opencode run --standalone`, so the cron path does not need a writable root filesystem.
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agent notify` resolves with `bash` as the only enabled tool and a deny-all rule except `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`.
+- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`.
 - The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
 
 Not verified, because this repository contains no credentials:
 
-- `opencode auth login` (no provider account was used).
+- `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Discord send (no real webhook was used).
 - A live Composio send (no real API key was used; the Composio path was only exercised against a local stub).
 

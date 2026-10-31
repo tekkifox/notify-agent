@@ -5,9 +5,9 @@ services:
     build:
       context: .
       args:
-        OPENCODE_VERSION: "1.19.5"
+        OPENCODE_VERSION: "2.2.1"
         SUPERCRONIC_VERSION: "0.2.51"
-    image: notify-agent:1.19.5
+    image: notify-agent:2.2.1
     container_name: notify-agent
 
     # The image ENTRYPOINT is ["supercronic", "/app/crontab"]. This dispatcher
@@ -29,6 +29,10 @@ services:
     environment:
       HOME: /home/agent
       OPENCODE_CONFIG: /app/opencode.json
+      # The image sets this too. Explicit here so the only config source is the
+      # pinned /app/opencode.json, never a file discovered from the working
+      # directory.
+      OPENCODE_DISABLE_PROJECT_CONFIG: "1"
       XDG_DATA_HOME: /home/agent/.local/share
       XDG_CONFIG_HOME: /home/agent/.config
       XDG_CACHE_HOME: /home/agent/.cache
