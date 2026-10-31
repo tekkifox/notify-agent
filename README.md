@@ -107,18 +107,36 @@ A failed job exits non-zero and is visible in the log, but there is no automatic
 - Exits non-zero on network errors, rate limits, and non-2xx responses. It never prints the webhook URL or API key.
 - Does not follow redirects and requires `https://`.
 
-### Composio limitation
+### Composio path
 
-The Composio path is behind `COMPOSIO_API_KEY` + `COMPOSIO_TOOL` and can be enabled without rebuilding:
+The Composio path is behind `COMPOSIO_API_KEY` + `COMPOSIO_TOOL`, uses the
+`/api/v3.1` execute endpoint, and can be enabled without rebuilding:
 
 ```sh
 COMPOSIO_API_KEY=...
-COMPOSIO_TOOL=...
+COMPOSIO_TOOL=DISCORDBOT_CREATE_MESSAGE
+COMPOSIO_ARGS='{"channel_id":"123456789012345678"}'
+COMPOSIO_CONNECTED_ACCOUNT_ID=...
 COMPOSIO_USER_ID=...
 COMPOSIO_MESSAGE_FIELD=content
 ```
 
-**Known limitation:** the Captain's Composio Discord connection is user-OAuth based and cannot post to a channel. That path is therefore scaffolded for a future server-side Composio tool, not a working Discord replacement. The arguments sent are `{"user_id": ..., "arguments": {"<COMPOSIO_MESSAGE_FIELD>": "<message>"}}`; adapt `COMPOSIO_TOOL` and the message field to the chosen tool. It has not been tested against a live Composio account.
+It targets the Discord **Bot** toolkit, which posts to a channel normally. The
+bot needs `DISCORDBOT_CREATE_MESSAGE` and the tool needs its own `channel_id`,
+so `COMPOSIO_ARGS` supplies extra arguments as a JSON object. They are merged
+into `arguments`, and the message field (`COMPOSIO_MESSAGE_FIELD`, default
+`content`) wins if a key collides. Anything that is not a JSON object is
+rejected before the request is sent, without echoing the value.
+
+A Composio user id can hold more than one connection for the same toolkit (for
+example two Discord bots, one per server). Executing by `user_id` alone is then
+ambiguous and can fail with `403` for a channel on the other server, so set
+`COMPOSIO_CONNECTED_ACCOUNT_ID` to name the connection explicitly. When it is
+empty the key is omitted from the payload.
+
+The payload sent is `{"user_id": ..., "connected_account_id": ...,
+"arguments": {...}}`; `connected_account_id` is absent when unset. The webhook
+path still takes precedence whenever `DISCORD_WEBHOOK_URL` is set.
 
 ## Security posture
 
@@ -200,6 +218,7 @@ Verified while building this branch:
 - Running the compose service shows a read-only root filesystem, `CapEff: 0`, `NoNewPrivs: 1`, memory limit `536870912`, pids limit `200`, one writable named volume, and no published ports.
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on all three scripts.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
+- The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
 - `opencode debug agent notify` resolves with `bash` as the only enabled tool and a deny-all rule except `/app/scripts/notify.sh`.
 
 Not verified, because this repository contains no credentials:

@@ -30,9 +30,11 @@ Delivery selection:
   else                                     -> error
 
 Optional Composio settings:
-  COMPOSIO_API_BASE       default https://backend.composio.dev
-  COMPOSIO_USER_ID        default "default"
-  COMPOSIO_MESSAGE_FIELD  default "content"
+  COMPOSIO_API_BASE               default https://backend.composio.dev
+  COMPOSIO_USER_ID                default "default"
+  COMPOSIO_MESSAGE_FIELD          default "content"
+  COMPOSIO_ARGS                   JSON object merged into the tool arguments
+  COMPOSIO_CONNECTED_ACCOUNT_ID   connected account to execute against
 
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
@@ -141,6 +143,7 @@ send_composio() {
     api_base=${COMPOSIO_API_BASE:-https://backend.composio.dev}
     user_id=${COMPOSIO_USER_ID:-default}
     message_field=${COMPOSIO_MESSAGE_FIELD:-content}
+    connected_account_id=${COMPOSIO_CONNECTED_ACCOUNT_ID:-}
 
     case "$api_base" in
         https://*) ;;
@@ -153,14 +156,28 @@ send_composio() {
         ''|*[!A-Za-z0-9_]*) fail "COMPOSIO_MESSAGE_FIELD contains invalid characters" ;;
     esac
 
+    # COMPOSIO_ARGS is an optional JSON object of extra tool arguments. Validate
+    # it without echoing it: parse errors can quote the input.
+    args_json='{}'
+    if [ -n "${COMPOSIO_ARGS:-}" ]; then
+        args_json=$(printf '%s' "$COMPOSIO_ARGS" \
+            | jq -ce 'if type == "object" then . else error("not an object") end' 2>/dev/null) \
+            || fail "COMPOSIO_ARGS must be a JSON object"
+    fi
+
+    # The message field is merged last so it always wins over COMPOSIO_ARGS.
     payload=$(jq -cn \
         --arg user_id "$user_id" \
         --arg field "$message_field" \
         --arg message "$message" \
-        '{user_id: $user_id, arguments: {($field): $message}}') \
+        --argjson args "$args_json" \
+        --arg connected_account_id "$connected_account_id" \
+        '{user_id: $user_id}
+         + (if $connected_account_id == "" then {} else {connected_account_id: $connected_account_id} end)
+         + {arguments: ($args + {($field): $message})}') \
         || fail "could not build Composio payload"
 
-    endpoint="${api_base%/}/api/v3/tools/execute/${tool}"
+    endpoint="${api_base%/}/api/v3.1/tools/execute/${tool}"
 
     status=$(printf '%s' "$payload" \
         | curl -sS --proto '=https' --tlsv1.2 --max-time 30 \
@@ -186,8 +203,6 @@ send_composio() {
 if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
     send_discord
 elif [ -n "${COMPOSIO_API_KEY:-}" ] && [ -n "${COMPOSIO_TOOL:-}" ]; then
-    # NOTE: Composio's Discord connection is user-OAuth based and cannot post to
-    # a channel. This path exists for a future server-side tool and is untested.
     send_composio
 else
     fail "no delivery configured: set DISCORD_WEBHOOK_URL, or COMPOSIO_API_KEY and COMPOSIO_TOOL"
