@@ -6,7 +6,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 
 - **Today:** Discord incoming webhook.
 - **Later:** Composio, switchable through environment variables without rebuilding.
-- **Schedules:** [supercronic](https://github.com/aptible/supercronic), a static non-root cron.
+- **Schedules:** [supercronic](https://github.com/aptible/supercronic), a static non-root cron, reading a crontab bind-mounted from the host.
 - **State:** one named volume for OpenCode auth and sessions.
 
 ## Repository layout
@@ -15,8 +15,8 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | --- | --- |
 | `Dockerfile` | Pinned OpenCode `2.2.1`, supercronic `0.2.51`, non-root uid `10001`. |
 | `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then triggers the Portainer redeploy webhook. |
-| `compose.yaml` | One `agent` service with the hardened runtime posture. |
-| `crontab` | Supercronic schedules. Ships with no active schedule; every example is commented out. |
+| `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
+| `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
 | `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
@@ -41,6 +41,8 @@ docker compose up -d
 
 `docker compose config` validates on a fresh checkout because `stack.env` is declared optional. If it is missing, delivery fails loudly rather than silently doing nothing.
 
+Schedules default to `./crontab`, so a fresh checkout starts as-is. To keep the schedule file somewhere else on the host, set `SCHEDULES_FILE` in `.env` beside `compose.yaml` or in the shell; see [Add a schedule](#add-a-schedule).
+
 ## Deploy
 
 Production runs the image published from GitHub, not a local build. A push to `main` runs `.github/workflows/publish-image.yml`, which builds `linux/amd64`, pushes `ghcr.io/tekkifox/notify-agent` to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then calls the Portainer stack webhook. `workflow_dispatch` runs the same job by hand.
@@ -49,6 +51,7 @@ Production runs the image published from GitHub, not a local build. A push to `m
 - When the webhook fires, Portainer pulls the new image and recreates the `agent` container.
 - `PORTAINER_WEBHOOK_URL` is a repository secret. Copy it from **Stacks → notify-agent → Webhooks** in Portainer. If the secret is empty, the workflow still succeeds and prints a warning: the image was published, but no redeploy was triggered.
 - Recreating the container keeps the named `opencode-data` volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
+- The stack directory owns the schedule file, and the stack's compose sets `SCHEDULES_FILE` to it (as an interpolation variable, not in `stack.env`). A redeploy re-reads whatever the host file contains, so schedule changes do not need an image build or a push.
 
 ## One-time authentication
 
@@ -68,7 +71,7 @@ docker compose run --rm agent opencode auth login "OpenCode Console" --method ke
 
 `opencode auth login --help` lists the `--method` flag, and an unknown method reports the valid choices: `device, key`.
 
-The compose entrypoint dispatcher exists so these commands work without an `--entrypoint` override: with arguments it execs the command, with no arguments it execs `supercronic /app/crontab`.
+The compose entrypoint dispatcher exists so these commands work without an `--entrypoint` override: with arguments it execs the command, with no arguments it checks that `/app/crontab` is a readable regular file and then execs `supercronic /app/crontab`.
 
 ### Upgrading from OpenCode 1.x
 
@@ -245,20 +248,69 @@ Both commands send to the real channel. There is no dry-run mode, because a fake
 
 The crontab ships with **no active schedule**. A fresh container runs supercronic and waits, but nothing is posted until an operator activates a line. The file contains commented examples to copy: a daily digest at 09:00, a weekday end-of-day wrap-up, a weekly planning reminder, a monthly maintenance note, and an hourly heartbeat.
 
-Uncomment exactly one example (or write your own line in the same shape), then rebuild because the file is baked read-only into the image:
+Uncomment exactly one example (or write your own line in the same shape). The live file is the one on the host, bind-mounted read-only over `/app/crontab`; editing it needs a container restart, not an image rebuild and not a push through GitHub.
+
+The image still ships `crontab` and compose uses it by default, so a fresh checkout works with `docker compose up` unchanged. To use an operator file, place it in the stack directory (for example `/srv/notify-agent/crontab`) and point `SCHEDULES_FILE` at it, either in `.env` beside `compose.yaml`:
 
 ```sh
-$EDITOR crontab
-docker compose up -d --build
+SCHEDULES_FILE=/srv/notify-agent/crontab
 ```
 
-Format: one line per schedule, five cron fields, then the prompt passed to `run-prompt.sh`:
+or for one command:
+
+```sh
+SCHEDULES_FILE=/srv/notify-agent/crontab docker compose up -d
+```
+
+Relative values resolve against the directory containing `compose.yaml`, so
+`SCHEDULES_FILE=crontab.local` keeps the file in the stack directory. Confirm
+the resolved mount with `docker compose config`.
+
+`SCHEDULES_FILE` is a Compose interpolation variable, not a container
+environment variable. Setting it in `stack.env` does nothing: compose resolves
+the mount before `env_file` is read. Keep it in the shell or `.env` (both are
+gitignored).
+
+The file must be readable by uid `10001`, the container's user; mode `0644`
+is fine:
+
+```sh
+sudo install -m 0644 ./crontab /srv/notify-agent/crontab
+```
+
+Edit it, then restart the container and check the log:
+
+```sh
+$EDITOR /srv/notify-agent/crontab
+docker compose restart agent
+docker compose logs --tail=20 agent
+```
+
+Supercronic logs `read crontab: /app/crontab` on startup. A restart
+re-reads the file and re-resolves the bind mount, so it also works when the
+editor saves by replacing the file (vim, `sed -i`, `mv`) rather than editing
+it in place.
+
+Do **not** use `docker kill -s HUP`: supercronic `0.2.51` does not reload on
+`SIGHUP`, it dies (exit 129), and only the restart policy brings the container
+back. Restart the container to apply an edit.
+
+If the host file is missing, the container refuses to start rather than
+scheduling nothing. Docker 29 fails the bind mount itself, because it creates
+a directory at the missing source and cannot mount that over the image's
+`/app/crontab` file. On a Docker version that lets the mount through, an empty
+directory appears at `/app/crontab`; the entrypoint detects it and exits with
+a message naming the path and telling you to create the file. Either way,
+check `docker compose logs agent` after changing `SCHEDULES_FILE`.
+
+Format is unchanged: one line per schedule, five cron fields, then the prompt
+passed to `run-prompt.sh`:
 
 ```cron
 0 9 * * * /app/scripts/run-prompt.sh "Compose and send the 09:00 digest."
 ```
 
-The fields are minute, hour, day-of-month, month, day-of-week. Times use `TZ` from `stack.env` (default `UTC`). The block above shows the shape only; it is not active until you put it in `crontab` yourself.
+The fields are minute, hour, day-of-month, month, day-of-week. Times use `TZ` from `stack.env` (default `UTC`). The block above shows the shape only; it is not active until you put it in the schedule file yourself.
 
 A schedule can also name its destination with `-t`:
 
@@ -268,7 +320,7 @@ A schedule can also name its destination with `-t`:
 
 The name must exist in `NOTIFY_TARGETS` (see [Named targets](#named-targets)). `run-prompt.sh` puts that name into the instruction, the agent must use exactly that `-t` value, and `notify.sh` resolves it against the operator's allowlist. The model never chooses the destination: it can only repeat the name it was given, and an unknown name fails before anything is sent. With no `-t`, the schedule uses `NOTIFY_DEFAULT_TARGET` when set, and otherwise keeps the legacy `COMPOSIO_ARGS` shape.
 
-Schedules are trusted operator configuration, not user input. Anyone who can edit `crontab` can make the agent post anything.
+Schedules are **trusted operator configuration**, not user input. The agent runs whatever command a schedule line names, with the container's full runtime access. Anyone who can edit the schedule file can make the agent post anything, to any configured target, at any time. Treat write access to it like write access to `stack.env`.
 
 ## Read logs
 
@@ -384,7 +436,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Processes | `pids_limit: 200` |
 | Restart | `restart: unless-stopped` |
 | Docker socket | not mounted |
-| Host mounts | named `opencode-data` volume plus the Oracle wallet bind-mounted read-only at `/wallet`; no host `/etc`, `/home` or Docker socket |
+| Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet contents live on the host and are mounted `:ro` |
 | Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...` and the MCP tool `oracle_query` are allowed |
@@ -418,6 +470,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 
 - Accept inbound connections (no published ports).
 - Access the Docker socket, the host filesystem, `/etc`, `/home`, or other containers.
+- Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
 - Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and `oracle_query`.
 - Read the CMS content: the Oracle user has no privilege on it, and the MCP guard refuses anything that is not a single read-only query.
@@ -446,6 +499,11 @@ Verified while building this branch:
 
 - `docker compose config` validates.
 - The image builds with `--platform linux/amd64` (the target host architecture).
+- `docker compose config` resolves the schedule mount to `./crontab` by default and to the `SCHEDULES_FILE` path when that variable is set.
+- With `/app/crontab` missing, or present as a directory (the shape a missing bind-mount source can produce), the entrypoint exits `1` before supercronic starts, printing `FATAL: schedule file /app/crontab is missing or unreadable` and naming `/app/crontab`.
+- On Docker `29.8.0`, a `SCHEDULES_FILE` path that does not exist fails even earlier, at container creation: the daemon creates a host directory and `runc` refuses to mount it over the image's `/app/crontab` file. The container does not start, so there is no silent empty schedule either.
+- With a mounted crontab whose schedules are commented out, supercronic logs `read crontab: /app/crontab`; after replacing the host file and restarting, it logs the same line and a newly added schedule runs.
+- `SIGHUP` was tested against supercronic `0.2.51` in this image: sending it terminated the process (exit `129`) without re-reading the file. A container restart is the documented way to apply an edit.
 - `docker run --rm --platform linux/amd64 --entrypoint sh <image> -c 'id; supercronic -version'` prints:
   `uid=10001(agent) gid=10001(agent) groups=10001(agent)` and `v0.2.51`.
 - The same image reports `opencode v2.2.1`.
