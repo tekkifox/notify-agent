@@ -16,7 +16,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `Dockerfile` | Pinned OpenCode `1.19.5`, supercronic `0.2.51`, non-root uid `10001`. |
 | `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then triggers the Portainer redeploy webhook. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture. |
-| `crontab` | Supercronic schedules. One line per schedule. |
+| `crontab` | Supercronic schedules. Ships with no active schedule; every example is commented out. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
 | `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
@@ -77,7 +77,9 @@ Both commands send to the real channel. There is no dry-run mode, because a fake
 
 ## Add a schedule
 
-Edit `crontab`, then rebuild because the file is baked read-only into the image:
+The crontab ships with **no active schedule**. A fresh container runs supercronic and waits, but nothing is posted until an operator activates a line. The file contains commented examples to copy: a daily digest at 09:00, a weekday end-of-day wrap-up, a weekly planning reminder, a monthly maintenance note, and an hourly heartbeat.
+
+Uncomment exactly one example (or write your own line in the same shape), then rebuild because the file is baked read-only into the image:
 
 ```sh
 $EDITOR crontab
@@ -90,7 +92,7 @@ Format: one line per schedule, five cron fields, then the prompt passed to `run-
 0 9 * * * /app/scripts/run-prompt.sh "Compose and send the 09:00 digest."
 ```
 
-The fields are minute, hour, day-of-month, month, day-of-week. Times use `TZ` from `stack.env` (default `UTC`). The file already contains a working 09:00 daily digest plus commented examples for weekdays, weekly, monthly, and hourly schedules.
+The fields are minute, hour, day-of-month, month, day-of-week. Times use `TZ` from `stack.env` (default `UTC`). The block above shows the shape only; it is not active until you put it in `crontab` yourself.
 
 A schedule can also name its destination with `-t`:
 

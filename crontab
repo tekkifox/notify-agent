@@ -1,5 +1,8 @@
 # Supercronic crontab.
 #
+# No active schedule: every schedule below is commented out. Nothing runs until
+# an operator uncomments exactly one line, rebuilds the image, and redeploys.
+#
 # Format: one line per schedule.
 #   <five cron fields>  /app/scripts/run-prompt.sh [-t <name>] "<prompt>"
 #
@@ -12,10 +15,10 @@
 # Only edit this file and rebuild the image: it is baked in read-only at /app.
 # Schedules are trusted operator configuration, not user input.
 #
-# Working example: daily digest at 09:00.
-0 9 * * * /app/scripts/run-prompt.sh "Compose a short daily digest for the team. Use the heading 'Daily digest', list the standing items: review the board, check overnight alerts, and note any blockers. End with a reminder to update the board. Do not invent news or metrics. Send it now with notify.sh."
+# Examples (uncomment one line per schedule):
 #
-# More examples (uncomment one line per schedule):
+# Daily digest at 09:00.
+# 0 9 * * * /app/scripts/run-prompt.sh "Compose a short daily digest for the team. Use the heading 'Daily digest', list the standing items: review the board, check overnight alerts, and note any blockers. End with a reminder to update the board. Do not invent news or metrics. Send it now with notify.sh."
 #
 # Weekdays at 17:30 - end-of-day wrap-up, explicitly to the "general" target.
 # 30 17 * * 1-5 /app/scripts/run-prompt.sh -t general "Compose a brief end-of-day wrap-up asking the team to close out their tasks and flag anything that needs attention tomorrow. Send it now with notify.sh."
