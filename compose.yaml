@@ -52,6 +52,10 @@ services:
       - /home/agent/.opencode:rw,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
 
     # Durable auth + sessions. This is the only persistent writable state.
+    # The schedule file comes from the host so schedules can be edited without
+    # rebuilding the image. The image's own /app/crontab is the default, which
+    # keeps a fresh checkout working; point SCHEDULES_FILE elsewhere to
+    # override it. Read-only: the container never writes schedules.
     volumes:
       - opencode-data:/home/agent/.local/share/opencode
       # Oracle wallet, mounted read-only at runtime. Wallet contents are never
@@ -62,6 +66,7 @@ services:
       # absolute host path. The container path must stay /wallet, matching
       # ORACLE_WALLET_DIR.
       - ${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}:/wallet:ro
+      - ${SCHEDULES_FILE:-./crontab}:/app/crontab:ro
 
     # No ports: outbound only. No Docker socket, no host /etc or /home,
     # no privileged mode.
