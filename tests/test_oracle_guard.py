@@ -192,8 +192,39 @@ class McpProtocolTests(unittest.TestCase):
                 "ORACLE_WALLET_DIR": wallet,
             }
             with mock.patch.dict(os.environ, env, clear=True):
-                with self.assertRaises(oracle_query.ConfigError):
+                with self.assertRaises(oracle_query.ConfigError) as caught:
                     oracle_query._config()
+        self.assertIn("ewallet.pem", str(caught.exception))
+        self.assertIn("cwallet.sso", str(caught.exception))
+
+    def test_pem_only_wallet_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as wallet:
+            pathlib.Path(wallet, "ewallet.pem").write_bytes(b"dummy")
+            env = {
+                "ORACLE_USER": "user",
+                "ORACLE_PASSWORD": "password",
+                "ORACLE_DSN": "dsn",
+                "ORACLE_WALLET_DIR": wallet,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = oracle_query._config()
+            self.assertEqual(config.wallet, wallet)
+
+    def test_tnsnames_only_wallet_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as wallet:
+            pathlib.Path(wallet, "tnsnames.ora").write_text(
+                "mydb = (DESCRIPTION=)\n"
+            )
+            env = {
+                "ORACLE_USER": "user",
+                "ORACLE_PASSWORD": "password",
+                "ORACLE_DSN": "dsn",
+                "ORACLE_WALLET_DIR": wallet,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(oracle_query.ConfigError) as caught:
+                    oracle_query._config()
+        self.assertIn("ewallet.pem", str(caught.exception))
 
     def test_wallet_directory_with_cwallet_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as wallet:
@@ -207,6 +238,35 @@ class McpProtocolTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True):
                 config = oracle_query._config()
             self.assertEqual(config.wallet, wallet)
+
+    def test_pem_only_wallet_is_passed_through(self) -> None:
+        with tempfile.TemporaryDirectory() as wallet:
+            pathlib.Path(wallet, "ewallet.pem").write_bytes(b"dummy")
+            with oracle_query._wallet_for_connection(wallet) as driver_dir:
+                self.assertEqual(driver_dir, wallet)
+
+    def test_java_wallet_files_beside_pem_are_not_passed_to_the_driver(self) -> None:
+        # cwallet.sso / ewallet.p12 next to ewallet.pem can make the thin
+        # driver prompt for a PEM pass phrase. Only the thin-mode files should
+        # reach the driver in that case.
+        with tempfile.TemporaryDirectory() as wallet:
+            for name in (
+                "tnsnames.ora",
+                "sqlnet.ora",
+                "ewallet.pem",
+                "cwallet.sso",
+                "ewallet.p12",
+            ):
+                pathlib.Path(wallet, name).write_bytes(b"dummy")
+            with oracle_query._wallet_for_connection(wallet) as driver_dir:
+                self.assertNotEqual(driver_dir, wallet)
+                self.assertEqual(
+                    set(os.listdir(driver_dir)),
+                    {"tnsnames.ora", "sqlnet.ora", "ewallet.pem"},
+                )
+                self.assertTrue(
+                    pathlib.Path(driver_dir, "ewallet.pem").is_symlink()
+                )
 
 
 class QueryExecutionTests(unittest.TestCase):

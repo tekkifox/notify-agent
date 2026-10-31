@@ -20,16 +20,19 @@ Environment (all required to query, none baked into the image):
     ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN, ORACLE_WALLET_DIR
 
 ``ORACLE_WALLET_DIR`` is the in-container path of a read-only wallet mount,
-normally ``/wallet``.
+normally ``/wallet``. A thin-mode wallet contains ``tnsnames.ora``,
+``ewallet.pem`` and ``sqlnet.ora``; the Java-format files are not needed.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import sys
-from typing import Any, Sequence
+import tempfile
+from typing import Any, Iterator, Sequence
 
 SERVER_NAME = "notify-oracle"
 SERVER_VERSION = "1.0.0"
@@ -47,6 +50,15 @@ MAX_RESPONSE_BYTES = 128 * 1024
 MAX_SQL_CHARS = 100_000
 CALL_TIMEOUT_MS = 15_000
 CONNECT_TIMEOUT_SECONDS = 10
+
+# A python-oracledb thin-mode wallet needs ewallet.pem; tnsnames.ora and
+# sqlnet.ora locate the services. The Java-format files (cwallet.sso,
+# ewallet.p12 and the keystores) are for thick mode and can make the thin
+# driver prompt for a PEM pass phrase.
+WALLET_FILE_CANDIDATES = ("ewallet.pem", "cwallet.sso", "ewallet.p12")
+WALLET_EXPECTED = "ewallet.pem (thin mode), cwallet.sso, or ewallet.p12"
+THIN_WALLET_FILES = ("tnsnames.ora", "ewallet.pem", "sqlnet.ora")
+JAVA_WALLET_FILES = frozenset({"cwallet.sso", "ewallet.p12"})
 
 # Keywords that must never appear outside a string literal or quoted
 # identifier. The first token must be SELECT or WITH, but a WITH clause in
@@ -316,12 +328,57 @@ def _config() -> _Config:
     try:
         entries = set(os.listdir(wallet))
     except OSError:
-        raise ConfigError("Oracle wallet directory is not mounted") from None
-    if not entries & {"cwallet.sso", "ewallet.p12"}:
+        raise ConfigError(
+            f"Oracle wallet directory is not mounted; expected {WALLET_EXPECTED}"
+        ) from None
+    if not entries:
         # An empty bind mount is still a directory. Fail closed instead of
         # trying to connect without a wallet.
-        raise ConfigError("Oracle wallet directory is not mounted")
+        raise ConfigError(
+            f"Oracle wallet directory is empty; expected {WALLET_EXPECTED}"
+        )
+    if not entries.intersection(WALLET_FILE_CANDIDATES):
+        # The directory can contain tnsnames.ora or sqlnet.ora and still have
+        # no usable wallet. Name the files that would have been accepted.
+        raise ConfigError(
+            "Oracle wallet directory has no recognised wallet file; expected "
+            f"{WALLET_EXPECTED}"
+        )
     return _Config(user, password, dsn, wallet)
+
+
+@contextlib.contextmanager
+def _wallet_for_connection(wallet: str) -> Iterator[str]:
+    """Yield the directory to pass to python-oracledb.
+
+    Thin mode reads ``ewallet.pem``. If ``cwallet.sso`` or ``ewallet.p12`` is
+    also present, the driver can try the Java-format wallet and prompt for a
+    PEM pass phrase, which would hang a cron container with no terminal. In
+    that case stage only the thin-mode files in a private temporary directory
+    so the PEM wallet is always the one used. The wallet itself is never
+    modified.
+    """
+
+    try:
+        entries = set(os.listdir(wallet))
+    except OSError:
+        # _config() already validates the directory. This keeps the helper
+        # usable in tests that inject a config without a real mount.
+        yield wallet
+        return
+
+    if "ewallet.pem" not in entries or not entries.intersection(
+        JAVA_WALLET_FILES
+    ):
+        yield wallet
+        return
+
+    with tempfile.TemporaryDirectory(prefix="oracle-wallet-") as staged:
+        for name in THIN_WALLET_FILES:
+            if name in entries:
+                target = os.path.join(wallet, name)
+                os.symlink(target, os.path.join(staged, name))
+        yield staged
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -344,45 +401,46 @@ def _run_query(statement: str) -> str:
 
     connection = None
     cursor = None
-    try:
-        connection = oracledb.connect(
-            user=config.user,
-            password=config.password,
-            dsn=config.dsn,
-            config_dir=config.wallet,
-            wallet_location=config.wallet,
-            tcp_connect_timeout=CONNECT_TIMEOUT_SECONDS,
-        )
-        connection.call_timeout = CALL_TIMEOUT_MS
+    with _wallet_for_connection(config.wallet) as wallet_dir:
+        try:
+            connection = oracledb.connect(
+                user=config.user,
+                password=config.password,
+                dsn=config.dsn,
+                config_dir=wallet_dir,
+                wallet_location=wallet_dir,
+                tcp_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            )
+            connection.call_timeout = CALL_TIMEOUT_MS
 
-        cursor = connection.cursor()
-        # Defense in depth: the session itself refuses to write even if the
-        # lexical guard were bypassed.
-        cursor.execute("SET TRANSACTION READ ONLY")
-        cursor.execute(statement)
+            cursor = connection.cursor()
+            # Defense in depth: the session itself refuses to write even if the
+            # lexical guard were bypassed.
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute(statement)
 
-        description = cursor.description or []
-        columns = [column[0] for column in description]
-        fetched = cursor.fetchmany(MAX_ROWS + 1)
-        truncated = len(fetched) > MAX_ROWS
-        rows = [[value for value in row] for row in fetched[:MAX_ROWS]]
+            description = cursor.description or []
+            columns = [column[0] for column in description]
+            fetched = cursor.fetchmany(MAX_ROWS + 1)
+            truncated = len(fetched) > MAX_ROWS
+            rows = [[value for value in row] for row in fetched[:MAX_ROWS]]
 
-        return _fit_response(columns, rows, truncated)
-    finally:
-        if cursor is not None:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-        if connection is not None:
-            try:
-                connection.rollback()
-            except Exception:
-                pass
-            try:
-                connection.close()
-            except Exception:
-                pass
+            return _fit_response(columns, rows, truncated)
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 def call_query(sql: Any) -> tuple[str, bool]:
