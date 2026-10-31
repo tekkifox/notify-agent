@@ -22,6 +22,9 @@ Design constraints, because this runs inside a 512 MB cron container:
 * Fail closed. The SQL guard runs before a connection is opened.
 * No secrets in logs, errors, or tool output. Connection details never leave
   the process.
+* The stdio transport stays clean. While the driver runs, stdin is detached
+  from the JSON-RPC stream, so a prompt is an immediate EOF and an error, not
+  a hung server waiting for a passphrase.
 
 Environment (all required to query, none baked into the image):
 
@@ -30,11 +33,17 @@ Environment (all required to query, none baked into the image):
 ``ORACLE_WALLET_DIR`` is the in-container path of a read-only wallet mount,
 normally ``/wallet``. A thin-mode wallet contains ``tnsnames.ora``,
 ``ewallet.pem`` and ``sqlnet.ora``; the Java-format files are not needed.
+
+The driver gets ``config_dir`` only. It resolves both ``tnsnames.ora`` and the
+PEM wallet, and the ADB PEM is not password-protected, so there is no wallet
+passphrase variable and no prompt. Never pass ``wallet_location``: in thin
+mode it makes the driver ask for a PEM pass phrase on stdin.
 """
 
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import re
@@ -519,6 +528,47 @@ def _wallet_for_connection(wallet: str) -> Iterator[str]:
         yield staged
 
 
+@contextlib.contextmanager
+def _stdin_guarded() -> Iterator[None]:
+    """Detach stdin from the MCP stream while the driver runs.
+
+    The JSON-RPC transport is this process's stdin. A driver prompt for a PEM
+    pass phrase would read protocol traffic and hang the client until the
+    request times out. Point file descriptor 0 at ``/dev/null`` and replace
+    ``sys.stdin`` with an empty stream for the duration of the driver call,
+    so any prompt gets an immediate EOF and fails instead of waiting. The real
+    stdin is restored afterwards, so buffered and later JSON-RPC lines are
+    unaffected.
+    """
+
+    try:
+        protocol_stdin = os.dup(0)
+    except OSError:
+        # No stdin is open, so there is nothing a prompt could consume.
+        yield
+        return
+
+    try:
+        devnull = os.open(os.devnull, os.O_RDONLY)
+    except OSError:
+        os.close(protocol_stdin)
+        yield
+        return
+
+    original_stdin = sys.stdin
+    try:
+        os.dup2(devnull, 0)
+        sys.stdin = io.StringIO("")
+        yield
+    finally:
+        sys.stdin = original_stdin
+        try:
+            os.dup2(protocol_stdin, 0)
+        finally:
+            os.close(protocol_stdin)
+            os.close(devnull)
+
+
 def _safe_error(exc: BaseException) -> str:
     """Return a short error that cannot contain a DSN, password or wallet."""
 
@@ -538,14 +588,16 @@ def _connection(config: _Config) -> Iterator[Any]:
 
     connection = None
     cursor = None
-    with _wallet_for_connection(config.wallet) as wallet_dir:
+    with _wallet_for_connection(config.wallet) as wallet_dir, _stdin_guarded():
         try:
+            # config_dir resolves tnsnames.ora and the PEM wallet. Do not pass
+            # wallet_location: in thin mode it makes the driver prompt for a
+            # PEM pass phrase on stdin, which is the MCP JSON-RPC stream.
             connection = oracledb.connect(
                 user=config.user,
                 password=config.password,
                 dsn=config.dsn,
                 config_dir=wallet_dir,
-                wallet_location=wallet_dir,
                 tcp_connect_timeout=CONNECT_TIMEOUT_SECONDS,
             )
             connection.call_timeout = CALL_TIMEOUT_MS
