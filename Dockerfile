@@ -4,7 +4,7 @@
 # carries the glibc/libstdc++ runtime the standalone OpenCode binary expects.
 FROM node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
 
-ARG OPENCODE_VERSION=1.19.5
+ARG OPENCODE_VERSION=2.2.1
 ARG SUPERCRONIC_VERSION=0.2.51
 
 # Runtime tools only. supercronic is a static Go binary, so no Cron daemon and
@@ -46,13 +46,15 @@ RUN groupadd --gid 10001 agent \
 
 USER 10001:10001
 
-# Official standalone installer, pinned. Install under /opt so the runtime
-# HOME can stay fully read-only except for tmpfs and the data volume.
+# Official standalone installer, pinned. OpenCode 2 (and later) use the /v2
+# installer; the original /install script refuses 2.x releases. Install under
+# /opt so the runtime HOME can stay fully read-only except for tmpfs and the
+# data volume.
 ENV PATH=/opt/opencode/.opencode/bin:$PATH
 RUN HOME=/opt/opencode \
-      curl -fsSL --proto '=https' https://opencode.ai/install \
+      curl -fsSL --proto '=https' https://opencode.ai/v2/install \
       | HOME=/opt/opencode bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path \
- && test "$(opencode --version)" = "${OPENCODE_VERSION}"
+ && test "$(opencode --version)" = "opencode v${OPENCODE_VERSION}"
 
 WORKDIR /app
 
@@ -62,6 +64,7 @@ COPY --chown=10001:10001 prompts/ /app/prompts/
 
 ENV HOME=/home/agent \
     OPENCODE_CONFIG=/app/opencode.json \
+    OPENCODE_DISABLE_PROJECT_CONFIG=1 \
     XDG_DATA_HOME=/home/agent/.local/share \
     XDG_CONFIG_HOME=/home/agent/.config \
     XDG_CACHE_HOME=/home/agent/.cache \

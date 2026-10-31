@@ -78,10 +78,13 @@ else
     prompt=$instruction
 fi
 
-# --pure disables external plugins for a reproducible run. There is no --auto:
-# anything not explicitly allowed by opencode.json is denied.
+# OpenCode 2 removed --pure. --standalone runs a private server for this one
+# invocation instead of attaching to (or leaving behind) a shared background
+# service, which is what an unattended cron job wants. No plugins are installed
+# in the image, so the run stays reproducible. There is no --auto: anything not
+# explicitly allowed by opencode.json is denied.
 exec opencode run \
-    --pure \
+    --standalone \
     --agent notify \
     --model "$OPENCODE_MODEL" \
     -- "$prompt"
