@@ -76,6 +76,13 @@ MAX_SEARCH_LIMIT = 20
 MAX_CHUNK_CHARS = 500
 MAX_SEARCH_QUERY_CHARS = 2_000
 
+# Set by run-prompt.sh for a target with ``allow_content`` false. The MCP
+# server inherits the environment of the opencode process that spawns it, so
+# this is a hard block even when the model ignores the instruction. Any
+# non-empty value disables the tool.
+CONTENT_DISABLED_ENV = "NOTIFY_CONTENT_DISABLED"
+CONTENT_DISABLED_ERROR = "content search is disabled for this run"
+
 SEARCH_SQL = (
     "SELECT kind, slug, title, section, chunk, source_updated,\n"
     "       ROUND(VECTOR_DISTANCE(embedding, ADMIN.EMBED_TEXT(:query), "
@@ -695,8 +702,17 @@ def call_query(sql: Any) -> tuple[str, bool]:
         return _dumps({"error": _safe_error(exc)}), True
 
 
+def content_disabled() -> bool:
+    """Return true when the current notification target forbids content."""
+
+    return bool(os.environ.get(CONTENT_DISABLED_ENV))
+
+
 def call_search_content(query: Any, limit: Any = None) -> tuple[str, bool]:
     """Return (text, is_error) for one search_content invocation."""
+
+    if content_disabled():
+        return _dumps({"error": CONTENT_DISABLED_ERROR}), True
 
     try:
         text = prepare_search_query(query)

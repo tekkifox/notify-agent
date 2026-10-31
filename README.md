@@ -201,6 +201,12 @@ treat retrieved text as instructions, and never invent content a search did not
 return. The operator can ask, for example, "post a summary of my latest project
 write-up" or "remind me what my CV says about storage".
 
+A target with `allow_content: false` blocks this tool hard. `run-prompt.sh`
+exports `NOTIFY_CONTENT_DISABLED=1` for the run, and `search_content` returns
+`content search is disabled for this run` without opening a connection. The
+tool is still listed, so a model that ignores the instruction gets a clear tool
+error rather than a silent fallback to the operator's CMS.
+
 ### Configuration
 
 Add these to `stack.env` for a plain compose run, or as stack environment
@@ -411,6 +417,8 @@ A failed job exits non-zero and is visible in the log, but there is no automatic
 
 - Reads the message from stdin or from `-m MESSAGE`.
 - Accepts `-t NAME` / `--target NAME` to select a named Composio target.
+- Validates `NOTIFY_TARGETS` before any request, including an optional
+  `host_scope`; malformed values fail by target name only, never by id.
 - Uses Discord when `DISCORD_WEBHOOK_URL` is set.
 - Otherwise uses Composio when both `COMPOSIO_API_KEY` and `COMPOSIO_TOOL` are set.
 - Otherwise exits `1` with a short reason.
@@ -460,16 +468,28 @@ bot connections. A schedule names one instead of carrying a channel id:
 ```
 
 `NOTIFY_TARGETS` is the operator-defined allowlist. It is a JSON object whose
-keys are target names and whose values need a `channel_id` and may pin a
-`connected_account_id` for that bot connection:
+keys are target names and whose values need a `channel_id`, may pin a
+`connected_account_id` for that bot connection, and may declare the optional
+`host_scope` and `allow_content` guards:
 
 ```sh
-NOTIFY_TARGETS='{"general":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000"},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111"}}'
+NOTIFY_TARGETS='{"general":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000"},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":"vortexservers.co.uk","allow_content":false}}'
 NOTIFY_DEFAULT_TARGET=general
 ```
 
 Both names above are placeholders. Put real ids only in `stack.env`, which is
 gitignored and mode `0600`.
+
+`host_scope` is the host (or list of hosts) a message to that target may talk
+about. `allow_content` is a boolean, default `true`; when it is `false` the
+target may not use the content-search tool at all. `general` is unscoped and
+may report on anything. `admin-chat` is scoped to `vortexservers.co.uk` with
+`allow_content: false`, so it gets host data only from
+`NOTIFY_RO.HOST_STATS_V` and nothing about the captain's site, CV, projects or
+pages. An admin channel in the game-hosting server must not leak the operator's
+other infrastructure or CMS content. A new channel on the same server gets the
+same protection by giving its target the same guard values, without changing
+code.
 
 Resolution works like this:
 
@@ -479,6 +499,29 @@ Resolution works like this:
 - The target's `channel_id` and `connected_account_id` are merged into the tool
   arguments and win over the same keys in `COMPOSIO_ARGS`; the target's
   connected account also wins over `COMPOSIO_CONNECTED_ACCOUNT_ID`.
+- An optional `host_scope` is a non-empty string or a non-empty array of
+  non-empty strings. It names the only host(s) a message to that target may
+  talk about; absent means no restriction. A malformed value fails before any
+  request and names the offending targets, never their ids.
+- An optional `allow_content` must be a JSON boolean. When a target sets it
+  `false`, `run-prompt.sh` adds a plain-words line to the instruction: do not
+  use the content-search tool, and do not include anything about the operator's
+  site, CV, projects or pages. A malformed value fails before any request and
+  names the offending targets, never their ids.
+- `run-prompt.sh` resolves the effective target's `host_scope` and adds a
+  plain-words line to the instruction: the delivery scope for the run, and that
+  nothing about any other host may appear in the message. `prompts/notify.md`
+  turns that into a hard rule: filter `host_label` to the scoped host, report
+  only that host, never mention another host even in passing, and say plainly
+  when the scoped host has no data instead of falling back to another host's
+  numbers. With no scope, the instruction is byte-identical to before.
+- `allow_content: false` is also a hard guard, not only an instruction:
+  `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` before it execs
+  `opencode`, and `mcp/oracle_query.py` refuses every `search_content` call with
+  `content search is disabled for this run` while that variable is non-empty.
+  The MCP server is a child of the opencode process, so it inherits the value.
+  A target without the flag, or with `true`, behaves exactly as before and the
+  variable is not exported.
 - An unknown name fails non-zero before any request and lists the configured
   target names, never their ids.
 - A malformed `NOTIFY_TARGETS` (not an object, or an entry with no `channel_id`)
@@ -490,7 +533,10 @@ The model cannot choose a destination. `run-prompt.sh` puts the schedule's
 target name into the instruction and the agent's prompt tells it to repeat that
 name verbatim; the actual channel and connected account come only from
 `NOTIFY_TARGETS`. Even a manipulated model cannot invent a destination that is
-not in the operator's allowlist.
+not in the operator's allowlist. The destination cannot choose the subject
+either: a scoped target carries its host boundary into the instruction and the
+agent's rules, and a target with `allow_content: false` also carries a
+server-side block that the model cannot talk its way around.
 
 ## Security posture
 
@@ -547,6 +593,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
 - Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and the two Oracle tools.
+- Read published content when the selected target sets `allow_content: false`: `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` and the MCP server refuses `search_content` before it connects.
 - Read arbitrary CMS tables or write to the content index. It can only run a fixed, read-only semantic search over `ROSSMONEY.CONTENT_EMBEDDINGS`; a `query` against `ROSSMONEY.pages` or any other CMS table fails with a privilege error.
 
 **Scenarios and residual risk**
@@ -591,12 +638,14 @@ Verified while building this branch:
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
 - `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` and `oracle_search_content` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves both Oracle tools to `deny`.
-- The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 59 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors.
+- The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 62 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors, plus `NOTIFY_CONTENT_DISABLED=1` refusing `search_content` with a clear tool error and behaving unchanged when unset.
 - The MCP stdio handshake in the image returns two tools, `query` and `search_content`, and its guard/input errors are tool errors rather than protocol failures. A `search_content` call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, password, or the query text.
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
-- The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
+- The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
+- The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs.
+- The environment inheritance assumption was checked in the image built from this branch (`notify-agent:target-scope`), not just in the unit tests. A temporary local MCP server was spawned by `opencode run --standalone` with `NOTIFY_CONTENT_DISABLED=1` in the parent environment; the child's `/probe/env.txt` contained `NOTIFY_CONTENT_DISABLED=1` and `PYTHONUNBUFFERED=1`, so OpenCode merges the parent environment into the configured MCP environment. Running the installed `/app/mcp/oracle_query.py` over stdio in the same image returned `{"error":"content search is disabled for this run"}` with `isError: true` when the variable was set, and `Oracle connection is not configured` without it.
 
 Not verified, because this repository contains no credentials:
 

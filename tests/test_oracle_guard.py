@@ -729,5 +729,50 @@ class SearchExecutionTests(unittest.TestCase):
         )
 
 
+class ContentDisabledTests(unittest.TestCase):
+    """A target with allow_content false must block search_content outright."""
+
+    def test_search_content_refuses_when_the_environment_disables_it(self) -> None:
+        with mock.patch.dict(
+            os.environ, {oracle_query.CONTENT_DISABLED_ENV: "1"}, clear=True
+        ):
+            text, is_error = oracle_query.call_search_content("storage servers")
+        self.assertTrue(is_error)
+        self.assertEqual(
+            json.loads(text), {"error": oracle_query.CONTENT_DISABLED_ERROR}
+        )
+        self.assertNotIn("storage servers", text)
+
+    def test_tools_call_reports_the_block(self) -> None:
+        with mock.patch.dict(
+            os.environ, {oracle_query.CONTENT_DISABLED_ENV: "1"}, clear=True
+        ), mock.patch.object(oracle_query, "_write") as write:
+            oracle_query._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_content",
+                        "arguments": {"query": "the CV"},
+                    },
+                }
+            )
+        message = write.call_args.args[0]
+        self.assertTrue(message["result"]["isError"])
+        self.assertIn(
+            oracle_query.CONTENT_DISABLED_ERROR,
+            message["result"]["content"][0]["text"],
+        )
+
+    def test_search_content_is_unchanged_without_the_flag(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            text, is_error = oracle_query.call_search_content("storage servers")
+        # It gets past the content block and fails on the missing Oracle config,
+        # exactly as it did before this guard existed.
+        self.assertTrue(is_error)
+        self.assertIn("not configured", text)
+
+
 if __name__ == "__main__":
     unittest.main()
