@@ -59,6 +59,75 @@ if [ -z "$target" ]; then
     target=${NOTIFY_DEFAULT_TARGET:-}
 fi
 
+# A target may declare a delivery host_scope and an allow_content flag.
+# Resolve them here so the instruction can state the boundaries; notify.sh
+# validates the same fields again before sending. A malformed value fails by
+# target name only, never by id.
+target_host_scope=
+target_content_disabled=0
+if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
+    command -v jq >/dev/null 2>&1 || {
+        printf 'run-prompt: jq is required to resolve target host_scope\n' >&2
+        exit 1
+    }
+    targets_json=$(printf '%s' "$NOTIFY_TARGETS" | jq -ce '
+        if type != "object" then error("not an object") else . end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: NOTIFY_TARGETS must be a JSON object mapping names to targets\n' >&2
+        exit 1
+    }
+    bad_scope_targets=$(printf '%s' "$targets_json" | jq -r '
+        def valid_scope:
+            if type == "string" then length > 0
+            elif type == "array" then
+                length > 0 and all(.[]; type == "string" and length > 0)
+            else false end;
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("host_scope"))
+          | select((.value.host_scope | valid_scope) | not)
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not validate NOTIFY_TARGETS host_scope\n' >&2
+        exit 1
+    }
+    if [ -n "$bad_scope_targets" ]; then
+        printf 'run-prompt: invalid host_scope for target(s) %s: expected a non-empty string or an array of non-empty strings\n' "$bad_scope_targets" >&2
+        exit 1
+    fi
+    target_host_scope=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) then
+            .[$name].host_scope // empty
+            | if type == "array" then map("`" + . + "`") | join(", ") else "`" + . + "`" end
+        else empty end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+    bad_content_targets=$(printf '%s' "$targets_json" | jq -r '
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("allow_content"))
+          | select((.value.allow_content | type) != "boolean")
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not validate NOTIFY_TARGETS allow_content\n' >&2
+        exit 1
+    }
+    if [ -n "$bad_content_targets" ]; then
+        printf 'run-prompt: invalid allow_content for target(s) %s: expected a boolean\n' "$bad_content_targets" >&2
+        exit 1
+    fi
+    target_content_disabled=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name].allow_content == false) then "1" else "0" end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+fi
+
 command -v opencode >/dev/null 2>&1 || {
     printf 'run-prompt: opencode is not installed or not on PATH\n' >&2
     exit 1
@@ -74,8 +143,26 @@ if [ -n "$target" ]; then
 
 The target for this run is \`${target}\`. Send with:
 /app/scripts/notify.sh -t ${target} -m \"<message>\""
+    if [ -n "$target_host_scope" ]; then
+        prompt="${prompt}
+
+The delivery scope for this run is ${target_host_scope}. Nothing about any other host may appear in the message: report only on the scoped host, and if there is no data for it, say that plainly instead of using another host's numbers."
+    fi
+    if [ "$target_content_disabled" -eq 1 ]; then
+        prompt="${prompt}
+
+Content search is disabled for this run: do not use the content search tool, and do not include anything about the operator's site, CV, projects or pages. Report host data only."
+    fi
 else
     prompt=$instruction
+fi
+
+# The MCP server is spawned by opencode as a child process. Export the
+# content-search block so oracle_query.py can refuse the tool even if the
+# instruction is ignored.
+if [ "$target_content_disabled" -eq 1 ]; then
+    NOTIFY_CONTENT_DISABLED=1
+    export NOTIFY_CONTENT_DISABLED
 fi
 
 # OpenCode 2 removed --pure. --standalone runs a private server for this one

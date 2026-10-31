@@ -233,6 +233,59 @@ else
     pass "malformed NOTIFY_TARGETS message does not echo the value"
 fi
 
+# 3b. A malformed host_scope fails before any request and names the target,
+#     never its id.
+bad_case=0
+for bad in \
+    '{"general":{"channel_id":"111111111111111111","host_scope":123}}' \
+    '{"general":{"channel_id":"111111111111111111","host_scope":["vortexservers.co.uk",7]}}' \
+    '{"general":{"channel_id":"111111111111111111","host_scope":[]}}' \
+    '{"general":{"channel_id":"111111111111111111","host_scope":""}}' \
+    '{"general":{"channel_id":"111111111111111111","host_scope":{"host":"vortexservers.co.uk"}}}'; do
+    bad_case=$((bad_case + 1))
+    expect_fail "malformed host_scope case $bad_case fails without a request" \
+        send NOTIFY_TARGETS="$bad"
+done
+set +e
+out=$(send NOTIFY_TARGETS='{"general":{"channel_id":"111111111111111111","host_scope":123}}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "malformed host_scope: expected failure"
+elif ! contains "$out" "general"; then
+    no "malformed host_scope: message did not name the target"
+elif contains "$out" "111111111111111111"; then
+    no "malformed host_scope: message leaked an id"
+else
+    pass "malformed host_scope message names the target only"
+fi
+
+# 3c. A malformed allow_content fails before any request and names the target,
+#     never its id.
+bad_case=0
+for bad in \
+    '{"general":{"channel_id":"111111111111111111","allow_content":"false"}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_content":0}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_content":null}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_content":[]}}'; do
+    bad_case=$((bad_case + 1))
+    expect_fail "malformed allow_content case $bad_case fails without a request" \
+        send NOTIFY_TARGETS="$bad"
+done
+set +e
+out=$(send NOTIFY_TARGETS='{"general":{"channel_id":"111111111111111111","allow_content":"false"}}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "malformed allow_content: expected failure"
+elif ! contains "$out" "general"; then
+    no "malformed allow_content: message did not name the target"
+elif contains "$out" "111111111111111111"; then
+    no "malformed allow_content: message leaked an id"
+else
+    pass "malformed allow_content message names the target only"
+fi
+
 # 4. -t is rejected when a webhook is configured.
 expect_fail "-t rejected when DISCORD_WEBHOOK_URL is set" \
     send_target general NOTIFY_TARGETS="$targets" \

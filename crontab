@@ -7,8 +7,10 @@
 #   <five cron fields>  /app/scripts/run-prompt.sh [-t <name>] "<prompt>"
 #
 # -t names a destination in NOTIFY_TARGETS. The name must exist there; an
-# unknown name fails before sending. Omit -t to use NOTIFY_DEFAULT_TARGET, or
-# the legacy COMPOSIO_ARGS configuration when no default is set.
+# unknown name fails before sending. A target with a host_scope also tells the
+# agent which host the message may talk about, and allow_content false blocks
+# the content-search tool for that run. Omit -t to use NOTIFY_DEFAULT_TARGET,
+# or the legacy COMPOSIO_ARGS configuration when no default is set.
 #
 # The five fields are minute, hour, day-of-month, month, day-of-week.
 # Times use the container's TZ (set TZ in stack.env; default is UTC).

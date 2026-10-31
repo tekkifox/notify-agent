@@ -31,7 +31,9 @@ Delivery selection:
 
 Named targets (Composio only):
   -t, --target NAME        send to a name defined in NOTIFY_TARGETS
-  NOTIFY_TARGETS           JSON object: name -> {channel_id, connected_account_id}
+  NOTIFY_TARGETS           JSON object: name -> {channel_id, connected_account_id,
+                           host_scope, allow_content}
+                           host_scope and allow_content are optional target guards.
   NOTIFY_DEFAULT_TARGET    target name used when -t is omitted
   The name must exist in NOTIFY_TARGETS; unknown names fail without sending.
   A target cannot be combined with DISCORD_WEBHOOK_URL.
@@ -132,6 +134,41 @@ if [ -n "${NOTIFY_TARGETS:-}" ]; then
           then . else error("invalid entry") end
     ' 2>/dev/null) \
         || fail "NOTIFY_TARGETS must be a JSON object mapping names to objects with a channel_id"
+
+    # host_scope is optional: a non-empty string, or a non-empty array of
+    # non-empty strings. Report bad entries by name only, never their ids.
+    bad_scope_targets=$(printf '%s' "$targets_json" | jq -r '
+        def valid_scope:
+            if type == "string" then length > 0
+            elif type == "array" then
+                length > 0 and all(.[]; type == "string" and length > 0)
+            else false end;
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("host_scope"))
+          | select((.value.host_scope | valid_scope) | not)
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) \
+        || fail "could not validate NOTIFY_TARGETS host_scope"
+    if [ -n "$bad_scope_targets" ]; then
+        fail "invalid host_scope for target(s) ${bad_scope_targets}: expected a non-empty string or an array of non-empty strings"
+    fi
+
+    # allow_content is optional and must be a JSON boolean when present.
+    # Report bad entries by name only, never their ids.
+    bad_content_targets=$(printf '%s' "$targets_json" | jq -r '
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("allow_content"))
+          | select((.value.allow_content | type) != "boolean")
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) \
+        || fail "could not validate NOTIFY_TARGETS allow_content"
+    if [ -n "$bad_content_targets" ]; then
+        fail "invalid allow_content for target(s) ${bad_content_targets}: expected a boolean"
+    fi
 fi
 
 # -t wins over NOTIFY_DEFAULT_TARGET. With neither, delivery keeps its legacy
