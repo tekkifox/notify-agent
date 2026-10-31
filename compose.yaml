@@ -1,0 +1,67 @@
+name: notify-agent
+
+services:
+  agent:
+    build:
+      context: .
+      args:
+        OPENCODE_VERSION: "1.19.5"
+        SUPERCRONIC_VERSION: "0.2.51"
+    image: notify-agent:1.19.5
+    container_name: notify-agent
+
+    # The image ENTRYPOINT is ["supercronic", "/app/crontab"]. This dispatcher
+    # execs that exact command with no arguments, and keeps `docker compose run
+    # agent <command>` working for auth, manual sends, and debugging.
+    entrypoint: ["/app/scripts/entrypoint.sh"]
+
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    # Secrets only, never baked into the image. Copy stack.env.example to
+    # stack.env and chmod 600. `required: false` keeps `docker compose config`
+    # valid on a fresh checkout; delivery fails loudly if it is missing.
+    env_file:
+      - path: stack.env
+        required: false
+
+    environment:
+      HOME: /home/agent
+      OPENCODE_CONFIG: /app/opencode.json
+      XDG_DATA_HOME: /home/agent/.local/share
+      XDG_CONFIG_HOME: /home/agent/.config
+      XDG_CACHE_HOME: /home/agent/.cache
+      XDG_STATE_HOME: /home/agent/.local/state
+
+    # Root filesystem is immutable. Only the named volume and these tmpfs
+    # mounts are writable. OpenCode needs home/cache/state/tmp paths.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /home/agent/.config:rw,nosuid,nodev,size=8m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.cache:rw,nosuid,nodev,size=64m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.local/state:rw,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.opencode:rw,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+
+    # Durable auth + sessions. This is the only persistent writable state.
+    volumes:
+      - opencode-data:/home/agent/.local/share/opencode
+
+    # No ports: outbound only. No Docker socket, no host /etc or /home,
+    # no privileged mode.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 200
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  opencode-data:

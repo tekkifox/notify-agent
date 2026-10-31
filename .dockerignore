@@ -1,0 +1,11 @@
+.git
+.gitignore
+.dockerignore
+README.md
+stack.env
+.env
+.env.*
+state
+data
+*.log
+.DS_Store

@@ -1,0 +1,18 @@
+# Secrets
+stack.env
+.env
+.env.*
+!.env.example
+
+# Local state / runtime artifacts
+state/
+data/
+*.log
+auth.json
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# OS noise
+.DS_Store
