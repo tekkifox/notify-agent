@@ -92,6 +92,14 @@ Format: one line per schedule, five cron fields, then the prompt passed to `run-
 
 The fields are minute, hour, day-of-month, month, day-of-week. Times use `TZ` from `stack.env` (default `UTC`). The file already contains a working 09:00 daily digest plus commented examples for weekdays, weekly, monthly, and hourly schedules.
 
+A schedule can also name its destination with `-t`:
+
+```cron
+0 9 * * * /app/scripts/run-prompt.sh -t general "Compose and send the 09:00 digest."
+```
+
+The name must exist in `NOTIFY_TARGETS` (see [Named targets](#named-targets)). `run-prompt.sh` puts that name into the instruction, the agent must use exactly that `-t` value, and `notify.sh` resolves it against the operator's allowlist. The model never chooses the destination: it can only repeat the name it was given, and an unknown name fails before anything is sent. With no `-t`, the schedule uses `NOTIFY_DEFAULT_TARGET` when set, and otherwise keeps the legacy `COMPOSIO_ARGS` shape.
+
 Schedules are trusted operator configuration, not user input. Anyone who can edit `crontab` can make the agent post anything.
 
 ## Read logs
@@ -109,12 +117,13 @@ A failed job exits non-zero and is visible in the log, but there is no automatic
 `scripts/notify.sh`:
 
 - Reads the message from stdin or from `-m MESSAGE`.
+- Accepts `-t NAME` / `--target NAME` to select a named Composio target.
 - Uses Discord when `DISCORD_WEBHOOK_URL` is set.
 - Otherwise uses Composio when both `COMPOSIO_API_KEY` and `COMPOSIO_TOOL` are set.
 - Otherwise exits `1` with a short reason.
 - Truncates to 2,000 Unicode characters before sending, and says so on stderr.
 - Sends `allowed_mentions: {parse: []}`, so `@everyone`, `@here`, and role pings are suppressed.
-- Exits non-zero on network errors, rate limits, and non-2xx responses. It never prints the webhook URL or API key.
+- Exits non-zero on network errors, rate limits, and non-2xx responses. It never prints the webhook URL, target ids, or API key.
 - Does not follow redirects and requires `https://`.
 
 ### Composio path
@@ -148,6 +157,48 @@ The payload sent is `{"user_id": ..., "connected_account_id": ...,
 "arguments": {...}}`; `connected_account_id` is absent when unset. The webhook
 path still takes precedence whenever `DISCORD_WEBHOOK_URL` is set.
 
+### Named targets
+
+There are real destinations on different Discord servers, behind different
+bot connections. A schedule names one instead of carrying a channel id:
+
+```cron
+0 9 * * * /app/scripts/run-prompt.sh -t admin-chat "Compose and send the daily digest."
+```
+
+`NOTIFY_TARGETS` is the operator-defined allowlist. It is a JSON object whose
+keys are target names and whose values need a `channel_id` and may pin a
+`connected_account_id` for that bot connection:
+
+```sh
+NOTIFY_TARGETS='{"general":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000"},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111"}}'
+NOTIFY_DEFAULT_TARGET=general
+```
+
+Both names above are placeholders. Put real ids only in `stack.env`, which is
+gitignored and mode `0600`.
+
+Resolution works like this:
+
+- `-t NAME` selects a target. When `-t` is omitted, `NOTIFY_DEFAULT_TARGET`
+  applies. When neither is set, delivery keeps the legacy shape exactly:
+  `COMPOSIO_ARGS` plus `COMPOSIO_CONNECTED_ACCOUNT_ID`, with no target lookup.
+- The target's `channel_id` and `connected_account_id` are merged into the tool
+  arguments and win over the same keys in `COMPOSIO_ARGS`; the target's
+  connected account also wins over `COMPOSIO_CONNECTED_ACCOUNT_ID`.
+- An unknown name fails non-zero before any request and lists the configured
+  target names, never their ids.
+- A malformed `NOTIFY_TARGETS` (not an object, or an entry with no `channel_id`)
+  fails before any request without echoing the value.
+- `-t` with `DISCORD_WEBHOOK_URL` set is a failure, not a silent fallback: a
+  webhook has no targets. Remove the webhook to use named targets.
+
+The model cannot choose a destination. `run-prompt.sh` puts the schedule's
+target name into the instruction and the agent's prompt tells it to repeat that
+name verbatim; the actual channel and connected account come only from
+`NOTIFY_TARGETS`. Even a manipulated model cannot invent a destination that is
+not in the operator's allowlist.
+
 ## Security posture
 
 These are enforced in `compose.yaml`, not conventions:
@@ -168,7 +219,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Host mounts | none beyond the named volume |
 | Privileged mode | never used |
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...` is allowed |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...` are allowed |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
 
@@ -189,7 +240,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 
 - Reach the internet outbound.
 - Read its environment (including the webhook and provider credentials).
-- Call exactly one shell command, `/app/scripts/notify.sh -m ...`, through the OpenCode bash tool.
+- Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`.
 - Write only to the named volume and tmpfs.
 
 **What it cannot do**
@@ -226,10 +277,11 @@ Verified while building this branch:
   `uid=10001(agent) gid=10001(agent) groups=10001(agent)` and `v0.2.51`.
 - The same image reports OpenCode `1.19.5`.
 - Running the compose service shows a read-only root filesystem, `CapEff: 0`, `NoNewPrivs: 1`, memory limit `536870912`, pids limit `200`, one writable named volume, and no published ports.
-- `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on all three scripts.
+- `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agent notify` resolves with `bash` as the only enabled tool and a deny-all rule except `/app/scripts/notify.sh`.
+- `opencode debug agent notify` resolves with `bash` as the only enabled tool and a deny-all rule except `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`.
+- The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
 
 Not verified, because this repository contains no credentials:
 
