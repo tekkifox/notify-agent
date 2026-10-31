@@ -342,6 +342,103 @@ class QueryExecutionTests(unittest.TestCase):
         self.assertNotIn("/wallet", text)
 
 
+class WalletConnectTests(unittest.TestCase):
+    """The thin-mode connect must never ask for a wallet passphrase."""
+
+    def _connect(self, wallet: str) -> tuple[dict[str, object], str]:
+        class FakeCursor:
+            description = [("N",)]
+
+            def execute(self, statement: str) -> None:
+                pass
+
+            def fetchmany(self, size: int) -> list[tuple[int]]:
+                return [(1,)]
+
+            def close(self) -> None:
+                pass
+
+        class FakeConnection:
+            call_timeout = None
+
+            def cursor(self) -> FakeCursor:
+                return FakeCursor()
+
+            def rollback(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        fake = types.ModuleType("oracledb")
+        fake.defaults = types.SimpleNamespace(fetch_lobs=True)
+        captured: dict[str, object] = {}
+
+        def connect(**kwargs: object) -> FakeConnection:
+            captured.update(kwargs)
+            # A passphrase prompt would read fd 0. It must be EOF, never the
+            # JSON-RPC stream that is the server's stdin.
+            captured["stdin_read"] = os.read(0, 1)
+            return FakeConnection()
+
+        fake.connect = connect
+
+        config = oracle_query._Config("user", "password", "dsn", wallet)
+        with mock.patch.dict(sys.modules, {"oracledb": fake}), mock.patch.object(
+            oracle_query, "_config", return_value=config
+        ):
+            text = oracle_query._run_query("SELECT 1 FROM dual")
+        return captured, text
+
+    def test_wallet_location_is_never_passed(self) -> None:
+        # Passing wallet_location without a password makes the thin driver
+        # prompt for a PEM pass phrase on stdin. config_dir alone is enough.
+        captured, _ = self._connect("/wallet")
+        self.assertNotIn("wallet_location", captured)
+        self.assertNotIn("wallet_password", captured)
+        self.assertEqual(captured["config_dir"], "/wallet")
+
+    def test_wallet_password_env_does_not_enable_the_prompt_path(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"ORACLE_WALLET_PASSWORD": "secret"}, clear=False
+        ):
+            captured, _ = self._connect("/wallet")
+        self.assertNotIn("wallet_location", captured)
+        self.assertNotIn("wallet_password", captured)
+
+    def test_stdin_is_detached_while_the_driver_connects(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x")
+        saved = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)
+            captured, _ = self._connect("/wallet")
+            self.assertEqual(captured["stdin_read"], b"")
+            # The unread protocol byte survives the connection.
+            self.assertEqual(os.read(0, 1), b"x")
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_stdin_guard_hides_and_restores_the_stream(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x")
+        saved = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)
+            with oracle_query._stdin_guarded():
+                self.assertEqual(os.read(0, 1), b"")
+                self.assertEqual(sys.stdin.read(), "")
+            self.assertEqual(os.read(0, 1), b"x")
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            os.close(read_fd)
+            os.close(write_fd)
+
+
 class SearchInputTests(unittest.TestCase):
     """Input handling for search_content, without a database."""
 
