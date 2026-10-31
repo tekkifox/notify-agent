@@ -14,6 +14,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Pinned OpenCode `1.19.5`, supercronic `0.2.51`, non-root uid `10001`. |
+| `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then triggers the Portainer redeploy webhook. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture. |
 | `crontab` | Supercronic schedules. One line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
@@ -37,6 +38,15 @@ docker compose up -d
 `stack.env` is gitignored and excluded by `.dockerignore`. It is the only place secrets enter the container. Never put a real webhook or API key in the image, `compose.yaml`, or this repository.
 
 `docker compose config` validates on a fresh checkout because `stack.env` is declared optional. If it is missing, delivery fails loudly rather than silently doing nothing.
+
+## Deploy
+
+Production runs the image published from GitHub, not a local build. A push to `main` runs `.github/workflows/publish-image.yml`, which builds `linux/amd64`, pushes `ghcr.io/tekkifox/notify-agent` to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then calls the Portainer stack webhook. `workflow_dispatch` runs the same job by hand.
+
+- The Portainer stack's compose must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`.
+- When the webhook fires, Portainer pulls the new image and recreates the `agent` container.
+- `PORTAINER_WEBHOOK_URL` is a repository secret. Copy it from **Stacks → notify-agent → Webhooks** in Portainer. If the secret is empty, the workflow still succeeds and prints a warning: the image was published, but no redeploy was triggered.
+- Recreating the container keeps the named `opencode-data` volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
 
 ## One-time authentication
 
