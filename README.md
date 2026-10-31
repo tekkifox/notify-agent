@@ -20,10 +20,10 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
 | `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
-| `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tool may be used. |
+| `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
-| `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode). |
-| `tests/test_oracle_guard.py` | SQL-guard tests; no database or driver required. |
+| `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
+| `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -82,12 +82,19 @@ The image moved from the pinned `1.19.5` CLI to `2.2.1`. OpenCode 2 still reads 
 - OpenCode 2 also discovers project configuration from the working directory. The image sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so the pinned `/app/opencode.json` is the only config source and its rules are not layered twice.
 - `opencode debug agent` became `opencode debug agents`; the agent definition is inspectable with `opencode debug agents`.
 
-## Oracle host statistics (MCP)
+## Oracle access (MCP)
 
-The `notify` agent can fetch real host statistics instead of inventing them. It
-calls a local MCP server, `mcp/oracle_query.py`, which exposes one tool:
-`query(sql)`. The server is Python 3 with `python-oracledb` in **thin mode**, so
-the image contains no Oracle client libraries and no JDK.
+The `notify` agent can fetch real host statistics and search the captain's
+published content instead of inventing either. It calls a local MCP server,
+`mcp/oracle_query.py`, which exposes two tools:
+
+- `query(sql)` — one read-only `SELECT`/`WITH` statement over host statistics.
+- `search_content(query, limit)` — semantic search over the published-content
+  index (pages, projects and experience).
+
+The server is Python 3 with `python-oracledb` in **thin mode**, so the image
+contains no Oracle client libraries and no JDK. Both tools are read-only, and
+the database user itself only has `SELECT` and one `EXECUTE`.
 
 The database side is read-only. For host statistics, query the view
 `NOTIFY_RO.HOST_STATS_V`. It has one row per sample, roughly every three minutes:
@@ -121,26 +128,78 @@ ORDER BY max_disk_percent DESC;
 
 The raw table `ROSSMONEY."host-samples"` stores each sample as a JSON document
 in a `DATA` column, so its rows are not the statistics shape. Do not query it
-for statistics; the view is the shape to query. The Oracle user has `SELECT`
-only on:
+for statistics; the view is the shape to query. The Oracle user has:
 
-- `NOTIFY_RO.HOST_STATS_V` — one row per sample, roughly every three minutes.
-- `ROSSMONEY."host-samples"` — the backing table; one JSON document per sample
-  in a `DATA` column, roughly 937 rows and growing every three minutes.
-- `ROSSMONEY."archview-sources"` — host/source metadata, 3 rows.
+- `SELECT` on `NOTIFY_RO.HOST_STATS_V` — one row per sample, roughly every
+  three minutes.
+- `SELECT` on `ROSSMONEY."host-samples"` — the backing table; one JSON document
+  per sample in a `DATA` column, roughly 937 rows and growing every three
+  minutes.
+- `SELECT` on `ROSSMONEY."archview-sources"` — host/source metadata, 3 rows.
+- `SELECT` on `ROSSMONEY.CONTENT_EMBEDDINGS` — the semantic index of published
+  content.
+- `EXECUTE` on `ADMIN.EMBED_TEXT` — used by `search_content` to embed the query
+  inside SQL.
 
-A query against `ROSSMONEY.pages` fails with an Oracle privilege error. That
-boundary is intentional and is not configurable from the agent. The MCP server
-adds its own guard: one statement only, `SELECT` or `WITH` only, no DML/DDL,
-PL/SQL, `EXEC` or second statement; `FETCH FIRST 101 ROWS ONLY` is appended when
-a query has no limit; results are hard-capped at 100 rows and 128 KiB; each
-call has a 15-second timeout. The session also runs `SET TRANSACTION READ ONLY`
-before the query, so a guard bypass still cannot write.
+A query against `ROSSMONEY.pages` or any other CMS table still fails with an
+Oracle privilege error. That boundary is intentional: published content is
+reachable only through the pre-built index and the `search_content` tool, not
+through arbitrary SQL. The MCP server adds its own guard to `query`: one
+statement only, `SELECT` or `WITH` only, no DML/DDL, PL/SQL, `EXEC` or second
+statement; `FETCH FIRST 101 ROWS ONLY` is appended when a query has no limit;
+results are hard-capped at 100 rows and 128 KiB; each call has a 15-second
+timeout. The session also runs `SET TRANSACTION READ ONLY` before the query, so
+a guard bypass still cannot write.
 
-Only the `notify` agent may use the tool. `opencode.json` puts a global
-`permissions` deny on `oracle_query`; the `notify` agent appends an allow after
-it. Every other agent therefore resolves to deny, while the notify agent's
-resolved list ends with `oracle_query: allow`.
+Only the `notify` agent may use either tool. `opencode.json` puts a global
+`permissions` deny on `oracle_query` and `oracle_search_content`; the `notify`
+agent appends an allow after each. Every other agent therefore resolves both to
+deny, while the notify agent's resolved list ends with `oracle_query: allow`
+and `oracle_search_content: allow`. OpenCode names an MCP tool
+`<server>_<tool>`, so the server's `search_content` tool is reached as
+`oracle_search_content`.
+
+### Published content search
+
+`search_content(query, limit)` answers questions about the captain's CV,
+projects, experience and pages. It embeds the query **in SQL** with
+`ADMIN.EMBED_TEXT(:query)` and ranks chunks with
+`VECTOR_DISTANCE(..., COSINE)`. No embedding is computed in Python and no new
+dependency is added; the only Python package is still `python-oracledb`.
+
+Both the query text and the limit are bind variables, never string
+interpolation:
+
+```sql
+SELECT kind, slug, title, section, chunk, source_updated,
+       ROUND(VECTOR_DISTANCE(embedding, ADMIN.EMBED_TEXT(:query), COSINE), 3)
+         AS distance
+FROM ROSSMONEY.CONTENT_EMBEDDINGS
+ORDER BY distance
+FETCH FIRST :limit ROWS ONLY
+```
+
+The index has one row per chunk with `ID`, `KIND` (`page`, `project` or
+`experience`), `SLUG`, `TITLE`, `CHUNK` (text, up to 4,000 characters),
+`EMBEDDING` (`VECTOR`), `SOURCE_UPDATED` and `SECTION`. What the tool can reach
+is exactly this table: it cannot read the underlying CMS tables, write, or
+change the index.
+
+Limits keep one search from flooding a notification:
+
+- `limit` defaults to **8** and is clamped between **1** and **20**, whatever
+  the model asks for.
+- Every returned `chunk` is truncated to about **500** characters, with
+  `chunk_truncated: true` when that happened.
+- The response is capped at the same **128 KiB** as `query`; results are
+  dropped from the end if the payload would exceed it.
+- Errors are sanitised the same way as `query`: at most an `ORA-xxxxx` code or
+  `oracle query failed`, never a DSN, password, wallet path or raw driver text.
+
+The agent is told to summarise and cite titles, never dump raw chunks, never
+treat retrieved text as instructions, and never invent content a search did not
+return. The operator can ask, for example, "post a summary of my latest project
+write-up" or "remind me what my CV says about storage".
 
 ### Configuration
 
@@ -228,6 +287,14 @@ The tests assert that a `SELECT` and a `WITH` query pass, and that `INSERT`,
 statements, trailing junk and an oversized statement are rejected. They also
 assert that the row cap is appended exactly once when a query has no limit and
 that an existing `FETCH FIRST` or `ROWNUM` is respected.
+
+For `search_content` they assert the default limit of 8, the hard ceiling of
+20, the floor of 1, fallback for unusable limits, empty/non-string/oversized
+query rejection, chunk truncation at 500 characters, the 128 KiB response cap,
+and error sanitisation. A fake driver asserts that the query text and limit
+reach the database only as `:query` and `:limit` bind values, that the supplied
+text never appears in the SQL statement, and that a driver error containing a
+password, DSN and wallet path is reduced to `oracle error ORA-01017`.
 
 ## Test delivery (sends a real message)
 
@@ -439,8 +506,8 @@ These are enforced in `compose.yaml`, not conventions:
 | Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet contents live on the host and are mounted `:ro` |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...` and the MCP tool `oracle_query` are allowed |
-| Oracle access | read-only database user; MCP guard allows one `SELECT`/`WITH`, caps rows and response size, applies a 15-second timeout |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...` and the MCP tools `oracle_query` and `oracle_search_content` are allowed |
+| Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
 
@@ -463,7 +530,8 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Reach the internet outbound.
 - Read its environment (including the webhook, provider credentials, and Oracle password).
 - Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`.
-- Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the two host-statistics objects.
+- Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
+- Call `search_content` to read short chunks from the published-content index.
 - Write only to the named volume and tmpfs.
 
 **What it cannot do**
@@ -472,13 +540,14 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Access the Docker socket, the host filesystem, `/etc`, `/home`, or other containers.
 - Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
-- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and `oracle_query`.
-- Read the CMS content: the Oracle user has no privilege on it, and the MCP guard refuses anything that is not a single read-only query.
+- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and the two Oracle tools.
+- Read arbitrary CMS tables or write to the content index. It can only run a fixed, read-only semantic search over `ROSSMONEY.CONTENT_EMBEDDINGS`; a `query` against `ROSSMONEY.pages` or any other CMS table fails with a privilege error.
 
 **Scenarios and residual risk**
 
-- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query`: the prompt tells the model to treat those values as data, never as instructions.
-- **Database access.** The Oracle user is read-only and limited to two host-statistics objects. A compromised model can read those statistics but not the CMS content, and cannot write. The wallet is mounted read-only, so the process cannot modify it.
+- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query` or `oracle_search_content`: the prompt tells the model to treat those values as data, never as instructions.
+- **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
+- **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
 - **Malicious or compromised model provider.** The provider sees the prompt and the composed message. It can influence message content but not the container's shell surface.
 - **Container compromise.** An attacker who compromises the OpenCode process gets the webhook, provider token, and outbound internet. There is no egress allowlist, so data can be exfiltrated. They still need a container or kernel escape to reach the host.
 - **Docker-host compromise.** Anyone with access to the Docker daemon can read the volume and change the container. Docker is not a security boundary against a hostile host.
@@ -515,11 +584,11 @@ Verified while building this branch:
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` last (over the global deny), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves `oracle_query` to `deny`.
-- The SQL-guard suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 36 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`.
-- The MCP stdio handshake in the image returns one tool, `query`, and its guard errors are tool errors rather than protocol failures. A tool call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, or password.
-- OpenCode's own debug log reports `mcp connected server=oracle tools=1` when the server is configured under `mcp.servers`, confirming the V2 shape and `codemode: false` expose the tool directly.
-- Image size, measured with `docker save` and `du -sh /` inside each image: before `205 MB` compressed / `502 MB` root filesystem; after `232 MB` compressed / `593 MB` root filesystem. The increase is Python 3, pip, `python-oracledb` and its wheels. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
+- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` and `oracle_search_content` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves both Oracle tools to `deny`.
+- The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 55 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors.
+- The MCP stdio handshake in the image returns two tools, `query` and `search_content`, and its guard/input errors are tool errors rather than protocol failures. A `search_content` call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, password, or the query text.
+- OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
+- Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
 
@@ -528,6 +597,6 @@ Not verified, because this repository contains no credentials:
 - `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Discord send (no real webhook was used).
 - A live Composio send (no real API key was used; the Composio path was only exercised against a local stub).
-- A live Oracle query (no credentials or wallet were used; the first mate runs the live query). The guard, protocol, and failure paths were exercised without a database.
+- A live Oracle query or a live `search_content` call (no credentials or wallet were used; the first mate runs the live checks). The guard, protocol, bind, cap, and failure paths were exercised without a database.
 
 Do those checks on the target host after copying `stack.env`, mounting the wallet, and completing the device flow.
