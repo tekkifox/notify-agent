@@ -313,7 +313,13 @@ def _config() -> _Config:
         raise ConfigError("Oracle connection is not configured")
     if not wallet:
         raise ConfigError("ORACLE_WALLET_DIR is not set")
-    if not os.path.isdir(wallet):
+    try:
+        entries = set(os.listdir(wallet))
+    except OSError:
+        raise ConfigError("Oracle wallet directory is not mounted") from None
+    if not entries & {"cwallet.sso", "ewallet.p12"}:
+        # An empty bind mount is still a directory. Fail closed instead of
+        # trying to connect without a wallet.
         raise ConfigError("Oracle wallet directory is not mounted")
     return _Config(user, password, dsn, wallet)
 

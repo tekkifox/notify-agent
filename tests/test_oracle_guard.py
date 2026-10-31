@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -180,6 +182,31 @@ class McpProtocolTests(unittest.TestCase):
         text, is_error = oracle_query.call_query("SELECT 1 FROM dual")
         self.assertTrue(is_error)
         self.assertIn("not configured", text)
+
+    def test_empty_wallet_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as wallet:
+            env = {
+                "ORACLE_USER": "user",
+                "ORACLE_PASSWORD": "password",
+                "ORACLE_DSN": "dsn",
+                "ORACLE_WALLET_DIR": wallet,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(oracle_query.ConfigError):
+                    oracle_query._config()
+
+    def test_wallet_directory_with_cwallet_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as wallet:
+            pathlib.Path(wallet, "cwallet.sso").write_bytes(b"dummy")
+            env = {
+                "ORACLE_USER": "user",
+                "ORACLE_PASSWORD": "password",
+                "ORACLE_DSN": "dsn",
+                "ORACLE_WALLET_DIR": wallet,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = oracle_query._config()
+            self.assertEqual(config.wallet, wallet)
 
 
 class QueryExecutionTests(unittest.TestCase):
