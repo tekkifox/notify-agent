@@ -574,7 +574,8 @@ POST https://backend.composio.dev/api/v3.1/tools/execute/proxy
   "poll my trigger events" REST method. Adding a webhook receiver or the
   Composio SDK would be a larger change and a new runtime dependency.
 - The proxy is a plain authenticated REST call, so `urllib` is enough. No new
-  Python package is installed.
+  Python package is installed. Redirects are refused, so the API key is never
+  forwarded to another host.
 - Discord returns messages newest-first. The listener walks backwards with
   `before` until it reaches its saved cursor, then handles the new messages
   oldest-first. This avoids the `after` pitfall where a backlog larger than
@@ -829,8 +830,8 @@ Verified while building this branch:
 Inbound listener checks on this branch:
 
 - `python3 -m py_compile scripts/discord_inbound.py tests/test_discord_inbound.py` passes.
-- `python3 -m unittest discover -s tests -p 'test_*.py' -v` passes 130 tests: the existing SQL-guard suite plus the new inbound suite. No network, Discord channel, Composio account, database or model is used.
-- The new suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the `last_message_id` fallback when the bot lacks Read Message History; backwards pagination to the cursor; the proxy request shape (endpoint, method, `connected_account_id`, `user_id`, `limit`/`before` parameters, `x-api-key` header) against a stub; redacted HTTP/JSON errors; and the exact `opencode run --standalone --agent notify --model ... -- <instruction>` argv with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false.
+- `python3 -m unittest discover -s tests -p 'test_*.py' -v` passes 131 tests: the existing SQL-guard suite plus the new inbound suite. No network, Discord channel, Composio account, database or model is used.
+- The new suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the `last_message_id` fallback when the bot lacks Read Message History; backwards pagination to the cursor; the proxy request shape (endpoint, method, `connected_account_id`, `user_id`, `limit`/`before` parameters, `x-api-key` header) against a stub; redacted HTTP/JSON errors; redirects refused; and the exact `opencode run --standalone --agent notify --model ... -- <instruction>` argv with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false.
 - The refusal path is exercised at the real process boundary: with `subprocess.Popen` patched, a message from a disallowed author produces no `Popen` call, no enqueue, and this log line (message id hashed, body absent):
   `refused reason=author_not_allowed msg=d1a35b8e`
 - `sh -n scripts/entrypoint.sh` passes. The supervisor was not exercised against a real container.

@@ -117,6 +117,28 @@ class FetchError(RuntimeError):
     """A poll failed.  The cursor is deliberately left unchanged."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the API key is never sent to another host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open_request(request: urllib.request.Request) -> Any:
+    return _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -822,7 +844,7 @@ def _proxy_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with _open_request(request) as response:
             raw = response.read(MAX_PROXY_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         # Never read or log the response body: it can echo request data.

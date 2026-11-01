@@ -531,15 +531,15 @@ class ProxyTests(unittest.TestCase):
 
     def test_proxy_request_shape(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse(
                 {"status": 200, "data": [{"id": "900000000000000001"}]}
             ),
-        ) as urlopen:
+        ) as opener:
             messages = discord_inbound.fetch_messages(self.config, limit=1)
         self.assertEqual(messages, [{"id": "900000000000000001"}])
-        request = urlopen.call_args.args[0]
+        request = opener.call_args.args[0]
         self.assertEqual(
             request.full_url,
             "https://backend.composio.dev/api/v3.1/tools/execute/proxy",
@@ -554,6 +554,19 @@ class ProxyTests(unittest.TestCase):
             body["parameters"], [{"name": "limit", "value": "1", "type": "query"}]
         )
 
+    def test_redirects_are_refused(self) -> None:
+        handler = discord_inbound._NoRedirect()
+        self.assertIsNone(
+            handler.redirect_request(
+                mock.Mock(),
+                None,
+                302,
+                "Found",
+                {},
+                "https://example.invalid/elsewhere",
+            )
+        )
+
     def test_proxy_http_error_is_redacted(self) -> None:
         error = urllib.error.HTTPError(
             "https://backend.composio.dev/x",
@@ -563,7 +576,7 @@ class ProxyTests(unittest.TestCase):
             None,
         )
         with mock.patch.object(
-            discord_inbound.urllib.request, "urlopen", side_effect=error
+            discord_inbound, "_open_request", side_effect=error
         ):
             with self.assertRaises(discord_inbound.FetchError) as caught:
                 discord_inbound.fetch_messages(self.config, limit=1)
@@ -571,8 +584,8 @@ class ProxyTests(unittest.TestCase):
 
     def test_proxy_non_200_body_status_is_an_error(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse({"status": 429, "data": []}),
         ):
             with self.assertRaises(discord_inbound.FetchError) as caught:
@@ -581,8 +594,8 @@ class ProxyTests(unittest.TestCase):
 
     def test_proxy_invalid_json_is_an_error(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse(None, raw=b"not json"),
         ):
             with self.assertRaises(discord_inbound.FetchError):
@@ -590,8 +603,8 @@ class ProxyTests(unittest.TestCase):
 
     def test_proxy_rejects_a_message_without_an_id(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse({"status": 200, "data": [{}]}),
         ):
             with self.assertRaises(discord_inbound.FetchError):
@@ -599,22 +612,22 @@ class ProxyTests(unittest.TestCase):
 
     def test_channel_last_message_id(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse(
                 {"status": 200, "data": {"last_message_id": "900000000000000001"}}
             ),
-        ) as urlopen:
+        ) as opener:
             last = discord_inbound.fetch_channel_last_message_id(self.config)
         self.assertEqual(last, "900000000000000001")
-        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        body = json.loads(opener.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(body["endpoint"], f"/channels/{CHANNEL}")
         self.assertEqual(body["parameters"], [])
 
     def test_channel_with_no_last_message_id(self) -> None:
         with mock.patch.object(
-            discord_inbound.urllib.request,
-            "urlopen",
+            discord_inbound,
+            "_open_request",
             return_value=FakeResponse(
                 {"status": 200, "data": {"last_message_id": None}}
             ),
