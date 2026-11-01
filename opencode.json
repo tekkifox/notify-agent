@@ -18,6 +18,16 @@
       "action": "ssh_probe",
       "resource": "*",
       "effect": "deny"
+    },
+    {
+      "action": "bookstack_search",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "bookstack_read",
+      "resource": "*",
+      "effect": "deny"
     }
   ],
   "mcp": {
@@ -58,12 +68,31 @@
           "PYTHONPATH": "/opt/mcp-python",
           "PYTHONUNBUFFERED": "1"
         }
+      },
+      "bookstack": {
+        "type": "local",
+        "command": ["python3", "/app/mcp/bookstack.py"],
+        "codemode": false,
+        "timeout": {
+          "startup": 60000,
+          "execution": 60000
+        },
+        "environment": {
+          "BOOKSTACK_URL": "{env:BOOKSTACK_URL}",
+          "BOOKSTACK_TOKEN_ID": "{env:BOOKSTACK_TOKEN_ID}",
+          "BOOKSTACK_TOKEN_SECRET": "{env:BOOKSTACK_TOKEN_SECRET}",
+          "BOOKSTACK_ALLOWED_BOOKS": "{env:BOOKSTACK_ALLOWED_BOOKS}",
+          "BOOKSTACK_TIMEOUT_SECONDS": "{env:BOOKSTACK_TIMEOUT_SECONDS}",
+          "NOTIFY_CONTENT_DISABLED": "{env:NOTIFY_CONTENT_DISABLED}",
+          "PYTHONPATH": "/opt/mcp-python",
+          "PYTHONUNBUFFERED": "1"
+        }
       }
     }
   },
   "agent": {
     "notify": {
-      "description": "Composes one notification and sends it through notify.sh. Read-only Oracle and SSH health tools only.",
+      "description": "Composes one notification and sends it through notify.sh. Read-only Oracle, SSH health and runbook documentation tools only.",
       "mode": "primary",
       "steps": 12,
       "prompt": "{file:./prompts/notify.md}",
@@ -88,6 +117,8 @@
         "oracle_query": "allow",
         "oracle_search_content": "allow",
         "ssh_probe": "allow",
+        "bookstack_search": "allow",
+        "bookstack_read": "allow",
         "bash": {
           "*": "deny",
           "/app/scripts/notify.sh -m *": "allow",
