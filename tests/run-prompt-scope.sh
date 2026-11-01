@@ -16,7 +16,11 @@ command -v jq >/dev/null 2>&1 || {
 }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/run-prompt-scope.XXXXXX")
+cms_pid=
 cleanup() {
+    if [ -n "$cms_pid" ]; then
+        kill "$cms_pid" 2>/dev/null || true
+    fi
     rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
@@ -763,6 +767,97 @@ elif [ -z "$size" ] || [ "$size" -gt 262144 ]; then
     no "transcript cap: log grew past 256 KiB (size=${size:-unknown})"
 else
     pass "the transcript stays bounded when output is large"
+fi
+
+# 17. With BOT_SETTINGS_URL set, run-prompt.sh resolves the target through
+#     bot_config.py against the CMS (a loopback stub), and logs the source.
+cat > "$tmp/cms.py" <<'PY'
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+body = open(sys.argv[1], "rb").read()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+
+cms_doc='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[]}'
+start_cms() {
+    printf '%s' "$1" > "$tmp/cms-body.json"
+    rm -f "$tmp/cms-port"
+    python3 "$tmp/cms.py" "$tmp/cms-body.json" "$tmp/cms-port" &
+    cms_pid=$!
+    tries=0
+    while [ ! -s "$tmp/cms-port" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            return 1
+        fi
+        sleep 0.05
+    done
+    cms_url="http://127.0.0.1:$(cat "$tmp/cms-port")/api/bot-settings"
+}
+
+if ! start_cms "$cms_doc"; then
+    no "CMS source: loopback stub did not start"
+else
+    set +e
+    capture "$tmp/cms" \
+        BOT_SETTINGS_URL="$cms_url" \
+        BOT_SETTINGS_API_KEY="cms-test-key" \
+        XDG_STATE_HOME="$tmp/state" \
+        NOTIFY_TARGETS='{"env-target":{"channel_id":"666666666666666666"}}' \
+        "$run_prompt" -t cms-target "Compose a status message." 2>/dev/null
+    rc=$?
+    set -e
+    err=$(cat "$tmp/cms.stderr")
+    prompt=$(cat "$tmp/cms" 2>/dev/null || true)
+    if [ "$rc" -ne 0 ]; then
+        no "CMS source: run-prompt.sh failed: $err"
+    elif ! contains "$prompt" '/app/scripts/notify.sh -t cms-target -m'; then
+        no "CMS source: instruction did not use the CMS target"
+    elif ! contains "$prompt" "The delivery scope for this run is \`cms.example\`."; then
+        no "CMS source: instruction did not use the CMS host_scope"
+    elif ! contains "$err" "config source=cms"; then
+        no "CMS source: log did not name the CMS"
+    elif [ "$(stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json")" != "600" ]; then
+        no "CMS source: cache file is not 0600"
+    else
+        pass "run-prompt resolves the target through the CMS and caches it"
+    fi
+fi
+
+# 18. With BOT_SETTINGS_URL unset the resolver is not called at all: the
+#     environment is used exactly as before and no source line is logged.
+set +e
+capture "$tmp/url-unset" NOTIFY_TARGETS="$targets" \
+    "$run_prompt" -t general "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    no "unset URL: run-prompt.sh failed: $(cat "$tmp/url-unset.stderr")"
+elif [ "$(cat "$tmp/url-unset")" != "$expected_unscoped" ]; then
+    no "unset URL: instruction changed"
+elif contains "$(cat "$tmp/url-unset.stderr")" "config source="; then
+    no "unset URL: a config source line was logged"
+else
+    pass "unset URL keeps the environment path silent and unchanged"
 fi
 
 if [ "$failures" -ne 0 ]; then

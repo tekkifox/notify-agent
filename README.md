@@ -21,6 +21,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent and captures the debug transcript. |
 | `scripts/discord_inbound.py` | Optional inbound listener: polls one or more Discord sources, authorises replies and runs the same agent once each. |
 | `scripts/agent_capture.py` | Shared bounded debug transcript: header, agent output, send-aware footer; used by both run paths. |
+| `scripts/bot_config.py` | Resolves targets and sources from the CMS, the cached last good copy, or the environment, validating with the agent's own parsers. |
 | `scripts/entrypoint.sh` | Compose dispatcher and supervisor: without args runs supercronic and the listener independently, with args runs the command. |
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle, SSH and BookStack MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
@@ -954,6 +955,65 @@ either: a scoped target carries its host boundary into the instruction and the
 agent's rules, a target with `allow_content: false` also carries a server-side
 CMS block, and a runbook grant is bound to that target's own BookStack URL and
 books, so one target cannot read another's wiki.
+
+## Bot configuration from the CMS
+
+The CMS admin panel can own the bot's targets and inbound sources. Set one
+URL and both delivery paths resolve through `scripts/bot_config.py`:
+
+```sh
+BOT_SETTINGS_URL=https://cms.example.com/api/bot-settings
+BOT_SETTINGS_API_KEY=payload-user-api-key
+BOT_SETTINGS_TIMEOUT_SECONDS=5
+```
+
+`BOT_SETTINGS_API_KEY` is a Payload API key for a user with read access to the
+bot-settings global. It is sent only as `Authorization: users API-Key <key>`,
+never placed in a URL, and never logged or included in an error. Redirects are
+refused so it cannot be forwarded to another host.
+
+The panel returns `{version, targets, sources}`. `targets` has the same shape as
+`NOTIFY_TARGETS`; `sources` has the same shape as `NOTIFY_INBOUND_SOURCES`
+(an empty array leaves inbound in its environment-configured single-channel
+mode). Nothing else moves: Composio credentials, author allowlists, state
+paths and model settings stay in `stack.env`.
+
+Resolution order, for every scheduled prompt and every inbound reply:
+
+1. **CMS.** `GET BOT_SETTINGS_URL`, HTTP 200, valid JSON, `version`, `targets`
+   and `sources` present. The document is validated with the agent's own
+   parsers: targets by the rules `notify.sh` applies at the send boundary,
+   sources by `discord_inbound`'s `_load_sources`. A document the agent would
+   refuse from the environment is refused from the panel with the same errors.
+2. **Cache.** A validated fetch is written atomically (temp file plus
+   `os.replace`) with mode `0600` to
+   `$XDG_STATE_HOME/notify-agent/bot-settings-cache.json`. On any CMS failure
+   (network error, timeout, non-200, malformed JSON, failed validation) the
+   last good copy is used.
+3. **Environment.** If there is no usable cache, `NOTIFY_TARGETS` and
+   `NOTIFY_INBOUND_SOURCES` are used exactly as before.
+
+The timeout is 5 seconds by default and capped at 30; a malformed value falls
+back to 5 rather than failing a run. The cache is internal configuration, not a
+secret, but it names hosts and channels, so it is owner-only. In the compose
+layout `$XDG_STATE_HOME` is tmpfs, so the cache survives a CMS outage during a
+container's life but not a restart; the environment fallback still keeps the
+09:00 digest running either way.
+
+One line is logged per run, naming the source and, when it is not the CMS, why:
+
+```text
+config source=cms
+config source=cache reason=cms timeout 5s
+config source=cache reason=cms 401
+config source=env reason=cms invalid JSON
+config source=env reason=cms invalid host_scope for target(s) automations: expected a non-empty string or an array of non-empty strings
+```
+
+The line never includes the API key, a full URL, a channel id or an account id.
+With `BOT_SETTINGS_URL` unset the resolver is not called: no request, no cache
+write, no source line, and the environment is used byte for byte as before.
+That is the switch: set one variable to enable the panel, remove it to go back.
 
 ## Inbound Discord replies
 

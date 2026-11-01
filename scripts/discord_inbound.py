@@ -92,12 +92,19 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-# The capture helpers live beside this script.  They are imported directly so
-# the listener and run-prompt.sh share one transcript format.
+# The capture helpers and the configuration resolver live beside this script.
+# They are imported directly so the listener and run-prompt.sh share one
+# transcript format and one configuration precedence.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+# When run as a script, this module is ``__main__``.  Register it under its
+# real name first so bot_config's lazy import reuses this instance instead of
+# loading a second copy.
+sys.modules.setdefault("discord_inbound", sys.modules[__name__])
+
 import agent_capture  # noqa: E402  (path set up above)
+import bot_config  # noqa: E402  (path set up above)
 
 LOG = logging.getLogger("discord-inbound")
 
@@ -235,6 +242,11 @@ class Config:
     delivery: str
     webhook_mode: bool
     opencode_model_fallback: str | None
+    # The effective (CMS, cache or environment) configuration.  It is passed
+    # to the agent child so notify.sh resolves the same targets the listener
+    # validated, instead of the stale environment copy.
+    targets_json: str = ""
+    sources_json: str = ""
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -848,7 +860,29 @@ def load_config(environ: Mapping[str, str]) -> Config:
         delivery=delivery,
         webhook_mode=webhook_mode,
         opencode_model_fallback=opencode_model_fallback,
+        targets_json=env.get("NOTIFY_TARGETS") or "",
+        sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
     )
+
+
+def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """Resolve targets/sources, preferring the CMS, then cache, then env.
+
+    Only the two configuration variables are replaced.  Every other setting
+    (Composio credentials, allowlist, state path) stays environment-only, so
+    the panel changes where the configuration comes from without becoming a
+    second source of truth for secrets.  The single source line is logged once
+    here; when ``BOT_SETTINGS_URL`` is unset the values are byte-for-byte the
+    environment's and nothing is logged.
+    """
+
+    resolution = bot_config.resolve(environ)
+    if resolution.log_required:
+        LOG.info("%s", resolution.log_line)
+    env = dict(environ)
+    env["NOTIFY_TARGETS"] = resolution.targets_json
+    env["NOTIFY_INBOUND_SOURCES"] = resolution.sources_json
+    return env
 
 
 def _check_state_path(path: Path) -> None:
@@ -1557,6 +1591,13 @@ def _run_agent_once(
     )
 
     environment = os.environ.copy()
+    # Carry the resolved (CMS, cache or environment) configuration to the
+    # agent, so notify.sh validates the same targets the listener did.
+    environment["NOTIFY_TARGETS"] = config.targets_json
+    if config.sources_json:
+        environment["NOTIFY_INBOUND_SOURCES"] = config.sources_json
+    else:
+        environment.pop("NOTIFY_INBOUND_SOURCES", None)
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
@@ -2034,7 +2075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     del argv  # no command-line arguments: configuration is environment only
     _configure_logging()
     try:
-        config = load_config(os.environ)
+        config = load_config(resolve_environment(os.environ))
     except ConfigError as error:
         LOG.error("configuration error: %s", error)
         return 2
