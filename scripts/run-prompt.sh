@@ -134,6 +134,23 @@ if [ -z "$target" ]; then
     target=${NOTIFY_DEFAULT_TARGET:-}
 fi
 
+# Prefer the CMS configuration when the operator enabled it. bot_config.py
+# validates the panel's document with the same rules notify.sh applies, caches
+# the last good copy and falls back to this environment on any failure. When
+# BOT_SETTINGS_URL is unset nothing is called and NOTIFY_TARGETS is untouched.
+if [ -n "${BOT_SETTINGS_URL:-}" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        resolved_targets=$(python3 "$script_dir/bot_config.py" --targets) || {
+            printf 'run-prompt: could not resolve bot configuration; using NOTIFY_TARGETS from the environment\n' >&2
+            resolved_targets=${NOTIFY_TARGETS:-}
+        }
+        NOTIFY_TARGETS=$resolved_targets
+        export NOTIFY_TARGETS
+    else
+        printf 'run-prompt: python3 is not installed; using NOTIFY_TARGETS from the environment\n' >&2
+    fi
+fi
+
 # A target may declare a delivery host_scope and an allow_content flag.
 # Resolve them here so the instruction can state the boundaries; notify.sh
 # validates the same fields again before sending. A malformed value fails by
