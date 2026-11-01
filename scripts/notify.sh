@@ -48,6 +48,12 @@ Optional Composio settings:
   COMPOSIO_ARGS                   JSON object merged into the tool arguments
   COMPOSIO_CONNECTED_ACCOUNT_ID   connected account to execute against
 
+Optional send record:
+  NOTIFY_SEND_MARKER   when set, a successful send touches this path. The
+                       inbound listener uses it to detect a run that delivered
+                       nothing. Unset is a no-op, and a marker that cannot be
+                       written never changes the exit status.
+
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
 EOF
@@ -62,6 +68,18 @@ usage_fail() {
     printf '%s: %s\n' "$PROG" "$*" >&2
     usage >&2
     exit 64
+}
+
+# Optional send record for the inbound listener. The marker path is set by the
+# listener, never by the agent. Only a confirmed 2xx send calls this. Unset is a
+# no-op, and a marker that cannot be written is reported but does not turn a
+# delivered message into a failed one (the exit status must not change).
+mark_sent() {
+    [ -n "${NOTIFY_SEND_MARKER:-}" ] || return 0
+    if ! : > "$NOTIFY_SEND_MARKER" 2>/dev/null; then
+        printf '%s: warning: could not record the send marker\n' "$PROG" >&2
+    fi
+    return 0
 }
 
 message=
@@ -268,6 +286,7 @@ send_discord() {
     case "$status" in
         2??)
             printf '%s: delivered via discord (HTTP %s)\n' "$PROG" "$status"
+            mark_sent
             ;;
         429)
             fail "discord rate limited the message (HTTP 429)"
@@ -349,6 +368,7 @@ send_composio() {
     case "$status" in
         2??)
             printf '%s: delivered via composio (HTTP %s)\n' "$PROG" "$status"
+            mark_sent
             ;;
         *)
             fail "composio rejected the message (HTTP ${status:-unknown})"

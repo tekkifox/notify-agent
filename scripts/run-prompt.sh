@@ -271,7 +271,7 @@ The known hosts for this run are ${known_hosts_rendered}. Include one line for e
     if [ "$target_content_disabled" -eq 1 ]; then
         prompt="${prompt}
 
-Content search is disabled for this run: do not use the content search tool, and do not include anything about the operator's site, CV, projects or pages. Report host data only."
+Report host data only: do not include any other material."
     fi
 else
     prompt=$instruction
@@ -302,8 +302,54 @@ preflight_mcp "$mcp_server"
 # service, which is what an unattended cron job wants. No plugins are installed
 # in the image, so the run stays reproducible. There is no --auto: anything not
 # explicitly allowed by opencode.json is denied.
-exec opencode run \
+#
+# Provider-level logs are opt-in for a run someone is actively debugging.
+set -- opencode run
+if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
+    set -- "$@" --print-logs --log-level debug
+fi
+set -- "$@" \
     --standalone \
     --agent notify \
     --model "$OPENCODE_MODEL" \
     -- "$prompt"
+
+# Capture the complete run to the same transcript the inbound listener uses.
+# Both derive the directory from XDG_DATA_HOME, so there is one location. If
+# neither XDG_DATA_HOME nor HOME is usable, keep today's inherited output
+# rather than failing a schedule.
+debug_log=
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+    debug_dir=$XDG_DATA_HOME/opencode
+elif [ -n "${HOME:-}" ]; then
+    debug_dir=$HOME/.local/share/opencode
+else
+    debug_dir=
+fi
+if [ -n "$debug_dir" ]; then
+    if mkdir -p "$debug_dir" 2>/dev/null && [ -w "$debug_dir" ]; then
+        debug_log=$debug_dir/notify-debug.log
+    else
+        printf 'run-prompt: warning: debug log directory is not writable; transcription disabled\n' >&2
+    fi
+fi
+
+if [ -n "$debug_log" ]; then
+    send_marker=
+    if send_marker=$(mktemp "${TMPDIR:-/tmp}/notify-send.XXXXXX" 2>/dev/null); then
+        rm -f "$send_marker"
+        export NOTIFY_SEND_MARKER="$send_marker"
+    else
+        send_marker=
+        printf 'run-prompt: warning: could not create a send marker; the transcript will report sent=unknown\n' >&2
+    fi
+    set -- python3 "$script_dir/agent_capture.py" \
+        --log "$debug_log" \
+        --origin "schedule" \
+        --model "$OPENCODE_MODEL" \
+        --instruction "$prompt" \
+        --marker "${send_marker:-}" \
+        -- "$@"
+fi
+
+exec "$@"
