@@ -88,6 +88,12 @@ class PromptContractTests(unittest.TestCase):
         self.assertNotIn("Content search is disabled", RUN_PROMPT)
         self.assertNotIn("site, CV, projects or pages", FLAT_PROMPT)
 
+    def test_rule_37_is_conditional_on_instruction_scope(self) -> None:
+        self.assertIn("only if this run permits it", FLAT_PROMPT)
+        self.assertIn("When the run is host-data-only", FLAT_PROMPT)
+        self.assertIn("do not mention site content", FLAT_PROMPT)
+        self.assertNotIn("published site content (pages and projects) only where this run permits it", FLAT_PROMPT)
+
     def test_existing_safety_rules_are_intact(self) -> None:
         self.assertIn("Send exactly one message per run", FLAT_PROMPT)
         self.assertIn(

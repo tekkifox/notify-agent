@@ -1360,7 +1360,7 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("\n", line)
         self.assertNotIn("\r", line)
         self.assertNotIn("\t", line)
-        self.assertLessEqual(len(line), 200)
+        self.assertLessEqual(len(line), 320)
         self.assertIn("run=inbound:vortex-admin", line)
         self.assertIn("model=test/model", line)
         self.assertIn("exit=0", line)
@@ -1380,7 +1380,7 @@ class SummaryTests(unittest.TestCase):
             "y" * 500,
         )
         self.assertNotIn("\n", line)
-        self.assertLessEqual(len(line), 200)
+        self.assertLessEqual(len(line), 320)
         self.assertIn("sent=no", line)
 
     def test_summary_has_utc_timestamp_and_schedule_path(self) -> None:
@@ -1520,6 +1520,104 @@ class WorkerTests(unittest.TestCase):
         worker.stop()
         self.assertEqual(state["done"], 3)
         self.assertEqual(state["max_active"], 1)
+
+
+class ContentBoundaryTests(unittest.TestCase):
+    def test_disabled_target_instruction_has_no_content_words(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        config = discord_inbound.load_config(base_env(temp.name))
+        instruction = discord_inbound.build_instruction(
+            config, "what can you do?"
+        )
+        lowered = instruction.lower()
+        for word in ("cv", "site", "website", "portfolio", "project", "page", "content"):
+            self.assertNotIn(word, lowered, f"forbidden word {word!r} present")
+
+    def test_enabled_target_mentions_published_content(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        env = base_env(temp.name)
+        targets = json.loads(env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_content"] = True
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+        config = discord_inbound.load_config(env)
+        instruction = discord_inbound.build_instruction(
+            config, "what can you do?"
+        )
+        self.assertIn("published content", instruction.lower())
+
+
+class SummaryOperatorMessageTests(unittest.TestCase):
+    def test_summary_contains_operator_message_not_preamble(self) -> None:
+        instruction = (
+            "You are answering an inbound reply.\n\n"
+            "Operator message:\n"
+            "what is the disk usage on host3?\n\n"
+            "Send exactly one reply with:\n"
+            '/app/scripts/notify.sh -t admin-chat -m "<message>"'
+        )
+        # Inbound runs pass the extracted operator message as the summary text.
+        operator_message = "what is the disk usage on host3?"
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, operator_message
+        )
+        self.assertIn("what is the disk usage on host3?", line)
+        self.assertNotIn("You are answering", line)
+
+    def test_multiline_operator_message_is_flattened(self) -> None:
+        message = "first line\n\nsecond line\twith tabs"
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, message
+        )
+        self.assertIn("first line second line with tabs", line)
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\t", line)
+
+    def test_long_operator_message_is_truncated_with_ellipsis(self) -> None:
+        message = "a" * 400
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, message
+        )
+        self.assertLessEqual(len(line), 320)
+        self.assertIn("...", line)
+
+    def test_long_source_name_cannot_push_line_past_cap(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:" + "s" * 64,
+            "m" * 120,
+            1,
+            2.0,
+            False,
+            "y" * 500,
+            llm=3,
+            types="text:1,tool:2",
+        )
+        self.assertLessEqual(len(line), 320)
+
+
+class LlmCountTests(unittest.TestCase):
+    def test_one_completion_reports_llm_one(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, "hi", llm=1
+        )
+        self.assertIn("llm=1", line)
+
+    def test_two_tool_followups_report_llm_three_with_types(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, "hi",
+            llm=3, types="text:1,tool:2",
+        )
+        self.assertIn("llm=3", line)
+        self.assertIn("types=text:1,tool:2", line)
+
+    def test_undeterminable_count_reports_unknown(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:admin", "test/model", 0, 1.0, True, "hi", llm=None
+        )
+        self.assertIn("llm=unknown", line)
+        self.assertNotIn("llm=0", line)
+        self.assertNotIn("llm=1", line)
 
 
 if __name__ == "__main__":

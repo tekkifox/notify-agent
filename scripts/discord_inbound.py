@@ -1310,12 +1310,35 @@ def build_instruction(
                 "freshness) and SSH reachability for "
                 f"{target.host_scope or 'the hosts in scope'}."
             )
+        else:
+            lines.append(
+                "\nIf the operator asks what you can do, answer with what this "
+                "run allows: host health (CPU, memory, load, disk, sample "
+                "freshness), SSH reachability for "
+                f"{target.host_scope or 'the hosts in scope'}, and published "
+                "content (pages and projects)."
+            )
     else:
         lines.append(
             "Send exactly one reply with:\n"
             '/app/scripts/notify.sh -m "<message>"'
         )
     return "\n".join(lines)
+
+
+def _operator_message_from_instruction(instruction: str) -> str | None:
+    marker = "Operator message:\n"
+    start = instruction.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    # The operator message runs until the blank line before "Send exactly".
+    end = instruction.find("\n\nSend exactly", start)
+    if end < 0:
+        end = instruction.find("\nSend exactly", start)
+    if end < 0:
+        end = len(instruction)
+    return instruction[start:end].strip() or None
 
 
 def _terminate(process: subprocess.Popen[Any]) -> None:
@@ -1375,6 +1398,7 @@ def _run_agent_once(
     chosen: InboundSource,
     instruction: str,
     stop_event: threading.Event | None,
+    summary_text: str | None = None,
 ) -> tuple[bool, bool]:
     """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
 
@@ -1458,7 +1482,7 @@ def _run_agent_once(
             "start-failed",
             0.0,
             False,
-            instruction,
+            summary_text if summary_text is not None else instruction,
         )
         return False, False
 
@@ -1499,7 +1523,7 @@ def _run_agent_once(
             exit_code,
             elapsed,
             sent,
-            instruction,
+            summary_text if summary_text is not None else instruction,
         )
         return sent, elapsed
 
@@ -1536,6 +1560,7 @@ def run_agent(
     instruction: str,
     stop_event: threading.Event | None = None,
     source: InboundSource | None = None,
+    summary_text: str | None = None,
 ) -> bool:
     """Run the notify agent, retrying once when it exits without sending.
 
@@ -1569,7 +1594,7 @@ def run_agent(
     log_path = agent_log_path(config)
 
     clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event
+        config, chosen, instruction, stop_event, summary_text=summary_text
     )
     if not clean_exit:
         return False
@@ -1586,7 +1611,7 @@ def run_agent(
         return False
 
     clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event
+        config, chosen, instruction, stop_event, summary_text=summary_text
     )
     if not clean_exit:
         LOG.warning(
@@ -1774,7 +1799,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _install_signal_handlers(stop_event)
     worker = InstructionWorker(
         run=lambda item: run_agent(
-            config, item[1], stop_event, source=item[0]
+            config, item[1], stop_event, source=item[0],
+            summary_text=_operator_message_from_instruction(item[1]),
         ),
         maxsize=config.queue_size,
         stop_event=stop_event,
