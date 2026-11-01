@@ -24,7 +24,11 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
 | `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
+| `mcp/ssh_probe.py` | Single-file read-only SSH MCP server (Python 3, `paramiko`) exposing `probe` as `ssh_probe`, with host-scope refusal before any connection. |
+| `mcp/host_report.py` | Pure digest formatter: deterministic ordering, stale rule, thresholds, SSH lines and 2,000-character truncation. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
+| `tests/test_ssh_probe.py` | SSH policy, scope, failure-class, timeout, selftest and protocol tests; no live connection. |
+| `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every threshold, SSH lines and truncation. |
 | `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, length, queue and refusal-path tests; no network or model required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
@@ -33,7 +37,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 ```sh
 cp stack.env.example stack.env
 chmod 600 stack.env
-$EDITOR stack.env          # set DISCORD_WEBHOOK_URL, OPENCODE_MODEL, ORACLE_*
+$EDITOR stack.env          # set DISCORD_WEBHOOK_URL, OPENCODE_MODEL, ORACLE_*, SSH_*
 
 docker compose build
 docker compose up -d
@@ -333,6 +337,160 @@ reach the database only as `:query` and `:limit` bind values, that the supplied
 text never appears in the SQL statement, and that a driver error containing a
 password, DSN and wallet path is reduced to `oracle error ORA-01017`.
 
+## SSH health (MCP)
+
+The `notify` agent can check SSH reachability and key authentication per host.
+It calls a second local MCP server, `mcp/ssh_probe.py`. OpenCode names an MCP
+tool `<server>_<tool>`, so the server's `probe` tool is reached as
+`ssh_probe`.
+
+The tool takes `{"hosts": ["a.example", "b.example"]}` or a single
+`{"host": "a.example"}`. Every requested host gets one result:
+
+- `status: "ok"` with `latency_ms` and `message: "connected"`;
+- `status: "timeout"`, `"refused"`, `"unreachable"` (including DNS),
+  `"auth_refused"` or `"error"`, with a short secret-free message;
+- `status: "not_allowed"` or `"out_of_scope"` when policy refuses the host
+  before any socket is opened;
+- `status: "not_configured"` when SSH is not configured.
+
+A failure for one host never fails the call or hides the others. Each host has
+a timeout (`SSH_TIMEOUT_SECONDS`, default 5) and the whole call has a deadline
+(`SSH_TOTAL_TIMEOUT_SECONDS`, default 20), so a list of dead hosts cannot stall
+a scheduled run. Hosts that would start after the deadline are returned as
+`timeout` with `attempted: false` and `not attempted: total time cap reached`.
+
+### Two host boundaries, enforced in code
+
+Before any connection is attempted, the tool applies two checks:
+
+1. **Global allowlist.** The host must be covered by `SSH_ALLOWED_HOSTS`
+   (default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk`). An entry
+   covers itself and its subdomains, so `vortexservers.co.uk` covers
+   `vortex1.vortexservers.co.uk`, but not `notvortexservers.co.uk` or
+   `vortexservers.co.uk.example`.
+2. **Run scope.** `run-prompt.sh` exports the selected target's `host_scope` as
+   `NOTIFY_HOST_SCOPE`; the tool refuses a host outside it. The optional
+   `scope` argument can narrow that list, never widen it. A run scoped to
+   `admin-chat` therefore cannot even receive a rossmoney result, even if the
+   model asks for one.
+
+Both refusals name the host and return `attempted: false`; the connector is
+never called. That is the defence-in-depth layer beneath the prompt.
+
+`python3 /app/mcp/ssh_probe.py --selftest` reports whether SSH is configured and
+which settings are present, without opening any connection. It exits 0 when SSH
+is unconfigured (that is a valid state the digest reports plainly) and 1 only
+for a malformed setting such as a non-numeric timeout. The output names no
+user, key path or key material.
+
+The image has no `openssh-client`. The probe uses **paramiko**, pinned with its
+direct dependencies in the `Dockerfile`, so SSH stays in Python and no shell or
+subprocess is involved.
+
+### SSH environment
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `SSH_USER` | yes | Unprivileged account used for the key-authenticated probe |
+| `SSH_KEY_PATH` | yes | In-container path of the private key; compose sets `/ssh/id_ed25519` |
+| `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk` |
+| `SSH_TIMEOUT_SECONDS` | no | Per-host timeout, default 5; capped at 30 |
+| `SSH_TOTAL_TIMEOUT_SECONDS` | no | Whole-call deadline, default 20; capped at 60 |
+| `SSH_PORT` | no | SSH port for every host, default 22 |
+| `SSH_KEY_HOST_FILE` | compose only | Host path bind-mounted read-only at `/ssh/id_ed25519`; set in `.env` or the shell, not `stack.env` |
+| `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk` |
+
+Mount the key read-only, exactly like the Oracle wallet:
+
+```yaml
+volumes:
+  - ${SSH_KEY_HOST_FILE:-./ssh/id_ed25519}:/ssh/id_ed25519:ro
+```
+
+Put the key outside the repository (for example
+`/srv/notify-agent/ssh/id_ed25519`), make it readable by uid `10001`, and point
+`SSH_KEY_HOST_FILE` at it. `ssh/` is gitignored. If the host file is missing,
+Docker may create an empty directory at the mount point; the tool checks for a
+readable regular file and reports `configured: false` rather than pretending a
+check happened. Never commit the key or bake it into the image.
+
+### The destination is the boundary
+
+The rule is about where a host may be discussed, not which host may be probed:
+
+- `admin-chat` is the Vortex server's channel. Its `host_scope` is
+  `["vortexservers.co.uk"]`, so only Vortex hosts may appear there.
+- `automations` is TekkiFox's Automations. Its `host_scope` includes
+  `rossmoney.me`, `photos.rossmoney.me` and `vortexservers.co.uk`.
+- A rossmoney hostname, or a figure attributable to one, must never reach
+  `admin-chat`.
+
+`notify.sh` enforces `host_scope` at the send boundary, not only in the prompt
+or the tool. For a scoped target it extracts host-like tokens (dotted names with
+a letters-only suffix) from the message and accepts a token only when it equals
+a scope entry or is a subdomain of one. Anything else makes the script exit
+non-zero before any request; the delivery call never happens. The same report
+aimed at `automations` succeeds. The check covers URLs and code spans, because
+it scans the whole message.
+
+What can evade it: bare host labels with no dot, IP addresses, spaced or
+obfuscated names, Unicode lookalikes, and a figure that is not accompanied by a
+hostname. It is an exact-name guard, which is the minimum the captain asked for;
+the prompt is the layer that handles semantic attribution. The guard is also
+deliberately stricter than "known hosts": a scoped message that mentions an
+unrelated domain such as `github.com` is refused too, because sending nothing is
+the safe failure. Keep the prompt's host set and the target's `host_scope` in
+sync.
+
+## Morning digest
+
+The digest keeps the old host report's shape, plus SSH status folded into each
+host line. A rendered example (produced by `mcp/host_report.py`):
+
+```text
+**Host report** — 2026-10-31 09:00 UTC
+3/3 hosts reported, 0 stale, 1 flagged
+- [!] rossmoney.me: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
+- photos.rossmoney.me: 46 samples, last-seen 3m ago; CPU 22.8% avg / 28.0% peak; mem 30.6% avg; load 0.23 avg / 0.28 peak; disk 80.3%; SSH auth_refused (authentication refused)
+- vortexservers.co.uk: 49 samples, last-seen 3m ago; CPU 17.9% avg / 25.2% peak; mem 75.7% avg; load 3.57 avg / 5.04 peak; disk 71.2%; SSH ok (61 ms)
+```
+
+Per host, the order is: sample count, last-seen age, CPU average and peak,
+memory average, load average and peak, disk from the latest sample, then SSH.
+Memory is average only and disk is latest only; load has both average and peak.
+STALE means no sample in the last **20** minutes (a sample exactly 20 minutes old
+is still fresh), and a host with no samples in the 24-hour window is stale too.
+The inclusive thresholds are CPU peak 90, memory average 90, load peak 8 and
+disk latest 90; a flagged line starts with `[!]` and ends with the inline reason,
+for example `(CPU peak 117.0% >= 90%)`.
+
+Known hosts keep the order of `HOST_REPORT_HOSTS`; other hosts found in the data
+follow in name order. A known host with no samples still gets a line. When the
+message would exceed 2,000 characters, whole host lines are dropped from the end
+and the message ends with `… truncated: N host line(s) not shown`.
+
+`mcp/host_report.py` is the pure reference formatter and is unit-tested. The
+prompt asks the model to render the same shape from one aggregate query, then
+append the SSH result per host. `run-prompt.sh` filters `HOST_REPORT_HOSTS` to
+the selected target's `host_scope` and carries the ordered list into the
+instruction, so a scoped run only sees its own hosts.
+
+### Ready-to-paste schedule lines
+
+The schedule is a host file (`SCHEDULES_FILE`, default `./crontab`), not
+anything this change can make live. Add one of these lines to the host file,
+then restart the container. The first is the full morning digest for the
+automations channel; the second is a Vortex-only digest for `admin-chat`.
+
+```cron
+0 7 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
+```
+
+```cron
+0 7 * * * /app/scripts/run-prompt.sh -t admin-chat "Compose the morning Vortex digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status, for the Vortex hosts only. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and the thresholds. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a rossmoney host or anything about it. If SSH is not configured, say so once. Send it now with notify.sh."
+```
+
 ## Test delivery (sends a real message)
 
 ```sh
@@ -422,6 +580,18 @@ A schedule can also name its destination with `-t`:
 0 9 * * * /app/scripts/run-prompt.sh -t general "Compose and send the 09:00 digest."
 ```
 
+A morning digest that calls both MCP tools and keeps the old host-report shape,
+aimed at the automations channel:
+
+```cron
+0 7 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
+```
+
+This repository cannot make that schedule live: the schedule is the operator's
+host file (`SCHEDULES_FILE`, default `./crontab`). Add the line to that file and
+restart the container. See [Morning digest](#morning-digest) for the
+Vortex-only `admin-chat` variant.
+
 The name must exist in `NOTIFY_TARGETS` (see [Named targets](#named-targets)). `run-prompt.sh` puts that name into the instruction, the agent must use exactly that `-t` value, and `notify.sh` resolves it against the operator's allowlist. The model never chooses the destination: it can only repeat the name it was given, and an unknown name fails before anything is sent. With no `-t`, the schedule uses `NOTIFY_DEFAULT_TARGET` when set, and otherwise keeps the legacy `COMPOSIO_ARGS` shape.
 
 Schedules are **trusted operator configuration**, not user input. The agent runs whatever command a schedule line names, with the container's full runtime access. Anyone who can edit the schedule file can make the agent post anything, to any configured target, at any time. Treat write access to it like write access to `stack.env`.
@@ -444,6 +614,10 @@ A failed job exits non-zero and is visible in the log, but there is no automatic
 - Accepts `-t NAME` / `--target NAME` to select a named Composio target.
 - Validates `NOTIFY_TARGETS` before any request, including an optional
   `host_scope`; malformed values fail by target name only, never by id.
+- Enforces `host_scope` at the send boundary: for a scoped target, a message
+  that names a host outside the permitted list (or its subdomains) exits
+  non-zero before any request. URLs and code spans are scanned; see
+  [The destination is the boundary](#the-destination-is-the-boundary).
 - Uses Discord when `DISCORD_WEBHOOK_URL` is set.
 - Otherwise uses Composio when both `COMPOSIO_API_KEY` and `COMPOSIO_TOOL` are set.
 - Otherwise exits `1` with a short reason.
@@ -498,23 +672,22 @@ keys are target names and whose values need a `channel_id`, may pin a
 `host_scope` and `allow_content` guards:
 
 ```sh
-NOTIFY_TARGETS='{"general":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000"},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":"vortexservers.co.uk","allow_content":false}}'
-NOTIFY_DEFAULT_TARGET=general
+NOTIFY_TARGETS='{"automations":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000","host_scope":["rossmoney.me","photos.rossmoney.me","vortexservers.co.uk"]},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":["vortexservers.co.uk"],"allow_content":false}}'
+NOTIFY_DEFAULT_TARGET=automations
 ```
 
 Both names above are placeholders. Put real ids only in `stack.env`, which is
 gitignored and mode `0600`.
 
 `host_scope` is the host (or list of hosts) a message to that target may talk
-about. `allow_content` is a boolean, default `true`; when it is `false` the
-target may not use the content-search tool at all. `general` is unscoped and
-may report on anything. `admin-chat` is scoped to `vortexservers.co.uk` with
-`allow_content: false`, so it gets host data only from
-`NOTIFY_RO.HOST_STATS_V` and nothing about the captain's site, CV, projects or
-pages. An admin channel in the game-hosting server must not leak the operator's
-other infrastructure or CMS content. A new channel on the same server gets the
-same protection by giving its target the same guard values, without changing
-code.
+about. Entries cover themselves and their subdomains. `allow_content` is a
+boolean, default `true`; when it is `false` the target may not use the
+content-search tool at all. `automations` is TekkiFox's Automations and may
+report rossmoney and Vortex hosts; `admin-chat` is the Vortex server's admin
+channel and is scoped to `vortexservers.co.uk` only, with `allow_content:
+false`. That keeps the operator's other infrastructure and CMS content out of
+the game-hosting server. A new channel on the same server gets the same
+protection by giving its target the same guard values, without changing code.
 
 Resolution works like this:
 
@@ -526,8 +699,18 @@ Resolution works like this:
   connected account also wins over `COMPOSIO_CONNECTED_ACCOUNT_ID`.
 - An optional `host_scope` is a non-empty string or a non-empty array of
   non-empty strings. It names the only host(s) a message to that target may
-  talk about; absent means no restriction. A malformed value fails before any
-  request and names the offending targets, never their ids.
+  talk about; absent means no restriction. An entry covers itself and its
+  subdomains. The guard is enforced twice: `run-prompt.sh` adds the scope to
+  the instruction and exports it to `ssh_probe`, and `notify.sh` refuses to
+  send a message whose body names a host outside the list. The delivery refusal
+  is non-zero and happens before any request. A malformed value fails before
+  any request and names the offending targets, never their ids.
+- The delivery guard extracts host-like tokens (dotted names with a
+  letters-only suffix) from the message and accepts a token only when it equals
+  a scope entry or is a subdomain of one. URLs and code spans are scanned. It
+  does not catch bare labels, IP addresses, spaced or obfuscated names,
+  Unicode lookalikes, or a figure with no hostname; the prompt handles semantic
+  attribution, and the guard is the hard floor.
 - An optional `allow_content` must be a JSON boolean. When a target sets it
   `false`, `run-prompt.sh` adds a plain-words line to the instruction: do not
   use the content-search tool, and do not include anything about the operator's
@@ -535,11 +718,13 @@ Resolution works like this:
   names the offending targets, never their ids.
 - `run-prompt.sh` resolves the effective target's `host_scope` and adds a
   plain-words line to the instruction: the delivery scope for the run, and that
-  nothing about any other host may appear in the message. `prompts/notify.md`
-  turns that into a hard rule: filter `host_label` to the scoped host, report
-  only that host, never mention another host even in passing, and say plainly
-  when the scoped host has no data instead of falling back to another host's
-  numbers. With no scope, the instruction is byte-identical to before.
+  nothing about any other host may appear in the message. It also filters
+  `HOST_REPORT_HOSTS` to that scope and lists the ordered known hosts for the
+  digest. `prompts/notify.md` turns that into a hard rule: filter `host_label`
+  to the scoped hosts, report only them, never mention another host even in
+  passing, and say plainly when a scoped host has no data instead of falling
+  back to another host's numbers. With no scope, the instruction keeps the
+  old target line and adds only the known-host list.
 - `allow_content: false` is also a hard guard, not only an instruction:
   `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` before it execs
   `opencode`, and `mcp/oracle_query.py` refuses every `search_content` call with
@@ -816,11 +1001,13 @@ These are enforced in `compose.yaml`, not conventions:
 | Processes | `pids_limit: 200` |
 | Restart | `restart: unless-stopped` |
 | Docker socket | not mounted |
-| Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
+| Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, the SSH key bind-mounted read-only at `/ssh/id_ed25519`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
-| Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet contents live on the host and are mounted `:ro` |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query` and `oracle_search_content` are allowed |
+| Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet and SSH key live on the host and are mounted `:ro` |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query`, `oracle_search_content` and `ssh_probe` are allowed |
 | Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
+| SSH access | key-authenticated, read-only probe; two host boundaries (global allowlist and run scope) are applied before any socket; policy refusals name the host and never connect; no remote command runs |
+| Delivery guard | `notify.sh` refuses a scoped target's message when it names a host outside that target's `host_scope`, before any request |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
 
@@ -835,6 +1022,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - The Discord webhook secret, which can post to one channel.
 - The provider OAuth token or API key in the `opencode-data` volume.
 - The Oracle password and wallet material.
+- The SSH private key and the host allowlist it can reach.
 - The ability to send messages as the bot/user the credentials represent.
 - Message content and model prompts, which leave the host for the model provider.
 
@@ -845,6 +1033,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`, plus one `/bin/sleep 5` between a failed `oracle_query` call and its retry.
 - Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
 - Call `search_content` to read short chunks from the published-content index.
+- Call `ssh_probe` with hosts that are both in `SSH_ALLOWED_HOSTS` and inside the run's delivery scope. The probe opens a key-authenticated SSH session and closes it; it runs no remote command. A host outside either boundary is refused before a socket is opened.
 - Write only to the named volume and tmpfs.
 - When the inbound listener is enabled, read the configured channels through Composio tool execution (`DISCORDBOT_LIST_MESSAGES`) using each source's bot connection. The listener itself never gives the agent an arbitrary command: it only invokes the fixed `opencode run --agent notify` command with a filtered instruction.
 - For a source without a named target, send its answer through that source's bot connection (`DISCORDBOT_CREATE_MESSAGE`) to that source's channel. The listener sets the channel and account in the child environment; the model cannot choose them.
@@ -857,13 +1046,17 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Access the Docker socket, the host filesystem, `/etc`, `/home`, or other containers.
 - Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
-- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms and the two Oracle tools.
+- Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms, the two Oracle tools and `ssh_probe`.
+- Use the SSH key outside the probe: the key is invoked only by `ssh_probe`, with a fixed user and port, and the probe runs no remote command. It cannot probe a host outside the global allowlist or the selected target's scope.
+- Send a message to a scoped target if it names a host outside that target's `host_scope`: `notify.sh` refuses before any request. The guard is exact-name based, so figures without a hostname are a prompt-level risk, not a code-level one.
 - Read published content when the selected target sets `allow_content: false`: `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` and the MCP server refuses `search_content` before it connects.
 - Read arbitrary CMS tables or write to the content index. It can only run a fixed, read-only semantic search over `ROSSMONEY.CONTENT_EMBEDDINGS`; a `query` against `ROSSMONEY.pages` or any other CMS table fails with a privilege error.
 
 **Scenarios and residual risk**
 
-- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query` or `oracle_search_content`: the prompt tells the model to treat those values as data, never as instructions.
+- **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query`, `oracle_search_content` or `ssh_probe`: the prompt tells the model to treat those values as data, never as instructions.
+- **Destination leak.** A rossmoney host must not reach the Vortex `admin-chat`. The hard guard is in `notify.sh`: a scoped target refuses a message that names a host outside its `host_scope`, before any request. `ssh_probe` also refuses out-of-scope hosts, so the model cannot receive a rossmoney result in an admin-chat run. The exact-name guard does not catch a figure without a hostname, an IP address, a bare label, or an obfuscated name; those remain prompt-level risks. The guard is intentionally strict and also refuses unrelated domains in a scoped message.
+- **SSH access.** The probe uses one unprivileged key, mounted read-only, and authenticates only to allowlisted hosts within the run scope. It runs no remote command, so a compromised model cannot use it as a shell. Host keys are not pinned (`AutoAddPolicy`), so the probe reports reachability, not host identity; an on-path attacker could answer the handshake, but cannot recover the private key.
 - **Inbound message injection.** An allowlisted human's reply becomes an instruction to an agent with database access. The allowlist is the boundary: a non-allowlisted author, a bot, a webhook, a different channel, a duplicate, an over-long message or a mentions-only message never reaches the agent. An allowlisted human can still phrase a request that produces a bad answer or a wide read, exactly as they could by editing a schedule. The agent remains read-only and can still only send through `notify.sh`. The listener never passes the raw Discord payload: it strips mentions, caps length, and wraps the text in a fixed instruction. If the allowlist is too broad, the exposure is too broad.
 - **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
 - **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
@@ -903,13 +1096,27 @@ Verified while building this branch:
 - `shellcheck` (container image `koalaman/shellcheck:stable`) and `sh -n` pass on every shell script, including `tests/notify-targets.sh`.
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
-- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` and `oracle_search_content` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves both Oracle tools to `deny`.
+- `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query`, `oracle_search_content` and `ssh_probe` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves the MCP tools to `deny`.
 - The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 89 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors, plus `NOTIFY_CONTENT_DISABLED=1` refusing `search_content` with a clear tool error and behaving unchanged when unset. With a stub driver they also cover one retry for each transient code on connect and execute, no retry for SQL/permission errors, the `code`/`retryable` error payload, `--selftest` success and a clean non-zero failure with no configuration (including the CLI exit path), and a broken stdout/stdin pipe ending quietly with no traceback.
 - The MCP stdio handshake in the image returns two tools, `query` and `search_content`, and its guard/input errors are tool errors rather than protocol failures. A `search_content` call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, password, or the query text.
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
-- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. That suite was syntax-checked with `sh -n` here; it was not re-run because this environment has no `jq`.
+- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `rossmoney.me` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **228 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`.
+- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
+- `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
+- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED`; malformed values fail before the agent runs. The MCP preflight cases still pass.
+- `python3 -m py_compile` passes on `mcp/ssh_probe.py`, `mcp/host_report.py`, `tests/test_ssh_probe.py` and `tests/test_host_report.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
+- `opencode.json` statically registers both MCP servers (`oracle` and `ssh`), gives both the same 60-second startup/execution budget, keeps the global `ssh_probe` deny, and allows `ssh_probe` for `notify`.
+
+Not verified here (no credentials, no live hosts, no Docker daemon use):
+
+- No live SSH connection to any host, including Vortex or rossmoney. Every connector call in the suite is a stub.
+- No live Oracle query, no live `search_content`, and no live model run of the digest. The formatting and prompt contracts are tested without a model.
+- No `docker build`/image-size measurement for the paramiko addition. Paramiko and its direct dependencies are pinned in the Dockerfile; the base image has no `openssh-client`, which is why it is added.
+- The schedule lines are documentation only. The live schedule is the host `SCHEDULES_FILE`; this branch cannot activate it.
+- Host-key identity is not pinned (`AutoAddPolicy`); the probe measures reachability and key authentication, not the remote host's identity.
 - The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs. The same suite now drives the MCP preflight with stub servers: a server that omits `search_content`, a missing server and a server whose Oracle self-test fails all fail before `opencode` starts without echoing `ORACLE_PASSWORD` or `ORACLE_DSN`, and a healthy server leaves the instruction byte-for-byte unchanged.
 - The text-level contract tests in `tests/test_prompt_contract.py` assert that the prompt keeps the query-first run order, the "never send a tool-unavailable message" rule, the zero-rows-is-not-a-failure wording, the one-pause/one-retry rule, the content-disabled exception, and the existing one-message/no-mentions/host-scope/read-only-SQL rules. They also assert that `opencode.json` keeps the 60-second startup timeout, at least 10 steps, the exact `/bin/sleep 5` allowance, and the denied-then-allowed Oracle tool permissions. These are text assertions, not a live model run.
 - The environment inheritance assumption was checked in the image built from this branch (`notify-agent:target-scope`), not just in the unit tests. A temporary local MCP server was spawned by `opencode run --standalone` with `NOTIFY_CONTENT_DISABLED=1` in the parent environment; the child's `/probe/env.txt` contained `NOTIFY_CONTENT_DISABLED=1` and `PYTHONUNBUFFERED=1`, so OpenCode merges the parent environment into the configured MCP environment. Running the installed `/app/mcp/oracle_query.py` over stdio in the same image returned `{"error":"content search is disabled for this run"}` with `isError: true` when the variable was set, and `Oracle connection is not configured` without it.

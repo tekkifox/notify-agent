@@ -131,6 +131,22 @@ send_target() {
         "$notify" -t "$target" -m "hello"
 }
 
+# send_message TARGET MESSAGE [ENV=VALUE ...]
+send_message() {
+    target=$1
+    message=$2
+    shift 2
+    env -i \
+        PATH="$PATH" \
+        COMPOSIO_API_KEY="test-key" \
+        COMPOSIO_TOOL="DISCORDBOT_CREATE_MESSAGE" \
+        COMPOSIO_API_BASE="$api_base" \
+        SSL_CERT_FILE="$tmp/cert.pem" \
+        CURL_CA_BUNDLE="$tmp/cert.pem" \
+        "$@" \
+        "$notify" -t "$target" -m "$message"
+}
+
 expect_fail() {
     label=$1
     shift
@@ -396,6 +412,136 @@ else
     else
         pass "bot source reply posts through the pinned source account and channel"
     fi
+fi
+
+# 9. Delivery-boundary guard: a rossmoney host in an admin-chat report is
+#    refused before the delivery call, and the same report succeeds on the
+#    automations target.
+scoped_targets='{"admin-chat":{"channel_id":"222222222222222222","host_scope":["vortexservers.co.uk"]},"automations":{"channel_id":"555555555555555555","host_scope":["rossmoney.me","photos.rossmoney.me","vortexservers.co.uk"]},"other":{"channel_id":"666666666666666666"}}'
+leak_report='Host report: rossmoney.me is healthy; CPU 20.0% avg / 40.0% peak.'
+
+before=$(count_requests)
+set +e
+out=$(send_message admin-chat "$leak_report" NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -eq 0 ]; then
+    no "host-scope leak: admin-chat accepted a rossmoney report"
+elif [ "$after" -ne "$before" ]; then
+    no "host-scope leak: admin-chat made a delivery request despite the refusal"
+elif ! contains "$out" "outside its host_scope"; then
+    no "host-scope leak: refusal did not name the scope problem"
+elif ! contains "$out" "rossmoney.me"; then
+    no "host-scope leak: refusal did not name the offending host"
+else
+    pass "admin-chat refuses a rossmoney report before delivery"
+fi
+
+before=$(count_requests)
+set +e
+out=$(send_message automations "$leak_report" NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "host-scope leak: automations rejected a rossmoney report: $out"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "host-scope leak: automations did not make exactly one delivery request"
+else
+    body=$(body_of "$((after - 1))")
+    if [ "$(printf '%s' "$body" | jq -r '.arguments.channel_id')" != "555555555555555555" ]; then
+        no "host-scope leak: automations delivered to the wrong channel"
+    elif ! contains "$(printf '%s' "$body" | jq -r '.arguments.content')" "rossmoney.me"; then
+        no "host-scope leak: automations message lost the host"
+    else
+        pass "the same rossmoney report is delivered to automations"
+    fi
+fi
+
+# 10. A vortex host is valid on admin-chat.
+before=$(count_requests)
+set +e
+out=$(send_message admin-chat "Host report: vortexservers.co.uk is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "host-scope vortex: admin-chat rejected a vortex host: $out"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "host-scope vortex: admin-chat did not make one request"
+else
+    pass "admin-chat accepts a vortex host"
+fi
+
+# 11. A host outside both destinations' lists is refused on both.
+for target in admin-chat automations; do
+    before=$(count_requests)
+    set +e
+    out=$(send_message "$target" "Host report: other.example is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+    rc=$?
+    set -e
+    after=$(count_requests)
+    if [ "$rc" -eq 0 ]; then
+        no "host-scope other host: $target accepted other.example"
+    elif [ "$after" -ne "$before" ]; then
+        no "host-scope other host: $target made a request despite the refusal"
+    elif ! contains "$out" "other.example"; then
+        no "host-scope other host: $target refusal did not name the host"
+    else
+        pass "$target refuses a host outside its list before delivery"
+    fi
+done
+
+# 12. Subdomains are covered by a scope entry, in both directions.
+before=$(count_requests)
+set +e
+out=$(send_message admin-chat "Host report: photos.rossmoney.me is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -eq 0 ] || [ "$after" -ne "$before" ]; then
+    no "host-scope subdomain: admin-chat accepted photos.rossmoney.me"
+else
+    pass "a rossmoney subdomain is refused on admin-chat"
+fi
+
+before=$(count_requests)
+set +e
+out=$(send_message automations "Host report: photos.rossmoney.me is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ] || [ "$after" -ne $((before + 1)) ]; then
+    no "host-scope subdomain: automations rejected photos.rossmoney.me: $out"
+else
+    pass "a configured rossmoney subdomain is accepted on automations"
+fi
+
+# 13. A URL or code span does not evade the guard.
+before=$(count_requests)
+set +e
+out=$(send_message admin-chat 'See `https://rossmoney.me/status` for details.' NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -eq 0 ] || [ "$after" -ne "$before" ]; then
+    no "host-scope URL: admin-chat accepted a rossmoney URL"
+else
+    pass "a rossmoney URL is refused on admin-chat"
+fi
+
+# 14. An unscoped target keeps the previous behaviour: no host guard.
+before=$(count_requests)
+set +e
+out=$(send_message other "$leak_report" NOTIFY_TARGETS="$scoped_targets" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ] || [ "$after" -ne $((before + 1)) ]; then
+    no "host-scope unscoped: other rejected a normal report: $out"
+else
+    pass "an unscoped target is not host-guarded"
 fi
 
 if [ "$failures" -ne 0 ]; then

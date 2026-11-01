@@ -139,6 +139,7 @@ fi
 # validates the same fields again before sending. A malformed value fails by
 # target name only, never by id.
 target_host_scope=
+target_host_scope_json='[]'
 target_content_disabled=0
 if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
     command -v jq >/dev/null 2>&1 || {
@@ -180,6 +181,14 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
         exit 1
     }
+    target_host_scope_json=$(printf '%s' "$targets_json" | jq -c --arg name "$target" '
+        if has($name) then
+            (.[$name].host_scope // [] | if type == "string" then [.] else . end)
+        else [] end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve host_scope for target "%s"\n' "$target" >&2
+        exit 1
+    }
     bad_content_targets=$(printf '%s' "$targets_json" | jq -r '
         [ to_entries[]
           | select((.value | type) == "object")
@@ -199,6 +208,37 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         if has($name) and (.[$name].allow_content == false) then "1" else "0" end
     ' 2>/dev/null) || {
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+fi
+
+# The old host report always listed a configured set of hosts, even when one
+# sent no samples. Mirror that here: HOST_REPORT_HOSTS is the ordered known-host
+# list, filtered to the target's delivery scope when there is one. The agent
+# cannot read the environment, so the list is carried into the instruction.
+host_report_hosts_raw=${HOST_REPORT_HOSTS:-rossmoney.me,photos.rossmoney.me,vortexservers.co.uk}
+known_hosts_rendered=
+if command -v jq >/dev/null 2>&1; then
+    known_hosts_list=$(printf '%s' "$host_report_hosts_raw" | jq -Rr --argjson scope "$target_host_scope_json" '
+        def norm: ascii_downcase | gsub("\\.+$"; "");
+        ($scope | map(norm)) as $allowed
+        | split(",")
+        | map(gsub("^\\s+|\\s+$"; "") | norm)
+        | map(select(length > 0))
+        | map(. as $h
+              | select(($allowed | length) == 0
+                       or any($allowed[];
+                              . as $e
+                              | ($h == $e) or ($h | endswith("." + $e)))))
+        | join(",")
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve HOST_REPORT_HOSTS\n' >&2
+        exit 1
+    }
+    known_hosts_rendered=$(printf '%s' "$known_hosts_list" | jq -Rr '
+        split(",") | map(select(length > 0) | "`" + . + "`") | join(", ")
+    ') || {
+        printf 'run-prompt: could not render HOST_REPORT_HOSTS\n' >&2
         exit 1
     }
 fi
@@ -223,6 +263,11 @@ The target for this run is \`${target}\`. Send with:
 
 The delivery scope for this run is ${target_host_scope}. Nothing about any other host may appear in the message: report only on the scoped host, and if there is no data for it, say that plainly instead of using another host's numbers."
     fi
+    if [ -n "$known_hosts_rendered" ]; then
+        prompt="${prompt}
+
+The known hosts for this run are ${known_hosts_rendered}. Include one line for each, in this order, even if it has no samples. Do not add a known host outside the permitted hosts."
+    fi
     if [ "$target_content_disabled" -eq 1 ]; then
         prompt="${prompt}
 
@@ -238,6 +283,14 @@ fi
 if [ "$target_content_disabled" -eq 1 ]; then
     NOTIFY_CONTENT_DISABLED=1
     export NOTIFY_CONTENT_DISABLED
+fi
+
+# Export the effective host scope so ssh_probe.py refuses a host outside it
+# even if the model ignores the instruction. The MCP server is a child of the
+# opencode process, so it inherits the value.
+if [ -n "$target_host_scope_json" ] && [ "$target_host_scope_json" != "[]" ]; then
+    NOTIFY_HOST_SCOPE=$target_host_scope_json
+    export NOTIFY_HOST_SCOPE
 fi
 
 # Fail before OpenCode starts if the MCP server cannot answer initialize and

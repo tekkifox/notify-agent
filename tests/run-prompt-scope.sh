@@ -29,6 +29,9 @@ printf '%s' "$last" > "$CAPTURE"
 if [ -n "${CAPTURE_ENV:-}" ]; then
     printf '%s' "${NOTIFY_CONTENT_DISABLED-}" > "$CAPTURE_ENV"
 fi
+if [ -n "${CAPTURE_SCOPE:-}" ]; then
+    printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
+fi
 SH
 chmod +x "$tmp/bin/opencode"
 
@@ -131,13 +134,14 @@ no() { printf 'FAIL - %s\n' "$1" >&2; failures=$((failures + 1)); }
 capture() {
     out=$1
     shift
-    rm -f "$out" "$out.env"
+    rm -f "$out" "$out.env" "$out.scope"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
         NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
         CAPTURE="$out" \
         CAPTURE_ENV="$out.env" \
+        CAPTURE_SCOPE="$out.scope" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -153,6 +157,8 @@ Compose a status message.
 
 The target for this run is `general`. Send with:
 /app/scripts/notify.sh -t general -m "<message>"
+
+The known hosts for this run are `rossmoney.me`, `photos.rossmoney.me`, `vortexservers.co.uk`. Include one line for each, in this order, even if it has no samples. Do not add a known host outside the permitted hosts.
 EOF
 )
 
@@ -179,6 +185,8 @@ else
         no "scoped target: instruction lost the target command"
     elif [ "$(cat "$tmp/scoped.env")" != "1" ]; then
         no "scoped target: NOTIFY_CONTENT_DISABLED was not exported"
+    elif [ "$(cat "$tmp/scoped.scope")" != '["vortexservers.co.uk"]' ]; then
+        no "scoped target: NOTIFY_HOST_SCOPE was not exported as JSON"
     else
         pass "scoped target carries the delivery scope and content block"
     fi
@@ -200,6 +208,8 @@ elif contains "$(cat "$tmp/unscoped")" "Content search is disabled"; then
     no "unscoped target: instruction mentioned content"
 elif [ -s "$tmp/unscoped.env" ]; then
     no "unscoped target: NOTIFY_CONTENT_DISABLED was exported"
+elif [ -s "$tmp/unscoped.scope" ]; then
+    no "unscoped target: NOTIFY_HOST_SCOPE was exported"
 else
     pass "unscoped target keeps the old instruction exactly"
 fi
@@ -235,6 +245,8 @@ elif contains "$(cat "$tmp/multi")" "Content search is disabled"; then
     no "array scope: instruction mentioned content"
 elif [ -s "$tmp/multi.env" ]; then
     no "array scope: NOTIFY_CONTENT_DISABLED was exported"
+elif [ "$(cat "$tmp/multi.scope")" != '["a.example","b.example"]' ]; then
+    no "array scope: NOTIFY_HOST_SCOPE did not carry both hosts"
 else
     pass "array scope is rendered as a list"
 fi
