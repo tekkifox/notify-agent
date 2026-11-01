@@ -367,6 +367,37 @@ else
     fi
 fi
 
+# 8. Bot-source reply path: the listener pins notify.sh to one source's bot
+#    account and channel with no named target. This is the environment
+#    run_agent builds for a source without `target`.
+before=$(count_requests)
+set +e
+out=$(send \
+    COMPOSIO_ARGS='{"channel_id":"333333333333333333"}' \
+    COMPOSIO_CONNECTED_ACCOUNT_ID="ffffffff-3333-3333-3333-333333333333" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "bot source reply: notify.sh failed: $out"
+else
+    body=$(body_of "$((after - 1))")
+    path=$(path_of "$((after - 1))")
+    if [ "$after" -ne $((before + 1)) ]; then
+        no "bot source reply: expected one request"
+    elif [ "$path" != "/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE" ]; then
+        no "bot source reply: unexpected path $path"
+    elif [ "$(printf '%s' "$body" | jq -r '.arguments.channel_id')" != "333333333333333333" ]; then
+        no "bot source reply: channel_id was not the pinned source channel"
+    elif [ "$(printf '%s' "$body" | jq -r '.connected_account_id')" != "ffffffff-3333-3333-3333-333333333333" ]; then
+        no "bot source reply: connected_account_id was not the pinned source account"
+    elif [ "$(printf '%s' "$body" | jq -r '.arguments.content')" != "hello" ]; then
+        no "bot source reply: message missing from arguments"
+    else
+        pass "bot source reply posts through the pinned source account and channel"
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf '%d test(s) failed\n' "$failures" >&2
     exit 1
