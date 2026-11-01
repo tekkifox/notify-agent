@@ -19,11 +19,13 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
+| `scripts/host-stats.py` | Scheduled-path prefetch: fetches one host's window before the model runs. |
 | `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
 | `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
+| `tests/test_host_stats.py` | Prefetch tests: success, empty window, sanitised failure; no database or driver required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -158,6 +160,81 @@ deny, while the notify agent's resolved list ends with `oracle_query: allow`
 and `oracle_search_content: allow`. OpenCode names an MCP tool
 `<server>_<tool>`, so the server's `search_content` tool is reached as
 `oracle_search_content`.
+
+### Scheduled path: prefetch, not MCP
+
+OpenCode registers MCP tools after the first model turn. A scheduled job can
+therefore start before `oracle_query` exists, and a model that cannot see the
+tool reports "statistics query tool unavailable" even though the database is
+fine. The scheduled path removes that ordering dependency: the wrapper fetches
+the numbers **before** `opencode` runs and puts them in the instruction. The
+model only composes the message.
+
+Ad-hoc jobs keep the MCP tools. The admin-chat job genuinely needs arbitrary
+SQL, and an operator asking a one-off question is already in a session where
+the tools have been registered.
+
+`scripts/host-stats.py` is the scheduled-path fetcher:
+
+```sh
+python3 /app/scripts/host-stats.py --host vortexservers.co.uk --minutes 70
+```
+
+It prints a compact, prompt-ready block of `key=value` lines on stdout, and
+nothing else. A successful window looks like this:
+
+```text
+result=ok
+host=vortexservers.co.uk
+requested_minutes=70
+samples=23
+first_sampled_at=2026-11-01T10:01:00+00:00
+last_sampled_at=2026-11-01T11:08:00+00:00
+max_cpu_percent=91.25
+max_cpu_at=2026-11-01T10:44:00+00:00
+max_memory_percent=63.5
+max_memory_at=2026-11-01T10:44:00+00:00
+max_disk_percent=44
+max_disk_at=2026-11-01T11:08:00+00:00
+```
+
+`first_sampled_at` and `last_sampled_at` are the window actually covered, not
+the window requested; that is how the model can say "over the last 67 minutes"
+without inventing it. `requested_minutes` is what was asked for. Peak
+timestamps come from the same aggregate (`MAX ... KEEP (DENSE_RANK FIRST ...)`),
+so the whole block is one query and one connection.
+
+The three outcomes are deliberately distinct:
+
+| Outcome | Output | Exit |
+| --- | --- | --- |
+| Samples found | `result=ok` block on stdout | `0` |
+| Query succeeded, no samples in the window | `result=empty`, `samples=0` on stdout | `0` |
+| Query failed | nothing on stdout; one reason on stderr | `1` |
+
+An empty window is **not** a failure. It gets exit `0` and a clearly marked
+block, so the wrapper can tell "no data for this host" apart from "could not
+ask". A failure prints only a short reason on stderr, for example
+`host-stats: oracle error ORA-00942` or `host-stats: oracle query failed`.
+When an Oracle/DPY code is present only the code survives; driver text,
+`ORACLE_DSN`, `ORACLE_USER`, `ORACLE_PASSWORD` and `ORACLE_WALLET_DIR` never
+reach stdout or stderr. Configuration errors use the same constant messages the
+MCP server already returns.
+
+The fetcher does not invent a second connection path. It loads
+`mcp/oracle_query.py` and uses that module's `_config` and `_connection`
+helpers, so it inherits the thin-mode wallet staging (PEM only, so no
+passphrase prompt), stdin detachment, `SET TRANSACTION READ ONLY`, connect and
+call timeouts, and connection cleanup. It adds one fixed aggregate over
+`NOTIFY_RO.HOST_STATS_V` with `:host` and `:minutes` bind variables; neither
+value is interpolated into SQL.
+
+**Wrapper integration is intentionally not part of this change.**
+`scripts/run-prompt.sh`, `prompts/notify.md` and `opencode.json` are untouched
+here. A follow-up change wires the prefetch into scheduled runs and tells the
+model to compose from the supplied block; until that lands, scheduled jobs keep
+the current MCP path. The fetcher and its tests ship first so the wrapper
+change can be small and reviewed on its own.
 
 ### Published content search
 
@@ -307,6 +384,15 @@ and error sanitisation. A fake driver asserts that the query text and limit
 reach the database only as `:query` and `:limit` bind values, that the supplied
 text never appears in the SQL statement, and that a driver error containing a
 password, DSN and wallet path is reduced to `oracle error ORA-01017`.
+
+`tests/test_host_stats.py` covers the prefetch path with a stubbed connection
+helper: a successful row renders `result=ok` with samples and peak timestamps,
+an aggregate row with `COUNT(*) = 0` renders `result=empty` and exits `0`, and
+a stub raising an ORA or DPY error exits `1` with only the code on stderr. It
+also asserts that the host and window reach the database as `:host` and
+`:minutes` binds, that the script loads `mcp/oracle_query.py` rather than a
+copy, and that a failure containing a password, user, DSN and wallet path
+leaks none of them.
 
 ## Test delivery (sends a real message)
 
@@ -639,6 +725,7 @@ Verified while building this branch:
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
 - `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` and `oracle_search_content` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves both Oracle tools to `deny`.
 - The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 62 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors, plus `NOTIFY_CONTENT_DISABLED=1` refusing `search_content` with a clear tool error and behaving unchanged when unset.
+- `scripts/host-stats.py` compiles with `python3 -m py_compile`, and its 19 tests pass in the same discovery run as the 62 guard tests (81 total). With no Oracle configuration the script exits `1`, writes nothing to stdout, and prints `host-stats: Oracle connection is not configured`; with a deliberately broken wallet mount it prints only the constant wallet message. A stubbed thin-mode driver produced the `result=ok` block (exit `0`), the `result=empty` block (exit `0`), and an `ORA-01017` failure (exit `1`, stderr `host-stats: oracle error ORA-01017`). Grepping the failing stdout and stderr found none of the supplied user, password, DSN or wallet path.
 - The MCP stdio handshake in the image returns two tools, `query` and `search_content`, and its guard/input errors are tool errors rather than protocol failures. A `search_content` call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, password, or the query text.
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
@@ -652,6 +739,6 @@ Not verified, because this repository contains no credentials:
 - `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Discord send (no real webhook was used).
 - A live Composio send (no real API key was used; the Composio path was only exercised against a local stub).
-- A live Oracle query or a live `search_content` call (no credentials or wallet were used; the first mate runs the live checks). The guard, protocol, bind, cap, and failure paths were exercised without a database.
+- A live Oracle query, a live `search_content` call, or a live `scripts/host-stats.py` run against the real view (no credentials or wallet were used; the first mate runs the live checks). The guard, protocol, bind, cap, prefetch, and failure paths were exercised without a database.
 
 Do those checks on the target host after copying `stack.env`, mounting the wallet, and completing the device flow.
