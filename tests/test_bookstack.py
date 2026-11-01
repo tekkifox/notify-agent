@@ -35,6 +35,7 @@ CONFIG_PATH = ROOT / "opencode.json"
 
 spec = importlib.util.spec_from_file_location("bookstack", MODULE)
 bookstack = importlib.util.module_from_spec(spec)
+sys.modules["bookstack"] = bookstack
 spec.loader.exec_module(bookstack)
 
 TOKEN_ID = "stubtokenid0000000000"
