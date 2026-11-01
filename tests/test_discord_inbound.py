@@ -189,9 +189,11 @@ class ConfigTests(unittest.TestCase):
             "url": "https://vortex.example.test",
             "books": "networking, operations-getting-started, organization, "
             "bookstack, v-rising, scripts",
+            "token": "vortex",
         }
         config = self.load(NOTIFY_TARGETS=json.dumps(targets))
         self.assertEqual(config.target.bookstack_url, "https://vortex.example.test")
+        self.assertEqual(config.target.bookstack_token, "vortex")
         self.assertEqual(
             config.target.bookstack_books,
             "networking,operations-getting-started,organization,bookstack,"
@@ -218,6 +220,7 @@ class ConfigTests(unittest.TestCase):
             targets["admin-chat"]["bookstack"] = {
                 "url": bad_url,
                 "books": "runbooks",
+                "token": "vortex",
             }
             with self.assertRaises(discord_inbound.ConfigError) as raised:
                 self.load(NOTIFY_TARGETS=json.dumps(targets))
@@ -232,6 +235,7 @@ class ConfigTests(unittest.TestCase):
             targets["admin-chat"]["bookstack"] = {
                 "url": "https://vortex.example.test",
                 "books": bad_books,
+                "token": "vortex",
             }
             with self.assertRaises(discord_inbound.ConfigError) as raised:
                 self.load(NOTIFY_TARGETS=json.dumps(targets))
@@ -246,9 +250,26 @@ class ConfigTests(unittest.TestCase):
         targets["admin-chat"]["bookstack"] = {
             "url": "https://vortex.example.test",
             "books": "42, v-rising",
+            "token": "vortex",
         }
         config = self.load(NOTIFY_TARGETS=json.dumps(targets))
         self.assertEqual(config.target.bookstack_books, "42,v-rising")
+
+    def test_target_bookstack_token_must_be_a_strict_suffix(self) -> None:
+        targets = json.loads(self.env["NOTIFY_TARGETS"])
+        for bad_token in ("", "vor tex", "vor-tex", "vor.tex", None):
+            targets["admin-chat"]["bookstack"] = {
+                "url": "https://vortex.example.test",
+                "books": "runbooks",
+                "token": bad_token,
+            }
+            with self.assertRaises(discord_inbound.ConfigError) as raised:
+                self.load(NOTIFY_TARGETS=json.dumps(targets))
+            message = str(raised.exception)
+            self.assertIn("admin-chat", message)
+            self.assertIn("bookstack.token", message)
+            if isinstance(bad_token, str) and bad_token:
+                self.assertNotIn(bad_token, message)
 
     def test_webhook_mode_rejects_named_target(self) -> None:
         with self.assertRaises(discord_inbound.ConfigError):
@@ -1356,15 +1377,24 @@ class RunAgentTests(unittest.TestCase):
         targets["admin-chat"]["bookstack"] = {
             "url": "https://vortex.example.test",
             "books": "networking,scripts",
+            "token": "vortex",
         }
         env["NOTIFY_TARGETS"] = json.dumps(targets)
         config = discord_inbound.load_config(env)
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BOOKSTACK_TOKEN_ID_VORTEX": "vortex-id",
+                "BOOKSTACK_TOKEN_SECRET_VORTEX": "vortex-secret",
+            },
+            clear=False,
+        ):
             os.environ.pop("NOTIFY_RUNBOOKS_ALLOWED", None)
             with mock.patch.object(
                 discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
             ) as popen:
                 discord_inbound.run_agent(config, "instruction")
+            instruction = discord_inbound.build_instruction(config, "instruction")
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["NOTIFY_RUNBOOKS_ALLOWED"], "1")
         self.assertEqual(
@@ -1373,7 +1403,10 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(
             environment["NOTIFY_BOOKSTACK_BOOKS"], "networking,scripts"
         )
-        instruction = discord_inbound.build_instruction(config, "instruction")
+        self.assertEqual(environment["NOTIFY_BOOKSTACK_TOKEN_ID"], "vortex-id")
+        self.assertEqual(
+            environment["NOTIFY_BOOKSTACK_TOKEN_SECRET"], "vortex-secret"
+        )
         self.assertIn("runbook", instruction.lower())
 
     def test_runbooks_grant_without_an_instance_is_not_exported(self) -> None:
@@ -1388,6 +1421,8 @@ class RunAgentTests(unittest.TestCase):
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://operator.example.test",
                 "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+                "NOTIFY_BOOKSTACK_TOKEN_ID": "operator-id",
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": "operator-secret",
             },
         ):
             with mock.patch.object(
@@ -1399,6 +1434,8 @@ class RunAgentTests(unittest.TestCase):
             "NOTIFY_RUNBOOKS_ALLOWED",
             "NOTIFY_BOOKSTACK_URL",
             "NOTIFY_BOOKSTACK_BOOKS",
+            "NOTIFY_BOOKSTACK_TOKEN_ID",
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET",
         ):
             self.assertNotIn(variable, environment)
         instruction = discord_inbound.build_instruction(config, "instruction")
@@ -1410,6 +1447,7 @@ class RunAgentTests(unittest.TestCase):
         targets["admin-chat"]["bookstack"] = {
             "url": "https://vortex.example.test",
             "books": "networking",
+            "token": "vortex",
         }
         env["NOTIFY_TARGETS"] = json.dumps(targets)
         config = discord_inbound.load_config(env)
@@ -1419,6 +1457,8 @@ class RunAgentTests(unittest.TestCase):
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://operator.example.test",
                 "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+                "NOTIFY_BOOKSTACK_TOKEN_ID": "operator-id",
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": "operator-secret",
             },
         ):
             with mock.patch.object(
@@ -1430,6 +1470,8 @@ class RunAgentTests(unittest.TestCase):
             "NOTIFY_RUNBOOKS_ALLOWED",
             "NOTIFY_BOOKSTACK_URL",
             "NOTIFY_BOOKSTACK_BOOKS",
+            "NOTIFY_BOOKSTACK_TOKEN_ID",
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET",
         ):
             self.assertNotIn(variable, environment)
         instruction = discord_inbound.build_instruction(config, "instruction")
@@ -1449,15 +1491,26 @@ class RunAgentTests(unittest.TestCase):
                         "url": "https://vortex.example.test",
                         "books": "networking,operations-getting-started,"
                         "organization,bookstack,v-rising,scripts",
+                        "token": "vortex",
                     },
                 }
             }
         )
         config = discord_inbound.load_config(env)
-        with mock.patch.object(
-            discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
-        ) as popen:
-            discord_inbound.run_agent(config, "instruction")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BOOKSTACK_TOKEN_ID_VORTEX": "vortex-id",
+                "BOOKSTACK_TOKEN_SECRET_VORTEX": "vortex-secret",
+                "BOOKSTACK_TOKEN_ID_OPERATOR": "operator-id",
+                "BOOKSTACK_TOKEN_SECRET_OPERATOR": "operator-secret",
+            },
+        ):
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
+            ) as popen:
+                discord_inbound.run_agent(config, "instruction")
+            instruction = discord_inbound.build_instruction(config, "instruction")
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(
             environment["NOTIFY_BOOKSTACK_URL"], "https://vortex.example.test"
@@ -1467,7 +1520,16 @@ class RunAgentTests(unittest.TestCase):
             "networking,operations-getting-started,organization,bookstack,"
             "v-rising,scripts",
         )
+        self.assertEqual(environment["NOTIFY_BOOKSTACK_TOKEN_ID"], "vortex-id")
+        self.assertEqual(
+            environment["NOTIFY_BOOKSTACK_TOKEN_SECRET"], "vortex-secret"
+        )
+        self.assertNotEqual(
+            environment["NOTIFY_BOOKSTACK_TOKEN_ID"], "operator-id"
+        )
         self.assertNotIn("operator.example.test", environment["NOTIFY_BOOKSTACK_URL"])
+        self.assertIn("runbook", instruction.lower())
+        self.assertNotIn("operator.example.test", instruction)
 
     def test_automations_run_exports_only_the_operator_instance(self) -> None:
         env = dict(self.env)
@@ -1481,21 +1543,41 @@ class RunAgentTests(unittest.TestCase):
                     "bookstack": {
                         "url": "https://operator.example.test",
                         "books": "runbooks",
+                        "token": "operator",
                     },
                 }
             }
         )
         config = discord_inbound.load_config(env)
-        with mock.patch.object(
-            discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
-        ) as popen:
-            discord_inbound.run_agent(config, "instruction")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BOOKSTACK_TOKEN_ID_VORTEX": "vortex-id",
+                "BOOKSTACK_TOKEN_SECRET_VORTEX": "vortex-secret",
+                "BOOKSTACK_TOKEN_ID_OPERATOR": "operator-id",
+                "BOOKSTACK_TOKEN_SECRET_OPERATOR": "operator-secret",
+            },
+        ):
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
+            ) as popen:
+                discord_inbound.run_agent(config, "instruction")
+            instruction = discord_inbound.build_instruction(config, "instruction")
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(
             environment["NOTIFY_BOOKSTACK_URL"], "https://operator.example.test"
         )
         self.assertEqual(environment["NOTIFY_BOOKSTACK_BOOKS"], "runbooks")
+        self.assertEqual(environment["NOTIFY_BOOKSTACK_TOKEN_ID"], "operator-id")
+        self.assertEqual(
+            environment["NOTIFY_BOOKSTACK_TOKEN_SECRET"], "operator-secret"
+        )
+        self.assertNotEqual(
+            environment["NOTIFY_BOOKSTACK_TOKEN_ID"], "vortex-id"
+        )
         self.assertNotIn("vortex.example.test", environment["NOTIFY_BOOKSTACK_URL"])
+        self.assertIn("runbook", instruction.lower())
+        self.assertNotIn("vortex.example.test", instruction)
 
     def _popen_side_effect(
         self, attempts: list[tuple[int, bool]]
@@ -1935,12 +2017,20 @@ class ContentBoundaryTests(unittest.TestCase):
         targets["admin-chat"]["bookstack"] = {
             "url": "https://vortex.example.test",
             "books": "networking,scripts",
+            "token": "vortex",
         }
         env["NOTIFY_TARGETS"] = json.dumps(targets)
         config = discord_inbound.load_config(env)
-        instruction = discord_inbound.build_instruction(
-            config, "what can you do?"
-        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BOOKSTACK_TOKEN_ID_VORTEX": "vortex-id",
+                "BOOKSTACK_TOKEN_SECRET_VORTEX": "vortex-secret",
+            },
+        ):
+            instruction = discord_inbound.build_instruction(
+                config, "what can you do?"
+            )
         self.assertIn("runbook", instruction.lower())
 
     def test_content_disabled_target_with_a_grant_mentions_its_own_runbooks(
@@ -1957,12 +2047,20 @@ class ContentBoundaryTests(unittest.TestCase):
             "url": "https://vortex.example.test",
             "books": "networking,operations-getting-started,organization,"
             "bookstack,v-rising,scripts",
+            "token": "vortex",
         }
         env["NOTIFY_TARGETS"] = json.dumps(targets)
         config = discord_inbound.load_config(env)
-        instruction = discord_inbound.build_instruction(
-            config, "what can you do?"
-        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BOOKSTACK_TOKEN_ID_VORTEX": "vortex-id",
+                "BOOKSTACK_TOKEN_SECRET_VORTEX": "vortex-secret",
+            },
+        ):
+            instruction = discord_inbound.build_instruction(
+                config, "what can you do?"
+            )
         self.assertIn("Report host data and runbook procedures only", instruction)
         self.assertNotIn("Report host data only", instruction)
         self.assertIn("runbook", instruction.lower())

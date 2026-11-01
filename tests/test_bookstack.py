@@ -332,8 +332,8 @@ def environment(stub: StubBookStack, **overrides: str) -> dict[str, str]:
         "NOTIFY_BOOKSTACK_URL": stub.https_url,
         "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
         "NOTIFY_RUNBOOKS_ALLOWED": "1",
-        "BOOKSTACK_TOKEN_ID": stub.token_id,
-        "BOOKSTACK_TOKEN_SECRET": stub.token_secret,
+        "NOTIFY_BOOKSTACK_TOKEN_ID": stub.token_id,
+        "NOTIFY_BOOKSTACK_TOKEN_SECRET": stub.token_secret,
         "BOOKSTACK_TIMEOUT_SECONDS": "2",
     }
     env.update(overrides)
@@ -705,6 +705,31 @@ class RunbooksGateTests(StubTestCase):
         self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
         self.assertEqual(self.stub.requests, [])
 
+    def test_a_grant_without_a_token_pair_is_refused(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(self.stub)
+        env.pop("NOTIFY_BOOKSTACK_TOKEN_ID")
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertEqual(self.stub.requests, [])
+
+    def test_there_is_no_global_token_fallback(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(self.stub)
+        env.pop("NOTIFY_BOOKSTACK_TOKEN_ID")
+        env.pop("NOTIFY_BOOKSTACK_TOKEN_SECRET")
+        env["BOOKSTACK_TOKEN_ID"] = TOKEN_ID
+        env["BOOKSTACK_TOKEN_SECRET"] = TOKEN_SECRET
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertEqual(self.stub.requests, [])
+
     def test_content_disabled_does_not_gate_a_granted_run(self) -> None:
         # admin-chat stays host-data-only for the operator's CMS but may read
         # its own instance. The CMS gate lives in oracle_query.py.
@@ -741,8 +766,16 @@ class InstanceIsolationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         bookstack._RESOLVED_BOOKS.clear()
-        self.operator = StubBookStack(host="operator.example.test")
-        self.vortex = StubBookStack(host="vortex.example.test")
+        self.operator = StubBookStack(
+            token_id="operator-token-id",
+            token_secret="operator-token-secret",
+            host="operator.example.test",
+        )
+        self.vortex = StubBookStack(
+            token_id="vortex-token-id",
+            token_secret="vortex-token-secret",
+            host="vortex.example.test",
+        )
         self.addCleanup(self.operator.close)
         self.addCleanup(self.vortex.close)
         self.operator.install_runbooks(
@@ -769,8 +802,8 @@ class InstanceIsolationTests(unittest.TestCase):
             "NOTIFY_RUNBOOKS_ALLOWED": "1",
             "NOTIFY_BOOKSTACK_URL": stub.https_url,
             "NOTIFY_BOOKSTACK_BOOKS": books,
-            "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-            "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+            "NOTIFY_BOOKSTACK_TOKEN_ID": stub.token_id,
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET": stub.token_secret,
             "BOOKSTACK_TIMEOUT_SECONDS": "2",
         }
 
@@ -801,6 +834,14 @@ class InstanceIsolationTests(unittest.TestCase):
         self.assertEqual(self.operator.requests, [])
         self.assertEqual(env["NOTIFY_BOOKSTACK_URL"], self.vortex.https_url)
         self.assertNotEqual(env["NOTIFY_BOOKSTACK_URL"], self.operator.https_url)
+        self.assertEqual(env["NOTIFY_BOOKSTACK_TOKEN_ID"], self.vortex.token_id)
+        self.assertNotEqual(
+            env["NOTIFY_BOOKSTACK_TOKEN_ID"], self.operator.token_id
+        )
+        self.assertEqual(
+            self.vortex.requests[0]["headers"]["Authorization"],
+            f"Token {self.vortex.token_id}:{self.vortex.token_secret}",
+        )
 
     def test_automations_run_cannot_reach_the_vortex_wiki(self) -> None:
         env = self.environment(self.operator, "runbooks")
@@ -819,6 +860,14 @@ class InstanceIsolationTests(unittest.TestCase):
         self.assertEqual(self.vortex.requests, [])
         self.assertEqual(env["NOTIFY_BOOKSTACK_URL"], self.operator.https_url)
         self.assertNotEqual(env["NOTIFY_BOOKSTACK_URL"], self.vortex.https_url)
+        self.assertEqual(env["NOTIFY_BOOKSTACK_TOKEN_ID"], self.operator.token_id)
+        self.assertNotEqual(
+            env["NOTIFY_BOOKSTACK_TOKEN_ID"], self.vortex.token_id
+        )
+        self.assertEqual(
+            self.operator.requests[0]["headers"]["Authorization"],
+            f"Token {self.operator.token_id}:{self.operator.token_secret}",
+        )
 
     def test_a_forbidden_page_never_reaches_the_other_instance(self) -> None:
         # The Vortex stub serves its own page 6 as forbidden; the operator's
@@ -951,8 +1000,8 @@ class ConfigurationTests(unittest.TestCase):
     def load(self, **overrides: str):
         env = {
             "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
-            "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-            "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+            "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
             "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
         }
         env.update(overrides)
@@ -992,10 +1041,10 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_missing_token_names_the_variable_without_echoing_the_other(self) -> None:
         self.assert_config_error(
-            "BOOKSTACK_TOKEN_ID", TOKEN_SECRET, BOOKSTACK_TOKEN_ID=None
+            "NOTIFY_BOOKSTACK_TOKEN_ID", TOKEN_SECRET, NOTIFY_BOOKSTACK_TOKEN_ID=None
         )
         self.assert_config_error(
-            "BOOKSTACK_TOKEN_SECRET", TOKEN_ID, BOOKSTACK_TOKEN_SECRET=None
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET", TOKEN_ID, NOTIFY_BOOKSTACK_TOKEN_SECRET=None
         )
 
     def test_malformed_token_names_the_variable_without_echoing_it(self) -> None:
@@ -1003,9 +1052,9 @@ class ConfigurationTests(unittest.TestCase):
         # header-injection hazard rather than an empty value.
         secret = "SECRET WITH SPACE"
         self.assert_config_error(
-            "BOOKSTACK_TOKEN_SECRET",
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET",
             secret,
-            BOOKSTACK_TOKEN_SECRET=secret,
+            NOTIFY_BOOKSTACK_TOKEN_SECRET=secret,
         )
 
     def test_missing_allowlist_names_the_variable(self) -> None:
@@ -1056,7 +1105,10 @@ class ConfigurationTests(unittest.TestCase):
             bookstack.MAX_TIMEOUT_SECONDS,
         )
 
-    def test_selftest_without_configuration_fails_and_names_the_variable(self) -> None:
+    def test_selftest_with_malformed_configuration_fails_and_names_the_variable(
+        self,
+    ) -> None:
+        secret = "SECRET WITH SPACE"
         stdout = io.StringIO()
         stderr = io.StringIO()
         with mock.patch.dict(
@@ -1065,6 +1117,8 @@ class ConfigurationTests(unittest.TestCase):
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
                 "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": secret,
             },
             clear=True,
         ), \
@@ -1073,7 +1127,8 @@ class ConfigurationTests(unittest.TestCase):
             rc = bookstack.selftest()
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("BOOKSTACK_TOKEN_ID", stderr.getvalue())
+        self.assertIn("NOTIFY_BOOKSTACK_TOKEN_SECRET", stderr.getvalue())
+        self.assertNotIn(secret, stderr.getvalue())
 
     def test_selftest_ignores_the_cms_content_flag(self) -> None:
         # The CMS gate lives in oracle_query.py; it does not block this server.
@@ -1084,8 +1139,8 @@ class ConfigurationTests(unittest.TestCase):
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
                 "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
-                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
                 "NOTIFY_CONTENT_DISABLED": "1",
             },
             clear=True,
@@ -1117,19 +1172,20 @@ class StartupTests(unittest.TestCase):
             timeout=20,
         )
 
-    def test_missing_configuration_fails_loudly_at_startup(self) -> None:
-        sentinel = "SENTINEL-TOKEN-VALUE"
+    def test_malformed_configuration_fails_loudly_at_startup(self) -> None:
+        sentinel = "SENTINEL TOKEN VALUE"
         result = self.run_server(
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
-                "BOOKSTACK_TOKEN_SECRET": sentinel,
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": sentinel,
                 "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
             },
             "",
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("BOOKSTACK_TOKEN_ID", result.stderr)
+        self.assertIn("NOTIFY_BOOKSTACK_TOKEN_SECRET", result.stderr)
         self.assertNotIn(sentinel, result.stderr)
         self.assertNotIn(sentinel, result.stdout)
         self.assertEqual(result.stdout, "")
@@ -1140,8 +1196,8 @@ class StartupTests(unittest.TestCase):
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
-                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
                 "NOTIFY_BOOKSTACK_BOOKS": f"{sentinel}!",
             },
             "",
@@ -1167,8 +1223,8 @@ class StartupTests(unittest.TestCase):
                 # Port 9 (discard) on loopback: reachable enough to refuse fast
                 # if the server ever tried to connect at startup.
                 "NOTIFY_BOOKSTACK_URL": "https://127.0.0.1:9",
-                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
                 "NOTIFY_BOOKSTACK_BOOKS": "19",
             },
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
@@ -1182,8 +1238,8 @@ class StartupTests(unittest.TestCase):
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "NOTIFY_BOOKSTACK_URL": "http://127.0.0.1:9",
-                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+                "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
                 "NOTIFY_BOOKSTACK_BOOKS": "19",
             },
             "",
@@ -1226,8 +1282,8 @@ class TimeoutTests(unittest.TestCase):
         env = {
             "NOTIFY_RUNBOOKS_ALLOWED": "1",
             "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.test",
-            "BOOKSTACK_TOKEN_ID": TOKEN_ID,
-            "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+            "NOTIFY_BOOKSTACK_TOKEN_ID": TOKEN_ID,
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
             "NOTIFY_BOOKSTACK_BOOKS": "19",
             "BOOKSTACK_TIMEOUT_SECONDS": "0.25",
         }
@@ -1350,8 +1406,8 @@ class RepositoryRegistrationTests(unittest.TestCase):
         self.assertEqual(server["timeout"], oracle["timeout"])
         for variable in (
             "NOTIFY_BOOKSTACK_URL",
-            "BOOKSTACK_TOKEN_ID",
-            "BOOKSTACK_TOKEN_SECRET",
+            "NOTIFY_BOOKSTACK_TOKEN_ID",
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET",
             "NOTIFY_BOOKSTACK_BOOKS",
             "BOOKSTACK_TIMEOUT_SECONDS",
             "NOTIFY_RUNBOOKS_ALLOWED",

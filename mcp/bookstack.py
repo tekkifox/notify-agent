@@ -40,11 +40,15 @@ The CMS content gate (``NOTIFY_CONTENT_DISABLED``) is separate and is enforced
 by ``mcp/oracle_query.py``. It does not gate runbooks: a target may be
 host-data-only for the operator's CMS and still read its own runbook wiki.
 
-Configuration (the tokens and timeout are global; the URL and books are per
+Configuration (the timeout is global; the URL, books and token pair are per
 run, and a missing or malformed value fails loudly naming the variable):
 
     NOTIFY_BOOKSTACK_URL, NOTIFY_BOOKSTACK_BOOKS,
-    BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET, BOOKSTACK_TIMEOUT_SECONDS
+    NOTIFY_BOOKSTACK_TOKEN_ID, NOTIFY_BOOKSTACK_TOKEN_SECRET,
+    BOOKSTACK_TIMEOUT_SECONDS
+
+There is no global token fallback: a run whose named credential pair is missing
+is refused rather than borrowing another target's token.
 
 ``NOTIFY_BOOKSTACK_BOOKS`` is a comma-separated list of book ids or slugs. A
 slug is resolved to its id through ``/api/books`` on first use; the resolved ids
@@ -91,6 +95,8 @@ PROTOCOL_VERSIONS = (
 RUNBOOKS_ALLOWED_ENV = "NOTIFY_RUNBOOKS_ALLOWED"
 BOOKSTACK_URL_ENV = "NOTIFY_BOOKSTACK_URL"
 BOOKSTACK_BOOKS_ENV = "NOTIFY_BOOKSTACK_BOOKS"
+BOOKSTACK_TOKEN_ID_ENV = "NOTIFY_BOOKSTACK_TOKEN_ID"
+BOOKSTACK_TOKEN_SECRET_ENV = "NOTIFY_BOOKSTACK_TOKEN_SECRET"
 # The wording names neither the wiki nor the book that is withheld.
 RUNBOOKS_DENIED_ERROR = "access is not enabled for this run"
 
@@ -263,7 +269,12 @@ def access_error() -> str | None:
 
     if not runbooks_allowed():
         return RUNBOOKS_DENIED_ERROR
-    if not _env(BOOKSTACK_URL_ENV) or not _env(BOOKSTACK_BOOKS_ENV):
+    if (
+        not _env(BOOKSTACK_URL_ENV)
+        or not _env(BOOKSTACK_BOOKS_ENV)
+        or not _env(BOOKSTACK_TOKEN_ID_ENV)
+        or not _env(BOOKSTACK_TOKEN_SECRET_ENV)
+    ):
         return RUNBOOKS_DENIED_ERROR
     return None
 
@@ -346,20 +357,20 @@ def load_settings() -> Settings:
             "query"
         )
 
-    token_id = _env("BOOKSTACK_TOKEN_ID")
-    token_secret = _env("BOOKSTACK_TOKEN_SECRET")
+    token_id = _env(BOOKSTACK_TOKEN_ID_ENV)
+    token_secret = _env(BOOKSTACK_TOKEN_SECRET_ENV)
     missing = []
     if not token_id:
-        missing.append("BOOKSTACK_TOKEN_ID")
+        missing.append(BOOKSTACK_TOKEN_ID_ENV)
     if not token_secret:
-        missing.append("BOOKSTACK_TOKEN_SECRET")
+        missing.append(BOOKSTACK_TOKEN_SECRET_ENV)
     if missing:
         verb = "is" if len(missing) == 1 else "are"
         raise ConfigError(
             f"BookStack is not configured: {' and '.join(missing)} {verb} unset"
         )
-    _valid_token("BOOKSTACK_TOKEN_ID", token_id)
-    _valid_token("BOOKSTACK_TOKEN_SECRET", token_secret)
+    _valid_token(BOOKSTACK_TOKEN_ID_ENV, token_id)
+    _valid_token(BOOKSTACK_TOKEN_SECRET_ENV, token_secret)
 
     raw_books = _env(BOOKSTACK_BOOKS_ENV)
     if not raw_books:
