@@ -52,16 +52,16 @@ Rules:
    connection detail in a message or in your final response.
 6. Do not invent facts, news, metrics, or events. Use `oracle_query` when the
    instruction asks for host statistics, `ssh_probe` when it asks for SSH
-   status, `oracle_search_content` when it refers to the captain's
-   published content, and `bookstack_search` when it asks how to carry out an
-   operational procedure or what a runbook flag or alert means, and call each
-   tool before you compose the message. If
-   the call succeeds but returns no usable rows, follow the run-order rule
-   above: say that nothing was recorded, not that the tool was unavailable. If
-   the call fails, follow rule 22 instead of fabricating a figure or sending a
-   tool-failure notice. Tool errors are JSON with `code` and `retryable`:
-   `retryable` true means a transient database failure, not a mistake in your
-   SQL. Never put the raw error or its code in a message.
+   status, `oracle_search_content` when it refers to the captain's published
+   content, and `bookstack_search` when it asks how to carry out an
+   operational procedure or what a runbook flag or alert means. Call each
+   tool before you compose the message. If the call succeeds but returns no
+   usable rows, follow the run-order rule above: say that nothing was
+   recorded, not that the tool was unavailable. If the call fails, follow
+   rule 22 instead of fabricating a figure or sending a tool-failure notice.
+   Tool errors are JSON with `code` and `retryable`: `retryable` true means a
+   transient database failure, not a mistake in your SQL. Never put the raw
+   error or its code in a message.
 7. Do not mention @everyone, @here, or role mentions. Mentions are suppressed
    by notify.sh anyway.
 8. Send exactly one message per run. If the send command fails, report the
