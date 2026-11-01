@@ -81,10 +81,9 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Never put the raw error or its code in a message", FLAT_PROMPT)
 
     def test_restricted_runs_do_not_name_withheld_capabilities(self) -> None:
-        self.assertIn(
-            "Never describe or hint at your own capabilities", FLAT_PROMPT
-        )
-        self.assertIn("that you can't help with that here", FLAT_PROMPT)
+        self.assertIn("what you can do", FLAT_PROMPT)
+        self.assertIn("available in this run", FLAT_PROMPT)
+        self.assertNotIn("say briefly that you can't help with that here", FLAT_PROMPT)
         self.assertIn("Report host data only", RUN_PROMPT)
         self.assertNotIn("Content search is disabled", RUN_PROMPT)
         self.assertNotIn("site, CV, projects or pages", FLAT_PROMPT)
