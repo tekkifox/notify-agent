@@ -133,6 +133,7 @@ ACCEPTED_MESSAGE_TYPES = frozenset({0, 19})
 
 TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 BOOK_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+TOKEN_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{1,32}$")
 MENTION_RE = re.compile(r"<@[!&]?[0-9]+>|<#[0-9]+>")
 EVERYONE_RE = re.compile(r"(?<![\w])@(everyone|here)\b", re.IGNORECASE)
@@ -194,6 +195,7 @@ class InboundTarget:
     allow_runbooks: bool
     bookstack_url: str
     bookstack_books: str
+    bookstack_token: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -338,16 +340,20 @@ def _format_host_scope(scope: object) -> str:
     return ", ".join(formatted)
 
 
-def _format_bookstack(entry: Mapping[str, Any], name: str) -> tuple[str, str]:
+def _format_bookstack(
+    entry: Mapping[str, Any], name: str
+) -> tuple[str, str, str]:
     """Validate a target's optional BookStack instance settings.
 
-    The URL must be https and the books value a non-empty comma-separated list
-    of ids or slugs. Errors name the target only, never the value.
+    The URL must be https, the books value a non-empty comma-separated list of
+    ids or slugs, and the token a suffix naming the credential pair in
+    ``BOOKSTACK_TOKEN_ID_<SUFFIX>`` / ``BOOKSTACK_TOKEN_SECRET_<SUFFIX>``.
+    Errors name the target only, never the value.
     """
 
     raw = entry.get("bookstack")
     if raw is None:
-        return "", ""
+        return "", "", ""
     if not isinstance(raw, dict):
         raise ConfigError(f"target {name!r} bookstack must be an object")
 
@@ -389,7 +395,14 @@ def _format_bookstack(entry: Mapping[str, Any], name: str) -> tuple[str, str]:
                 f"target {name!r} bookstack.books contains an invalid entry"
             )
         normalised.append(lowered)
-    return url, ",".join(normalised)
+
+    token = raw.get("token")
+    if not isinstance(token, str) or not TOKEN_SUFFIX_RE.match(token):
+        raise ConfigError(
+            f"target {name!r} bookstack.token must be a suffix of letters, "
+            "digits and underscore"
+        )
+    return url, ",".join(normalised), token
 
 
 def _load_target_by_name(
@@ -489,7 +502,7 @@ def _load_target_by_name(
             )
         allow_runbooks = entry["allow_runbooks"]
 
-    bookstack_url, bookstack_books = _format_bookstack(entry, name)
+    bookstack_url, bookstack_books, bookstack_token = _format_bookstack(entry, name)
 
     return InboundTarget(
         name=name,
@@ -500,6 +513,7 @@ def _load_target_by_name(
         allow_runbooks=allow_runbooks,
         bookstack_url=bookstack_url,
         bookstack_books=bookstack_books,
+        bookstack_token=bookstack_token,
     )
 
 
@@ -1350,6 +1364,22 @@ def fetch_new_messages(
 # ---------------------------------------------------------------------------
 
 
+def _bookstack_credentials(target: InboundTarget | None) -> tuple[str, str]:
+    """Resolve the target's named credential pair from the listener env.
+
+    The suffix is validated at config load, so it is safe to use in an
+    environment variable name. There is no global-token fallback.
+    """
+
+    if target is None or not target.bookstack_token:
+        return "", ""
+    suffix = target.bookstack_token.upper()
+    return (
+        (os.environ.get(f"BOOKSTACK_TOKEN_ID_{suffix}") or "").strip(),
+        (os.environ.get(f"BOOKSTACK_TOKEN_SECRET_{suffix}") or "").strip(),
+    )
+
+
 def build_instruction(
     source: Config | InboundSource,
     operator_message: str,
@@ -1385,10 +1415,13 @@ def build_instruction(
                 "there is no data for it, say that plainly instead of using "
                 "another host's numbers."
             )
+        token_id, token_secret = _bookstack_credentials(target)
         runbooks_enabled = bool(
             target.allow_runbooks
             and target.bookstack_url
             and target.bookstack_books
+            and token_id
+            and token_secret
         )
         if not target.allow_content:
             restriction = "Report host data"
@@ -1528,20 +1561,27 @@ def _run_agent_once(
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
     # Runbooks are default-deny and per target: export the explicit grant and
-    # that target's own BookStack URL and books only when both are present,
-    # and clear any inherited values otherwise.
+    # that target's own BookStack URL, books and resolved credential pair only
+    # when all are present, and clear any inherited values otherwise.
     environment.pop("NOTIFY_RUNBOOKS_ALLOWED", None)
     environment.pop("NOTIFY_BOOKSTACK_URL", None)
     environment.pop("NOTIFY_BOOKSTACK_BOOKS", None)
+    environment.pop("NOTIFY_BOOKSTACK_TOKEN_ID", None)
+    environment.pop("NOTIFY_BOOKSTACK_TOKEN_SECRET", None)
+    token_id, token_secret = _bookstack_credentials(chosen.target)
     if (
         chosen.target is not None
         and chosen.target.allow_runbooks
         and chosen.target.bookstack_url
         and chosen.target.bookstack_books
+        and token_id
+        and token_secret
     ):
         environment["NOTIFY_RUNBOOKS_ALLOWED"] = "1"
         environment["NOTIFY_BOOKSTACK_URL"] = chosen.target.bookstack_url
         environment["NOTIFY_BOOKSTACK_BOOKS"] = chosen.target.bookstack_books
+        environment["NOTIFY_BOOKSTACK_TOKEN_ID"] = token_id
+        environment["NOTIFY_BOOKSTACK_TOKEN_SECRET"] = token_secret
     if chosen.reply_mode == "bot":
         # notify.sh treats DISCORD_WEBHOOK_URL and NOTIFY_DEFAULT_TARGET as
         # stronger than COMPOSIO_ARGS.  Remove both so this run can only reach

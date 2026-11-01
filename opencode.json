@@ -78,12 +78,12 @@
           "execution": 60000
         },
         "environment": {
-          "BOOKSTACK_TOKEN_ID": "{env:BOOKSTACK_TOKEN_ID}",
-          "BOOKSTACK_TOKEN_SECRET": "{env:BOOKSTACK_TOKEN_SECRET}",
           "BOOKSTACK_TIMEOUT_SECONDS": "{env:BOOKSTACK_TIMEOUT_SECONDS}",
           "NOTIFY_RUNBOOKS_ALLOWED": "{env:NOTIFY_RUNBOOKS_ALLOWED}",
           "NOTIFY_BOOKSTACK_URL": "{env:NOTIFY_BOOKSTACK_URL}",
           "NOTIFY_BOOKSTACK_BOOKS": "{env:NOTIFY_BOOKSTACK_BOOKS}",
+          "NOTIFY_BOOKSTACK_TOKEN_ID": "{env:NOTIFY_BOOKSTACK_TOKEN_ID}",
+          "NOTIFY_BOOKSTACK_TOKEN_SECRET": "{env:NOTIFY_BOOKSTACK_TOKEN_SECRET}",
           "PYTHONPATH": "/opt/mcp-python",
           "PYTHONUNBUFFERED": "1"
         }

@@ -228,10 +228,14 @@ if [ -n "${NOTIFY_TARGETS:-}" ]; then
             type == "string"
             and length > 8
             and test("^https://[^/?#@]+(/[^?#]*)?$");
+        def valid_token:
+            type == "string"
+            and test("^[A-Za-z0-9_]{1,64}$");
         def valid_bookstack:
             type == "object"
             and (.url | valid_url)
-            and (.books | valid_books);
+            and (.books | valid_books)
+            and (.token | valid_token);
         [ to_entries[]
           | select((.value | type) == "object")
           | select(.value | has("bookstack"))
@@ -241,7 +245,7 @@ if [ -n "${NOTIFY_TARGETS:-}" ]; then
     ' 2>/dev/null) \
         || fail "could not validate NOTIFY_TARGETS bookstack"
     if [ -n "$bad_bookstack_targets" ]; then
-        fail "invalid bookstack for target(s) ${bad_bookstack_targets}: expected an object with an https url and a comma-separated books list"
+        fail "invalid bookstack for target(s) ${bad_bookstack_targets}: expected an object with an https url, a comma-separated books list and a token suffix"
     fi
 fi
 

@@ -41,6 +41,12 @@ fi
 if [ -n "${CAPTURE_BOOKSTACK_BOOKS:-}" ]; then
     printf '%s' "${NOTIFY_BOOKSTACK_BOOKS-}" > "$CAPTURE_BOOKSTACK_BOOKS"
 fi
+if [ -n "${CAPTURE_BOOKSTACK_TOKEN_ID:-}" ]; then
+    printf '%s' "${NOTIFY_BOOKSTACK_TOKEN_ID-}" > "$CAPTURE_BOOKSTACK_TOKEN_ID"
+fi
+if [ -n "${CAPTURE_BOOKSTACK_TOKEN_SECRET:-}" ]; then
+    printf '%s' "${NOTIFY_BOOKSTACK_TOKEN_SECRET-}" > "$CAPTURE_BOOKSTACK_TOKEN_SECRET"
+fi
 if [ -n "${CAPTURE_SCOPE:-}" ]; then
     printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
 fi
@@ -149,7 +155,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 PY
 
-targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false,"allow_runbooks":true,"bookstack":{"url":"https://vortex.example.test","books":"networking,operations-getting-started,organization,bookstack,v-rising,scripts"}},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true,"bookstack":{"url":"https://operator.example.test","books":"runbooks"}}}'
+targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false,"allow_runbooks":true,"bookstack":{"url":"https://vortex.example.test","books":"networking,operations-getting-started,organization,bookstack,v-rising,scripts","token":"vortex"}},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true,"bookstack":{"url":"https://operator.example.test","books":"runbooks","token":"operator"}}}'
 
 failures=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -160,17 +166,24 @@ capture() {
     out=$1
     shift
     rm -f "$out" "$out.env" "$out.scope" "$out.runbooks" \
-        "$out.bookstack-url" "$out.bookstack-books"
+        "$out.bookstack-url" "$out.bookstack-books" \
+        "$out.bookstack-token-id" "$out.bookstack-token-secret"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
         NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
+        BOOKSTACK_TOKEN_ID_OPERATOR="operator-token-id" \
+        BOOKSTACK_TOKEN_SECRET_OPERATOR="operator-token-secret" \
+        BOOKSTACK_TOKEN_ID_VORTEX="vortex-token-id" \
+        BOOKSTACK_TOKEN_SECRET_VORTEX="vortex-token-secret" \
         CAPTURE="$out" \
         CAPTURE_ENV="$out.env" \
         CAPTURE_SCOPE="$out.scope" \
         CAPTURE_RUNBOOKS="$out.runbooks" \
         CAPTURE_BOOKSTACK_URL="$out.bookstack-url" \
         CAPTURE_BOOKSTACK_BOOKS="$out.bookstack-books" \
+        CAPTURE_BOOKSTACK_TOKEN_ID="$out.bookstack-token-id" \
+        CAPTURE_BOOKSTACK_TOKEN_SECRET="$out.bookstack-token-secret" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -226,10 +239,14 @@ else
         no "scoped target: NOTIFY_BOOKSTACK_URL was not the Vortex instance"
     elif [ "$(cat "$tmp/scoped.bookstack-books")" != "networking,operations-getting-started,organization,bookstack,v-rising,scripts" ]; then
         no "scoped target: NOTIFY_BOOKSTACK_BOOKS was not the Vortex book list"
+    elif [ "$(cat "$tmp/scoped.bookstack-token-id")" != "vortex-token-id" ]; then
+        no "scoped target: NOTIFY_BOOKSTACK_TOKEN_ID was not the Vortex credential"
+    elif [ "$(cat "$tmp/scoped.bookstack-token-secret")" != "vortex-token-secret" ]; then
+        no "scoped target: NOTIFY_BOOKSTACK_TOKEN_SECRET was not the Vortex credential"
     elif contains "$(cat "$tmp/scoped.bookstack-url")" "operator.example.test"; then
         no "scoped target: admin-chat could reach the operator instance"
     else
-        pass "scoped target carries its scope and its own Vortex runbooks"
+        pass "scoped target carries its scope and its own Vortex runbooks and token"
     fi
 fi
 
@@ -370,12 +387,16 @@ elif [ "$(cat "$tmp/runbooks.bookstack-url")" != "https://operator.example.test"
     no "allow_runbooks target: NOTIFY_BOOKSTACK_URL was not the operator instance"
 elif [ "$(cat "$tmp/runbooks.bookstack-books")" != "runbooks" ]; then
     no "allow_runbooks target: NOTIFY_BOOKSTACK_BOOKS was not the operator book"
+elif [ "$(cat "$tmp/runbooks.bookstack-token-id")" != "operator-token-id" ]; then
+    no "allow_runbooks target: NOTIFY_BOOKSTACK_TOKEN_ID was not the operator credential"
+elif [ "$(cat "$tmp/runbooks.bookstack-token-secret")" != "operator-token-secret" ]; then
+    no "allow_runbooks target: NOTIFY_BOOKSTACK_TOKEN_SECRET was not the operator credential"
 elif contains "$(cat "$tmp/runbooks.bookstack-url")" "vortex.example.test"; then
     no "allow_runbooks target: automations could reach the Vortex instance"
 elif [ -s "$tmp/runbooks.env" ]; then
     no "allow_runbooks target: NOTIFY_CONTENT_DISABLED was exported"
 else
-    pass "allow_runbooks true mentions runbooks and exports its own instance"
+    pass "allow_runbooks true mentions runbooks and exports its own instance and token"
 fi
 
 # 7c. admin-chat with allow_content flipped true but no allow_runbooks is still
@@ -451,6 +472,8 @@ capture "$tmp/grant-no-instance" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"22
     NOTIFY_RUNBOOKS_ALLOWED=1 \
     NOTIFY_BOOKSTACK_URL=https://operator.example.test \
     NOTIFY_BOOKSTACK_BOOKS=runbooks \
+    NOTIFY_BOOKSTACK_TOKEN_ID=operator-token-id \
+    NOTIFY_BOOKSTACK_TOKEN_SECRET=operator-token-secret \
     "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
 rc=$?
 set -e
@@ -461,7 +484,9 @@ elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
     no "grant without instance: instruction mentioned runbooks"
 elif [ -s "$tmp/grant-no-instance.runbooks" ] \
     || [ -s "$tmp/grant-no-instance.bookstack-url" ] \
-    || [ -s "$tmp/grant-no-instance.bookstack-books" ]; then
+    || [ -s "$tmp/grant-no-instance.bookstack-books" ] \
+    || [ -s "$tmp/grant-no-instance.bookstack-token-id" ] \
+    || [ -s "$tmp/grant-no-instance.bookstack-token-secret" ]; then
     no "grant without instance: runbook variables were not cleared"
 else
     pass "a grant without an instance exports nothing"
@@ -470,10 +495,12 @@ fi
 # 7g. A bookstack instance without the grant exports nothing and mentions
 #     nothing, even if the parent environment carries a grant and an instance.
 set +e
-capture "$tmp/instance-no-grant" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","bookstack":{"url":"https://vortex.example.test","books":"networking"}}}' \
+capture "$tmp/instance-no-grant" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","bookstack":{"url":"https://vortex.example.test","books":"networking","token":"vortex"}}}' \
     NOTIFY_RUNBOOKS_ALLOWED=1 \
     NOTIFY_BOOKSTACK_URL=https://operator.example.test \
     NOTIFY_BOOKSTACK_BOOKS=runbooks \
+    NOTIFY_BOOKSTACK_TOKEN_ID=operator-token-id \
+    NOTIFY_BOOKSTACK_TOKEN_SECRET=operator-token-secret \
     "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
 rc=$?
 set -e
@@ -484,10 +511,56 @@ elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
     no "instance without grant: instruction mentioned runbooks"
 elif [ -s "$tmp/instance-no-grant.runbooks" ] \
     || [ -s "$tmp/instance-no-grant.bookstack-url" ] \
-    || [ -s "$tmp/instance-no-grant.bookstack-books" ]; then
+    || [ -s "$tmp/instance-no-grant.bookstack-books" ] \
+    || [ -s "$tmp/instance-no-grant.bookstack-token-id" ] \
+    || [ -s "$tmp/instance-no-grant.bookstack-token-secret" ]; then
     no "instance without grant: runbook variables were not cleared"
 else
     pass "an instance without the grant exports nothing"
+fi
+
+# 7h. A malformed bookstack.token suffix fails before opencode runs, names the
+#     target, and never echoes the value.
+set +e
+capture "$tmp/bad-token" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","allow_runbooks":true,"bookstack":{"url":"https://vortex.example.test","books":"runbooks","token":"vor-tex"}}}' \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/bad-token.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "malformed bookstack token: expected a non-zero exit"
+elif [ -e "$tmp/bad-token" ]; then
+    no "malformed bookstack token: opencode ran despite the failure"
+elif ! contains "$err" "admin-chat"; then
+    no "malformed bookstack token: message did not name the target"
+elif contains "$err" "vor-tex" || contains "$err" "222222222222222222"; then
+    no "malformed bookstack token: message leaked a value or id"
+else
+    pass "malformed bookstack token fails by name and sends nothing"
+fi
+
+# 7i. A named token suffix with no configured pair gets no runbooks and no
+#     mention, even if a global BOOKSTACK_TOKEN_* pair is present.
+set +e
+capture "$tmp/token-missing" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","allow_runbooks":true,"bookstack":{"url":"https://vortex.example.test","books":"networking","token":"unconfigured"}}}' \
+    BOOKSTACK_TOKEN_ID=global-token-id \
+    BOOKSTACK_TOKEN_SECRET=global-token-secret \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+prompt=$(cat "$tmp/token-missing" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "unconfigured token: run-prompt.sh failed: $(cat "$tmp/token-missing.stderr")"
+elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
+    no "unconfigured token: instruction mentioned runbooks"
+elif [ -s "$tmp/token-missing.runbooks" ] \
+    || [ -s "$tmp/token-missing.bookstack-url" ] \
+    || [ -s "$tmp/token-missing.bookstack-books" ] \
+    || [ -s "$tmp/token-missing.bookstack-token-id" ] \
+    || [ -s "$tmp/token-missing.bookstack-token-secret" ]; then
+    no "unconfigured token: runbook variables were not cleared"
+else
+    pass "an unconfigured token suffix gets no runbooks"
 fi
 
 # 8. A server that does not advertise both tools fails the run before
