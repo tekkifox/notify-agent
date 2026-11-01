@@ -1304,7 +1304,11 @@ def build_instruction(
             )
         if not target.allow_content:
             lines.append(
-                "\nReport host data only: do not include any other material."
+                "\nReport host data only: do not include any other material.\n"
+                "If the operator asks what you can do, answer with what this "
+                "run allows: host health (CPU, memory, load, disk, sample "
+                "freshness) and SSH reachability for "
+                f"{target.host_scope or 'the hosts in scope'}."
             )
     else:
         lines.append(
