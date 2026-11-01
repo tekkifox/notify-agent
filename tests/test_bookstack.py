@@ -82,9 +82,17 @@ FORBIDDEN_BOOK = {
 class StubBookStack:
     """A tiny BookStack API stub that records every request it receives."""
 
-    def __init__(self, token_id: str = TOKEN_ID, token_secret: str = TOKEN_SECRET):
+    def __init__(
+        self,
+        token_id: str = TOKEN_ID,
+        token_secret: str = TOKEN_SECRET,
+        host: str = "bookstack.example.test",
+    ):
         self.token_id = token_id
         self.token_secret = token_secret
+        self.host = host
+        self.book_id = 19
+        self.book_slug = "runbooks"
         self.requests: list[dict] = []
         self.routes: dict[str, object] = {}
         self.delay = 0.0
@@ -167,6 +175,10 @@ class StubBookStack:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    @property
+    def https_url(self) -> str:
+        return f"https://{self.host}"
+
     def route(self, path: str, payload, status: int = 200, headers=None) -> None:
         self.routes[path] = (status, payload, headers or {})
 
@@ -183,8 +195,15 @@ class StubBookStack:
 
     # -- standard fixtures -------------------------------------------------
 
-    def install_runbooks(self, book_id: int = 19, book_slug: str = "runbooks") -> None:
-        book = {"id": book_id, "name": "Runbooks", "slug": book_slug}
+    def install_runbooks(
+        self,
+        book_id: int = 19,
+        book_slug: str = "runbooks",
+        book_name: str = "Runbooks",
+    ) -> None:
+        self.book_id = book_id
+        self.book_slug = book_slug
+        book = {"id": book_id, "name": book_name, "slug": book_slug}
 
         self.route(
             "/api/books",
@@ -240,12 +259,11 @@ class StubBookStack:
             )
 
         self.route_func(f"/api/search/book/{book_id}", search)
-        self.route("/api/pages/5", dict(ALLOWED_PAGE))
+        self.route("/api/pages/5", dict(ALLOWED_PAGE, book_id=book_id))
         self.route("/api/pages/6", dict(FORBIDDEN_PAGE))
         self.route_func("/api/pages", self._pages_by_slug)
 
-    @staticmethod
-    def _pages_by_slug(query):
+    def _pages_by_slug(self, query):
         slug = query.get("filter[slug]", "")
         if slug == "restart-backrest":
             return (
@@ -254,8 +272,8 @@ class StubBookStack:
                     "data": [
                         {
                             "id": 5,
-                            "book_id": 19,
-                            "book_slug": "runbooks",
+                            "book_id": self.book_id,
+                            "book_slug": self.book_slug,
                             "name": "Restart backrest",
                             "slug": "restart-backrest",
                         }
@@ -284,14 +302,39 @@ class StubBookStack:
         return (200, {"data": [], "total": 0}, {})
 
 
+class RewriteOpener:
+    """Send a fake https:// test URL to the matching loopback HTTP stub.
+
+    Production requires https. The tests still use plain HTTP stubs on
+    127.0.0.1, so this test-only opener maps each fake host to its stub while
+    preserving the no-redirect behaviour.
+    """
+
+    def __init__(self, routes: dict[str, str]) -> None:
+        self.routes = {host: url.rstrip("/") for host, url in routes.items()}
+        self._opener = urllib.request.build_opener(bookstack._NoRedirect)
+
+    def open(self, request, timeout=None):
+        parsed = urllib.parse.urlsplit(request.full_url)
+        base = self.routes[parsed.netloc]
+        url = base + parsed.path
+        if parsed.query:
+            url = f"{url}?{parsed.query}"
+        headers = {key: value for key, value in request.header_items()}
+        rewritten = urllib.request.Request(
+            url, headers=headers, method=request.get_method()
+        )
+        return self._opener.open(rewritten, timeout=timeout)
+
+
 def environment(stub: StubBookStack, **overrides: str) -> dict[str, str]:
     env = {
-        "BOOKSTACK_URL": stub.url,
+        "NOTIFY_BOOKSTACK_URL": stub.https_url,
+        "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+        "NOTIFY_RUNBOOKS_ALLOWED": "1",
         "BOOKSTACK_TOKEN_ID": stub.token_id,
         "BOOKSTACK_TOKEN_SECRET": stub.token_secret,
-        "BOOKSTACK_ALLOWED_BOOKS": "runbooks",
         "BOOKSTACK_TIMEOUT_SECONDS": "2",
-        "NOTIFY_RUNBOOKS_ALLOWED": "1",
     }
     env.update(overrides)
     return env
@@ -302,6 +345,13 @@ class StubTestCase(unittest.TestCase):
         bookstack._RESOLVED_BOOKS.clear()
         self.stub = StubBookStack()
         self.addCleanup(self.stub.close)
+        opener = mock.patch.object(
+            bookstack,
+            "_OPENER",
+            RewriteOpener({self.stub.host: self.stub.url}),
+        )
+        opener.start()
+        self.addCleanup(opener.stop)
 
     def call(self, name: str, arguments: dict) -> tuple[str, bool]:
         env = environment(self.stub)
@@ -449,7 +499,7 @@ class AllowlistTests(StubTestCase):
 
     def test_numeric_allowlist_needs_no_book_lookup(self) -> None:
         self.stub.install_runbooks()
-        env = environment(self.stub, BOOKSTACK_ALLOWED_BOOKS="19")
+        env = environment(self.stub, NOTIFY_BOOKSTACK_BOOKS="19")
 
         with mock.patch.dict(os.environ, env, clear=True):
             text, is_error = bookstack.call_search({"query": "restart"})
@@ -486,7 +536,7 @@ class AllowlistTests(StubTestCase):
                 "total": 1,
             },
         )
-        env = environment(self.stub, BOOKSTACK_ALLOWED_BOOKS="runbooks,other")
+        env = environment(self.stub, NOTIFY_BOOKSTACK_BOOKS="runbooks,other")
 
         with mock.patch.dict(os.environ, env, clear=True):
             text, is_error = bookstack.call_search({"query": "anything"})
@@ -497,6 +547,54 @@ class AllowlistTests(StubTestCase):
         self.assertEqual(
             self.stub.paths(),
             ["/api/books", "/api/books", "/api/search/book/19", "/api/search/book/42"],
+        )
+
+    def test_a_missing_slug_is_skipped_not_fatal(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(
+            self.stub, NOTIFY_BOOKSTACK_BOOKS="runbooks,missing-book"
+        )
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertFalse(is_error, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["count"], 1)
+        self.assertIn("/api/search/book/19", self.stub.paths())
+        self.assertNotIn("/api/search/book/0", self.stub.paths())
+
+    def test_a_slug_that_returns_404_is_skipped(self) -> None:
+        self.stub.install_runbooks()
+
+        def books(query):
+            if query.get("filter[slug]") == "missing-book":
+                return (404, {"error": {"message": "Not Found"}}, {})
+            return (200, {"data": [dict(ALLOWED_BOOK)], "total": 1}, {})
+
+        self.stub.route_func("/api/books", books)
+        env = environment(
+            self.stub, NOTIFY_BOOKSTACK_BOOKS="runbooks,missing-book"
+        )
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertFalse(is_error, text)
+        self.assertEqual(json.loads(text)["count"], 1)
+
+    def test_no_resolvable_book_returns_an_empty_search(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(self.stub, NOTIFY_BOOKSTACK_BOOKS="missing-book")
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+        read_text, read_error = self.call_with("read", {"page": 5}, env)
+
+        self.assertFalse(is_error, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["results"], [])
+        self.assertTrue(read_error)
+        self.assertEqual(
+            json.loads(read_text)["error"], bookstack.PAGE_REFUSED_ERROR
         )
 
 
@@ -556,7 +654,7 @@ class RunbooksGateTests(StubTestCase):
 
         self.assertTrue(is_error)
         self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
-        self.assertNotIn("BOOKSTACK_URL", text)
+        self.assertNotIn("NOTIFY_BOOKSTACK_URL", text)
 
     def test_the_refusal_says_nothing_about_the_wiki(self) -> None:
         self.stub.install_runbooks()
@@ -585,61 +683,153 @@ class RunbooksGateTests(StubTestCase):
         self.assertEqual(len(messages), 2)
         self.assertIn("result", messages[0])
 
-    def test_the_content_gate_is_an_additional_refusal(self) -> None:
+    def test_a_grant_without_an_instance_is_refused(self) -> None:
         self.stub.install_runbooks()
-        env = environment(
-            self.stub,
-            NOTIFY_RUNBOOKS_ALLOWED="1",
-            NOTIFY_CONTENT_DISABLED="1",
-        )
+        env = environment(self.stub)
+        env.pop("NOTIFY_BOOKSTACK_URL")
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertEqual(self.stub.requests, [])
+
+    def test_a_grant_without_books_is_refused(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(self.stub)
+        env.pop("NOTIFY_BOOKSTACK_BOOKS")
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertEqual(self.stub.requests, [])
+
+    def test_content_disabled_does_not_gate_a_granted_run(self) -> None:
+        # admin-chat stays host-data-only for the operator's CMS but may read
+        # its own instance. The CMS gate lives in oracle_query.py.
+        self.stub.install_runbooks()
+        env = environment(self.stub, NOTIFY_CONTENT_DISABLED="1")
 
         search_text, search_error = self.call_with("search", {"query": "restart"}, env)
         read_text, read_error = self.call_with("read", {"page": 5}, env)
 
-        self.assertTrue(search_error)
-        self.assertTrue(read_error)
-        self.assertEqual(
-            json.loads(search_text)["error"], bookstack.CONTENT_DISABLED_ERROR
-        )
-        self.assertEqual(
-            json.loads(read_text)["error"], bookstack.CONTENT_DISABLED_ERROR
-        )
-        self.assertEqual(self.stub.requests, [])
+        self.assertFalse(search_error, search_text)
+        self.assertFalse(read_error, read_text)
+        self.assertNotEqual(self.stub.requests, [])
 
-    def test_the_content_refusal_says_nothing_about_the_wiki(self) -> None:
-        self.stub.install_runbooks()
-        env = environment(
-            self.stub,
-            NOTIFY_RUNBOOKS_ALLOWED="1",
-            NOTIFY_CONTENT_DISABLED="1",
-        )
-
-        text, _ = self.call_with("search", {"query": "restart"}, env)
-        read_text, _ = self.call_with("read", {"page": "restart-backrest"}, env)
-
-        for output in (text, read_text):
-            for word in ("bookstack", "book", "wiki", "runbook", "page"):
-                self.assertNotIn(word, output.lower())
-
-    def test_a_content_disabled_run_does_not_need_bookstack_configuration(self) -> None:
+    def test_a_grant_without_an_instance_serves_the_protocol_without_configuration(
+        self,
+    ) -> None:
         requests = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
         )
         responses = io.StringIO()
         with mock.patch.dict(
-            os.environ,
-            {
-                "NOTIFY_RUNBOOKS_ALLOWED": "1",
-                "NOTIFY_CONTENT_DISABLED": "1",
-            },
-            clear=True,
+            os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": "1"}, clear=True
         ), mock.patch.object(bookstack.sys, "stdin", io.StringIO(requests)), \
                 contextlib.redirect_stdout(responses):
             self.assertEqual(bookstack.main(), 0)
         messages = [json.loads(line) for line in responses.getvalue().splitlines()]
         self.assertEqual(len(messages), 2)
         self.assertIn("result", messages[0])
+
+
+class InstanceIsolationTests(unittest.TestCase):
+    """Each run is bound to one target's instance, not just one book list."""
+
+    def setUp(self) -> None:
+        bookstack._RESOLVED_BOOKS.clear()
+        self.operator = StubBookStack(host="operator.example.test")
+        self.vortex = StubBookStack(host="vortex.example.test")
+        self.addCleanup(self.operator.close)
+        self.addCleanup(self.vortex.close)
+        self.operator.install_runbooks(
+            book_id=19, book_slug="runbooks", book_name="Operator runbooks"
+        )
+        self.vortex.install_runbooks(
+            book_id=42, book_slug="vortex-runbooks", book_name="Vortex runbooks"
+        )
+        opener = mock.patch.object(
+            bookstack,
+            "_OPENER",
+            RewriteOpener(
+                {
+                    self.operator.host: self.operator.url,
+                    self.vortex.host: self.vortex.url,
+                }
+            ),
+        )
+        opener.start()
+        self.addCleanup(opener.stop)
+
+    def environment(self, stub: StubBookStack, books: str) -> dict[str, str]:
+        return {
+            "NOTIFY_RUNBOOKS_ALLOWED": "1",
+            "NOTIFY_BOOKSTACK_URL": stub.https_url,
+            "NOTIFY_BOOKSTACK_BOOKS": books,
+            "BOOKSTACK_TOKEN_ID": TOKEN_ID,
+            "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+            "BOOKSTACK_TIMEOUT_SECONDS": "2",
+        }
+
+    def call(
+        self, name: str, arguments: dict, env: dict[str, str]
+    ) -> tuple[str, bool]:
+        with mock.patch.dict(os.environ, env, clear=True):
+            if name == "search":
+                return bookstack.call_search(arguments)
+            return bookstack.call_read(arguments)
+
+    def test_admin_chat_run_cannot_reach_the_operator_wiki(self) -> None:
+        env = self.environment(self.vortex, "vortex-runbooks")
+
+        text, is_error = self.call("search", {"query": "restart"}, env)
+        read_text, read_error = self.call("read", {"page": 5}, env)
+
+        self.assertFalse(is_error, text)
+        self.assertFalse(read_error, read_text)
+        payload = json.loads(text)
+        self.assertEqual(
+            [result["book"] for result in payload["results"]],
+            ["Vortex runbooks"],
+        )
+        self.assertNotEqual(self.vortex.requests, [])
+        # The operator's stub was never contacted, so the run cannot read the
+        # operator's wiki even though both stubs serve the same page id.
+        self.assertEqual(self.operator.requests, [])
+        self.assertEqual(env["NOTIFY_BOOKSTACK_URL"], self.vortex.https_url)
+        self.assertNotEqual(env["NOTIFY_BOOKSTACK_URL"], self.operator.https_url)
+
+    def test_automations_run_cannot_reach_the_vortex_wiki(self) -> None:
+        env = self.environment(self.operator, "runbooks")
+
+        text, is_error = self.call("search", {"query": "restart"}, env)
+        read_text, read_error = self.call("read", {"page": 5}, env)
+
+        self.assertFalse(is_error, text)
+        self.assertFalse(read_error, read_text)
+        payload = json.loads(text)
+        self.assertEqual(
+            [result["book"] for result in payload["results"]],
+            ["Operator runbooks"],
+        )
+        self.assertNotEqual(self.operator.requests, [])
+        self.assertEqual(self.vortex.requests, [])
+        self.assertEqual(env["NOTIFY_BOOKSTACK_URL"], self.operator.https_url)
+        self.assertNotEqual(env["NOTIFY_BOOKSTACK_URL"], self.vortex.https_url)
+
+    def test_a_forbidden_page_never_reaches_the_other_instance(self) -> None:
+        # The Vortex stub serves its own page 6 as forbidden; the operator's
+        # stub receives no request at all.
+        env = self.environment(self.vortex, "vortex-runbooks")
+
+        text, is_error = self.call("read", {"page": 6}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.PAGE_REFUSED_ERROR)
+        self.assertEqual(self.operator.requests, [])
 
 
 class SecretTests(StubTestCase):
@@ -760,10 +950,10 @@ class ConfigurationTests(unittest.TestCase):
 
     def load(self, **overrides: str):
         env = {
-            "BOOKSTACK_URL": "https://bookstack.example.com",
+            "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
             "BOOKSTACK_TOKEN_ID": TOKEN_ID,
             "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
-            "BOOKSTACK_ALLOWED_BOOKS": "runbooks",
+            "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
         }
         env.update(overrides)
         env = {key: value for key, value in env.items() if value is not None}
@@ -780,20 +970,24 @@ class ConfigurationTests(unittest.TestCase):
         return message
 
     def test_missing_url_names_the_variable(self) -> None:
-        self.assert_config_error("BOOKSTACK_URL", BOOKSTACK_URL=None)
+        self.assert_config_error("NOTIFY_BOOKSTACK_URL", NOTIFY_BOOKSTACK_URL=None)
 
     def test_bad_url_scheme_is_rejected(self) -> None:
-        self.assert_config_error(
-            "BOOKSTACK_URL", BOOKSTACK_URL="ftp://bookstack.example.com"
-        )
-        self.assert_config_error("BOOKSTACK_URL", BOOKSTACK_URL="not a url")
+        for bad_url in (
+            "http://bookstack.example.com",
+            "ftp://bookstack.example.com",
+            "not a url",
+        ):
+            self.assert_config_error(
+                "NOTIFY_BOOKSTACK_URL", NOTIFY_BOOKSTACK_URL=bad_url
+            )
 
     def test_url_with_credentials_or_query_is_rejected(self) -> None:
         self.assert_config_error(
-            "BOOKSTACK_URL", BOOKSTACK_URL="https://user:pass@bookstack.example.com"
+            "NOTIFY_BOOKSTACK_URL", NOTIFY_BOOKSTACK_URL="https://user:pass@bookstack.example.com"
         )
         self.assert_config_error(
-            "BOOKSTACK_URL", BOOKSTACK_URL="https://bookstack.example.com?x=1"
+            "NOTIFY_BOOKSTACK_URL", NOTIFY_BOOKSTACK_URL="https://bookstack.example.com?x=1"
         )
 
     def test_missing_token_names_the_variable_without_echoing_the_other(self) -> None:
@@ -816,20 +1010,20 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_missing_allowlist_names_the_variable(self) -> None:
         self.assert_config_error(
-            "BOOKSTACK_ALLOWED_BOOKS", BOOKSTACK_ALLOWED_BOOKS=None
+            "NOTIFY_BOOKSTACK_BOOKS", NOTIFY_BOOKSTACK_BOOKS=None
         )
         self.assert_config_error(
-            "BOOKSTACK_ALLOWED_BOOKS", BOOKSTACK_ALLOWED_BOOKS="  ,  "
+            "NOTIFY_BOOKSTACK_BOOKS", NOTIFY_BOOKSTACK_BOOKS="  ,  "
         )
 
     def test_invalid_allowlist_entry_is_rejected_without_echoing_it(self) -> None:
         self.assert_config_error(
-            "BOOKSTACK_ALLOWED_BOOKS",
+            "NOTIFY_BOOKSTACK_BOOKS",
             "not a book!",
-            BOOKSTACK_ALLOWED_BOOKS="runbooks,not a book!",
+            NOTIFY_BOOKSTACK_BOOKS="runbooks,not a book!",
         )
         self.assert_config_error(
-            "BOOKSTACK_ALLOWED_BOOKS", BOOKSTACK_ALLOWED_BOOKS="0"
+            "NOTIFY_BOOKSTACK_BOOKS", NOTIFY_BOOKSTACK_BOOKS="0"
         )
 
     def test_bad_timeout_names_the_variable_without_echoing_it(self) -> None:
@@ -846,8 +1040,8 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_valid_configuration_is_normalised(self) -> None:
         settings = self.load(
-            BOOKSTACK_URL="https://bookstack.example.com/",
-            BOOKSTACK_ALLOWED_BOOKS=" Runbooks , 19 ",
+            NOTIFY_BOOKSTACK_URL="https://bookstack.example.com/",
+            NOTIFY_BOOKSTACK_BOOKS=" Runbooks , 19 ",
             BOOKSTACK_TIMEOUT_SECONDS="3",
         )
         self.assertEqual(settings.base_url, "https://bookstack.example.com")
@@ -866,29 +1060,39 @@ class ConfigurationTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with mock.patch.dict(
-            os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": "1"}, clear=True
+            os.environ,
+            {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
+                "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
+                "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+            },
+            clear=True,
         ), \
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
             rc = bookstack.selftest()
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("BOOKSTACK_URL", stderr.getvalue())
+        self.assertIn("BOOKSTACK_TOKEN_ID", stderr.getvalue())
 
-    def test_selftest_in_a_disabled_run_makes_no_claim_about_the_wiki(self) -> None:
+    def test_selftest_ignores_the_cms_content_flag(self) -> None:
+        # The CMS gate lives in oracle_query.py; it does not block this server.
         stdout = io.StringIO()
         with mock.patch.dict(
             os.environ,
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
+                "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
+                "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
+                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
                 "NOTIFY_CONTENT_DISABLED": "1",
             },
             clear=True,
         ), contextlib.redirect_stdout(stdout):
             rc = bookstack.selftest()
         self.assertEqual(rc, 0)
-        self.assertIn("content access is disabled", stdout.getvalue())
-        self.assertNotIn("bookstack", stdout.getvalue().lower())
+        self.assertIn("bookstack configured", stdout.getvalue())
 
     def test_selftest_in_a_refused_run_makes_no_claim_about_the_wiki(self) -> None:
         stdout = io.StringIO()
@@ -918,9 +1122,9 @@ class StartupTests(unittest.TestCase):
         result = self.run_server(
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
-                "BOOKSTACK_URL": "https://bookstack.example.com",
+                "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
                 "BOOKSTACK_TOKEN_SECRET": sentinel,
-                "BOOKSTACK_ALLOWED_BOOKS": "runbooks",
+                "NOTIFY_BOOKSTACK_BOOKS": "runbooks",
             },
             "",
         )
@@ -935,15 +1139,15 @@ class StartupTests(unittest.TestCase):
         result = self.run_server(
             {
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
-                "BOOKSTACK_URL": "https://bookstack.example.com",
+                "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.com",
                 "BOOKSTACK_TOKEN_ID": TOKEN_ID,
                 "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
-                "BOOKSTACK_ALLOWED_BOOKS": f"{sentinel}!",
+                "NOTIFY_BOOKSTACK_BOOKS": f"{sentinel}!",
             },
             "",
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("BOOKSTACK_ALLOWED_BOOKS", result.stderr)
+        self.assertIn("NOTIFY_BOOKSTACK_BOOKS", result.stderr)
         self.assertNotIn(sentinel, result.stderr)
         self.assertNotIn(TOKEN_SECRET, result.stderr)
 
@@ -962,16 +1166,31 @@ class StartupTests(unittest.TestCase):
                 "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 # Port 9 (discard) on loopback: reachable enough to refuse fast
                 # if the server ever tried to connect at startup.
-                "BOOKSTACK_URL": "http://127.0.0.1:9",
+                "NOTIFY_BOOKSTACK_URL": "https://127.0.0.1:9",
                 "BOOKSTACK_TOKEN_ID": TOKEN_ID,
                 "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
-                "BOOKSTACK_ALLOWED_BOOKS": "19",
+                "NOTIFY_BOOKSTACK_BOOKS": "19",
             },
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         message = json.loads(result.stdout.strip())
         self.assertEqual(message["result"]["serverInfo"]["name"], "notify-bookstack")
+
+    def test_startup_rejects_a_non_https_url(self) -> None:
+        result = self.run_server(
+            {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
+                "NOTIFY_BOOKSTACK_URL": "http://127.0.0.1:9",
+                "BOOKSTACK_TOKEN_ID": TOKEN_ID,
+                "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
+                "NOTIFY_BOOKSTACK_BOOKS": "19",
+            },
+            "",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("NOTIFY_BOOKSTACK_URL", result.stderr)
+        self.assertNotIn("127.0.0.1", result.stderr)
 
 
 class SilentServer:
@@ -993,14 +1212,23 @@ class TimeoutTests(unittest.TestCase):
         bookstack._RESOLVED_BOOKS.clear()
         self.server = SilentServer()
         self.addCleanup(self.server.close)
+        opener = mock.patch.object(
+            bookstack,
+            "_OPENER",
+            RewriteOpener(
+                {"bookstack.example.test": f"http://127.0.0.1:{self.server.port}"}
+            ),
+        )
+        opener.start()
+        self.addCleanup(opener.stop)
 
     def test_a_slow_wiki_fails_within_the_configured_timeout(self) -> None:
         env = {
             "NOTIFY_RUNBOOKS_ALLOWED": "1",
-            "BOOKSTACK_URL": f"http://127.0.0.1:{self.server.port}",
+            "NOTIFY_BOOKSTACK_URL": "https://bookstack.example.test",
             "BOOKSTACK_TOKEN_ID": TOKEN_ID,
             "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
-            "BOOKSTACK_ALLOWED_BOOKS": "19",
+            "NOTIFY_BOOKSTACK_BOOKS": "19",
             "BOOKSTACK_TIMEOUT_SECONDS": "0.25",
         }
         started = time.monotonic()
@@ -1121,13 +1349,12 @@ class RepositoryRegistrationTests(unittest.TestCase):
         self.assertFalse(server["codemode"])
         self.assertEqual(server["timeout"], oracle["timeout"])
         for variable in (
-            "BOOKSTACK_URL",
+            "NOTIFY_BOOKSTACK_URL",
             "BOOKSTACK_TOKEN_ID",
             "BOOKSTACK_TOKEN_SECRET",
-            "BOOKSTACK_ALLOWED_BOOKS",
+            "NOTIFY_BOOKSTACK_BOOKS",
             "BOOKSTACK_TIMEOUT_SECONDS",
             "NOTIFY_RUNBOOKS_ALLOWED",
-            "NOTIFY_CONTENT_DISABLED",
         ):
             self.assertEqual(
                 server["environment"][variable], "{env:" + variable + "}"

@@ -142,6 +142,9 @@ target_host_scope=
 target_host_scope_json='[]'
 target_content_disabled=0
 target_runbooks_allowed=0
+target_bookstack_url=
+target_bookstack_books=
+target_runbooks_enabled=0
 if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
     command -v jq >/dev/null 2>&1 || {
         printf 'run-prompt: jq is required to resolve target host_scope\n' >&2
@@ -232,6 +235,63 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
         exit 1
     }
+    # bookstack is optional per target. When present it must be an object with
+    # an https URL and a non-empty comma-separated book list. Report bad
+    # entries by target name only, never their ids or values.
+    bad_bookstack_targets=$(printf '%s' "$targets_json" | jq -r '
+        def valid_entry:
+            ascii_downcase as $e
+            | if ($e | test("^[0-9]+$")) then ($e | tonumber) > 0
+              else ($e | test("^[a-z0-9][a-z0-9._-]{0,99}$")) end;
+        def valid_books:
+            type == "string"
+            and (split(",")
+                 | map(gsub("^\\s+|\\s+$"; ""))
+                 | map(select(length > 0)) as $entries
+                 | ($entries | length) > 0
+                   and ($entries | length) <= 16
+                   and all($entries[]; valid_entry));
+        def valid_url:
+            type == "string"
+            and length > 8
+            and test("^https://[^/?#@]+(/[^?#]*)?$");
+        def valid_bookstack:
+            type == "object"
+            and (.url | valid_url)
+            and (.books | valid_books);
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("bookstack"))
+          | select((.value.bookstack | valid_bookstack) | not)
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not validate NOTIFY_TARGETS bookstack\n' >&2
+        exit 1
+    }
+    if [ -n "$bad_bookstack_targets" ]; then
+        printf 'run-prompt: invalid bookstack for target(s) %s: expected an object with an https url and a comma-separated books list\n' "$bad_bookstack_targets" >&2
+        exit 1
+    fi
+    target_bookstack_url=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name].bookstack | type) == "object"
+        then .[$name].bookstack.url // empty else empty end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+    target_bookstack_books=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name].bookstack | type) == "object"
+        then .[$name].bookstack.books // empty else empty end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+    if [ "$target_runbooks_allowed" -eq 1 ] \
+        && [ -n "$target_bookstack_url" ] \
+        && [ -n "$target_bookstack_books" ]; then
+        target_runbooks_enabled=1
+    fi
 fi
 
 # The old host report always listed a configured set of hosts, even when one
@@ -309,10 +369,17 @@ The delivery scope for this run is ${target_host_scope}. Nothing about any other
 The known hosts for this run are ${known_hosts_rendered}. Include one line for each, in this order, even if it has no samples. Do not add a known host outside the permitted hosts."
     fi
     if [ "$target_content_disabled" -eq 1 ]; then
-        prompt="${prompt}
+        if [ "$target_runbooks_enabled" -eq 1 ]; then
+            prompt="${prompt}
+
+Report host data and runbook procedures only: do not include any other material."
+        else
+            prompt="${prompt}
 
 Report host data only: do not include any other material."
-    elif [ "$target_runbooks_allowed" -eq 1 ]; then
+        fi
+    fi
+    if [ "$target_runbooks_enabled" -eq 1 ]; then
         prompt="${prompt}
 
 Runbooks are available for this run: when the instruction asks how to carry out an operational task, or what a runbook flag or alert means, you may use the runbook tools."
@@ -329,14 +396,22 @@ if [ "$target_content_disabled" -eq 1 ]; then
     export NOTIFY_CONTENT_DISABLED
 fi
 
-# Runbooks are default-deny: export the explicit allow only for a target whose
-# allow_runbooks is true, and clear any inherited value otherwise. bookstack.py
-# refuses both tools unless it sees exactly "1".
-if [ "$target_runbooks_allowed" -eq 1 ]; then
+# Runbooks are default-deny and per target: export the explicit grant and that
+# target's own BookStack URL and books only when both the grant and the
+# instance settings are present, and clear any inherited values otherwise.
+# bookstack.py refuses both tools unless it sees the grant and a complete
+# instance, and it requires an https URL.
+if [ "$target_runbooks_enabled" -eq 1 ]; then
     NOTIFY_RUNBOOKS_ALLOWED=1
     export NOTIFY_RUNBOOKS_ALLOWED
+    NOTIFY_BOOKSTACK_URL=$target_bookstack_url
+    export NOTIFY_BOOKSTACK_URL
+    NOTIFY_BOOKSTACK_BOOKS=$target_bookstack_books
+    export NOTIFY_BOOKSTACK_BOOKS
 else
     unset NOTIFY_RUNBOOKS_ALLOWED
+    unset NOTIFY_BOOKSTACK_URL
+    unset NOTIFY_BOOKSTACK_BOOKS
 fi
 
 # Export the effective host scope so ssh_probe.py refuses a host outside it

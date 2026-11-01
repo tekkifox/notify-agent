@@ -86,6 +86,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -131,6 +132,7 @@ SOURCE_NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")
 ACCEPTED_MESSAGE_TYPES = frozenset({0, 19})
 
 TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+BOOK_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{1,32}$")
 MENTION_RE = re.compile(r"<@[!&]?[0-9]+>|<#[0-9]+>")
 EVERYONE_RE = re.compile(r"(?<![\w])@(everyone|here)\b", re.IGNORECASE)
@@ -190,6 +192,8 @@ class InboundTarget:
     host_scope: str
     allow_content: bool
     allow_runbooks: bool
+    bookstack_url: str
+    bookstack_books: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,6 +338,60 @@ def _format_host_scope(scope: object) -> str:
     return ", ".join(formatted)
 
 
+def _format_bookstack(entry: Mapping[str, Any], name: str) -> tuple[str, str]:
+    """Validate a target's optional BookStack instance settings.
+
+    The URL must be https and the books value a non-empty comma-separated list
+    of ids or slugs. Errors name the target only, never the value.
+    """
+
+    raw = entry.get("bookstack")
+    if raw is None:
+        return "", ""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"target {name!r} bookstack must be an object")
+
+    url = raw.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ConfigError(f"target {name!r} bookstack.url must be an https URL")
+    url = url.strip()
+    parts = urllib.parse.urlsplit(url)
+    if (
+        parts.scheme != "https"
+        or not parts.netloc
+        or parts.query
+        or parts.fragment
+        or parts.username
+        or parts.password
+    ):
+        raise ConfigError(f"target {name!r} bookstack.url must be an https URL")
+
+    books = raw.get("books")
+    if not isinstance(books, str) or not books.strip():
+        raise ConfigError(
+            f"target {name!r} bookstack.books must be a comma-separated list"
+        )
+    entries = [part.strip() for part in books.split(",") if part.strip()]
+    if not entries or len(entries) > 16:
+        raise ConfigError(
+            f"target {name!r} bookstack.books must name between 1 and 16 books"
+        )
+    normalised: list[str] = []
+    for part in entries:
+        lowered = part.lower()
+        if lowered.isdigit():
+            if int(lowered, 10) <= 0:
+                raise ConfigError(
+                    f"target {name!r} bookstack.books contains an invalid entry"
+                )
+        elif not BOOK_SLUG_RE.match(lowered):
+            raise ConfigError(
+                f"target {name!r} bookstack.books contains an invalid entry"
+            )
+        normalised.append(lowered)
+    return url, ",".join(normalised)
+
+
 def _load_target_by_name(
     env: Mapping[str, str],
     name: str,
@@ -431,6 +489,8 @@ def _load_target_by_name(
             )
         allow_runbooks = entry["allow_runbooks"]
 
+    bookstack_url, bookstack_books = _format_bookstack(entry, name)
+
     return InboundTarget(
         name=name,
         channel_id=target_channel.strip(),
@@ -438,6 +498,8 @@ def _load_target_by_name(
         host_scope=host_scope,
         allow_content=allow_content,
         allow_runbooks=allow_runbooks,
+        bookstack_url=bookstack_url,
+        bookstack_books=bookstack_books,
     )
 
 
@@ -1323,26 +1385,39 @@ def build_instruction(
                 "there is no data for it, say that plainly instead of using "
                 "another host's numbers."
             )
+        runbooks_enabled = bool(
+            target.allow_runbooks
+            and target.bookstack_url
+            and target.bookstack_books
+        )
         if not target.allow_content:
-            lines.append(
-                "\nReport host data only: do not include any other material.\n"
-                "If the operator asks what you can do, answer with what this "
+            restriction = "Report host data"
+            if runbooks_enabled:
+                restriction += " and runbook procedures"
+            restriction += " only: do not include any other material."
+            capabilities = (
+                "\nIf the operator asks what you can do, answer with what this "
                 "run allows: host health (CPU, memory, load, disk, sample "
                 "freshness) and SSH reachability for "
-                f"{target.host_scope or 'the hosts in scope'}."
+                f"{target.host_scope or 'the hosts in scope'}"
             )
+            if runbooks_enabled:
+                capabilities += ", and runbook procedures for operational tasks."
+            else:
+                capabilities += "."
+            lines.append(f"\n{restriction}\n{capabilities}")
         else:
             capabilities = (
                 "\nIf the operator asks what you can do, answer with what this "
                 "run allows: host health (CPU, memory, load, disk, sample "
                 "freshness), SSH reachability for "
                 f"{target.host_scope or 'the hosts in scope'}, and published "
-                "content (pages and projects)."
+                "content (pages and projects)"
             )
-            if target.allow_runbooks:
-                capabilities = capabilities[:-1] + (
-                    ", and runbook procedures for operational tasks."
-                )
+            if runbooks_enabled:
+                capabilities += ", and runbook procedures for operational tasks."
+            else:
+                capabilities += "."
             lines.append(capabilities)
     else:
         lines.append(
@@ -1452,12 +1527,21 @@ def _run_agent_once(
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
-    # Runbooks are default-deny and independent of allow_content: export the
-    # explicit allow only for a target that has the flag, and clear any
-    # inherited value otherwise.
+    # Runbooks are default-deny and per target: export the explicit grant and
+    # that target's own BookStack URL and books only when both are present,
+    # and clear any inherited values otherwise.
     environment.pop("NOTIFY_RUNBOOKS_ALLOWED", None)
-    if chosen.target is not None and chosen.target.allow_runbooks:
+    environment.pop("NOTIFY_BOOKSTACK_URL", None)
+    environment.pop("NOTIFY_BOOKSTACK_BOOKS", None)
+    if (
+        chosen.target is not None
+        and chosen.target.allow_runbooks
+        and chosen.target.bookstack_url
+        and chosen.target.bookstack_books
+    ):
         environment["NOTIFY_RUNBOOKS_ALLOWED"] = "1"
+        environment["NOTIFY_BOOKSTACK_URL"] = chosen.target.bookstack_url
+        environment["NOTIFY_BOOKSTACK_BOOKS"] = chosen.target.bookstack_books
     if chosen.reply_mode == "bot":
         # notify.sh treats DISCORD_WEBHOOK_URL and NOTIFY_DEFAULT_TARGET as
         # stronger than COMPOSIO_ARGS.  Remove both so this run can only reach

@@ -233,11 +233,22 @@ class OpenCodeConfigTests(unittest.TestCase):
         self.assertIn("NOTIFY_RUNBOOKS_ALLOWED=1", RUN_PROMPT)
         self.assertIn("export NOTIFY_RUNBOOKS_ALLOWED", RUN_PROMPT)
         self.assertIn("unset NOTIFY_RUNBOOKS_ALLOWED", RUN_PROMPT)
+        self.assertIn("NOTIFY_BOOKSTACK_URL=$target_bookstack_url", RUN_PROMPT)
+        self.assertIn("export NOTIFY_BOOKSTACK_URL", RUN_PROMPT)
+        self.assertIn("NOTIFY_BOOKSTACK_BOOKS=$target_bookstack_books", RUN_PROMPT)
+        self.assertIn("export NOTIFY_BOOKSTACK_BOOKS", RUN_PROMPT)
         bookstack = CONFIG["mcp"]["servers"]["bookstack"]
-        self.assertEqual(
-            bookstack["environment"]["NOTIFY_RUNBOOKS_ALLOWED"],
-            "{env:NOTIFY_RUNBOOKS_ALLOWED}",
-        )
+        for variable in (
+            "NOTIFY_RUNBOOKS_ALLOWED",
+            "NOTIFY_BOOKSTACK_URL",
+            "NOTIFY_BOOKSTACK_BOOKS",
+        ):
+            self.assertEqual(
+                bookstack["environment"][variable],
+                "{env:" + variable + "}",
+            )
+        self.assertNotIn("BOOKSTACK_URL", bookstack["environment"])
+        self.assertNotIn("BOOKSTACK_ALLOWED_BOOKS", bookstack["environment"])
 
 
 class PreflightScriptTests(unittest.TestCase):

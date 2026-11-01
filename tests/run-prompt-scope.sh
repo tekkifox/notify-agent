@@ -35,6 +35,12 @@ fi
 if [ -n "${CAPTURE_RUNBOOKS:-}" ]; then
     printf '%s' "${NOTIFY_RUNBOOKS_ALLOWED-}" > "$CAPTURE_RUNBOOKS"
 fi
+if [ -n "${CAPTURE_BOOKSTACK_URL:-}" ]; then
+    printf '%s' "${NOTIFY_BOOKSTACK_URL-}" > "$CAPTURE_BOOKSTACK_URL"
+fi
+if [ -n "${CAPTURE_BOOKSTACK_BOOKS:-}" ]; then
+    printf '%s' "${NOTIFY_BOOKSTACK_BOOKS-}" > "$CAPTURE_BOOKSTACK_BOOKS"
+fi
 if [ -n "${CAPTURE_SCOPE:-}" ]; then
     printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
 fi
@@ -143,7 +149,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 PY
 
-targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true}}'
+targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false,"allow_runbooks":true,"bookstack":{"url":"https://vortex.example.test","books":"networking,operations-getting-started,organization,bookstack,v-rising,scripts"}},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true,"bookstack":{"url":"https://operator.example.test","books":"runbooks"}}}'
 
 failures=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -153,7 +159,8 @@ no() { printf 'FAIL - %s\n' "$1" >&2; failures=$((failures + 1)); }
 capture() {
     out=$1
     shift
-    rm -f "$out" "$out.env" "$out.scope" "$out.runbooks"
+    rm -f "$out" "$out.env" "$out.scope" "$out.runbooks" \
+        "$out.bookstack-url" "$out.bookstack-books"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
@@ -162,6 +169,8 @@ capture() {
         CAPTURE_ENV="$out.env" \
         CAPTURE_SCOPE="$out.scope" \
         CAPTURE_RUNBOOKS="$out.runbooks" \
+        CAPTURE_BOOKSTACK_URL="$out.bookstack-url" \
+        CAPTURE_BOOKSTACK_BOOKS="$out.bookstack-books" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -197,8 +206,10 @@ else
         no "scoped target: instruction did not state the scope"
     elif ! contains "$prompt" "Nothing about any other host may appear in the message"; then
         no "scoped target: instruction did not state the host boundary"
-    elif ! contains "$prompt" "Report host data only"; then
-        no "scoped target: instruction did not state the host-data boundary"
+    elif ! contains "$prompt" "Report host data and runbook procedures only"; then
+        no "scoped target: instruction did not state the host-data and runbook boundary"
+    elif ! contains "$prompt" "Runbooks are available for this run"; then
+        no "scoped target: instruction did not mention its granted runbooks"
     elif contains "$prompt" "disabled" \
         || contains "$prompt" "content search" \
         || contains "$prompt" "site, CV, projects or pages"; then
@@ -209,8 +220,16 @@ else
         no "scoped target: NOTIFY_CONTENT_DISABLED was not exported"
     elif [ "$(cat "$tmp/scoped.scope")" != '["host3.example.com"]' ]; then
         no "scoped target: NOTIFY_HOST_SCOPE was not exported as JSON"
+    elif [ "$(cat "$tmp/scoped.runbooks")" != "1" ]; then
+        no "scoped target: NOTIFY_RUNBOOKS_ALLOWED was not exported"
+    elif [ "$(cat "$tmp/scoped.bookstack-url")" != "https://vortex.example.test" ]; then
+        no "scoped target: NOTIFY_BOOKSTACK_URL was not the Vortex instance"
+    elif [ "$(cat "$tmp/scoped.bookstack-books")" != "networking,operations-getting-started,organization,bookstack,v-rising,scripts" ]; then
+        no "scoped target: NOTIFY_BOOKSTACK_BOOKS was not the Vortex book list"
+    elif contains "$(cat "$tmp/scoped.bookstack-url")" "operator.example.test"; then
+        no "scoped target: admin-chat could reach the operator instance"
     else
-        pass "scoped target carries the delivery scope and content block"
+        pass "scoped target carries its scope and its own Vortex runbooks"
     fi
 fi
 
@@ -347,10 +366,16 @@ elif ! contains "$(cat "$tmp/runbooks")" "Runbooks are available for this run"; 
     no "allow_runbooks target: instruction did not mention runbooks"
 elif [ "$(cat "$tmp/runbooks.runbooks")" != "1" ]; then
     no "allow_runbooks target: NOTIFY_RUNBOOKS_ALLOWED was not exported"
+elif [ "$(cat "$tmp/runbooks.bookstack-url")" != "https://operator.example.test" ]; then
+    no "allow_runbooks target: NOTIFY_BOOKSTACK_URL was not the operator instance"
+elif [ "$(cat "$tmp/runbooks.bookstack-books")" != "runbooks" ]; then
+    no "allow_runbooks target: NOTIFY_BOOKSTACK_BOOKS was not the operator book"
+elif contains "$(cat "$tmp/runbooks.bookstack-url")" "vortex.example.test"; then
+    no "allow_runbooks target: automations could reach the Vortex instance"
 elif [ -s "$tmp/runbooks.env" ]; then
     no "allow_runbooks target: NOTIFY_CONTENT_DISABLED was exported"
 else
-    pass "allow_runbooks true mentions runbooks and exports the grant"
+    pass "allow_runbooks true mentions runbooks and exports its own instance"
 fi
 
 # 7c. admin-chat with allow_content flipped true but no allow_runbooks is still
@@ -370,6 +395,8 @@ elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
     no "content-enabled admin-chat: instruction mentioned runbooks"
 elif [ -s "$tmp/content-on.runbooks" ]; then
     no "content-enabled admin-chat: NOTIFY_RUNBOOKS_ALLOWED was not cleared"
+elif [ -s "$tmp/content-on.bookstack-url" ] || [ -s "$tmp/content-on.bookstack-books" ]; then
+    no "content-enabled admin-chat: NOTIFY_BOOKSTACK_* was not cleared"
 elif contains "$prompt" "Report host data only"; then
     no "content-enabled admin-chat: instruction added the host-data block"
 else
@@ -395,6 +422,72 @@ elif contains "$err" "222222222222222222" || contains "$err" '"true"' \
     no "malformed allow_runbooks: message leaked an id or value"
 else
     pass "malformed allow_runbooks fails by name and sends nothing"
+fi
+
+# 7e. A malformed bookstack fails before opencode runs, names the target, and
+#     never echoes the URL or books.
+set +e
+capture "$tmp/bad-bookstack" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","allow_runbooks":true,"bookstack":{"url":"http://bad.example.test","books":"runbooks"}}}' \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/bad-bookstack.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "malformed bookstack: expected a non-zero exit"
+elif [ -e "$tmp/bad-bookstack" ]; then
+    no "malformed bookstack: opencode ran despite the failure"
+elif ! contains "$err" "admin-chat"; then
+    no "malformed bookstack: message did not name the target"
+elif contains "$err" "bad.example.test" || contains "$err" "222222222222222222"; then
+    no "malformed bookstack: message leaked a value or id"
+else
+    pass "malformed bookstack fails by name and sends nothing"
+fi
+
+# 7f. A grant without a bookstack instance exports nothing and mentions
+#     nothing, even if the parent environment carries a grant and an instance.
+set +e
+capture "$tmp/grant-no-instance" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","allow_runbooks":true}}' \
+    NOTIFY_RUNBOOKS_ALLOWED=1 \
+    NOTIFY_BOOKSTACK_URL=https://operator.example.test \
+    NOTIFY_BOOKSTACK_BOOKS=runbooks \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+prompt=$(cat "$tmp/grant-no-instance" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "grant without instance: run-prompt.sh failed: $(cat "$tmp/grant-no-instance.stderr")"
+elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
+    no "grant without instance: instruction mentioned runbooks"
+elif [ -s "$tmp/grant-no-instance.runbooks" ] \
+    || [ -s "$tmp/grant-no-instance.bookstack-url" ] \
+    || [ -s "$tmp/grant-no-instance.bookstack-books" ]; then
+    no "grant without instance: runbook variables were not cleared"
+else
+    pass "a grant without an instance exports nothing"
+fi
+
+# 7g. A bookstack instance without the grant exports nothing and mentions
+#     nothing, even if the parent environment carries a grant and an instance.
+set +e
+capture "$tmp/instance-no-grant" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","bookstack":{"url":"https://vortex.example.test","books":"networking"}}}' \
+    NOTIFY_RUNBOOKS_ALLOWED=1 \
+    NOTIFY_BOOKSTACK_URL=https://operator.example.test \
+    NOTIFY_BOOKSTACK_BOOKS=runbooks \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+prompt=$(cat "$tmp/instance-no-grant" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "instance without grant: run-prompt.sh failed: $(cat "$tmp/instance-no-grant.stderr")"
+elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
+    no "instance without grant: instruction mentioned runbooks"
+elif [ -s "$tmp/instance-no-grant.runbooks" ] \
+    || [ -s "$tmp/instance-no-grant.bookstack-url" ] \
+    || [ -s "$tmp/instance-no-grant.bookstack-books" ]; then
+    no "instance without grant: runbook variables were not cleared"
+else
+    pass "an instance without the grant exports nothing"
 fi
 
 # 8. A server that does not advertise both tools fails the run before

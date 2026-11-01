@@ -32,12 +32,13 @@ Delivery selection:
 Named targets (Composio only):
   -t, --target NAME        send to a name defined in NOTIFY_TARGETS
   NOTIFY_TARGETS           JSON object: name -> {channel_id, connected_account_id,
-                           host_scope, allow_content, allow_runbooks}
-                           host_scope, allow_content and allow_runbooks are
-                           optional target guards. A host_scope is enforced here:
-                           if the message names a host outside the permitted list
-                           (or its subdomains), notify.sh exits non-zero and
-                           sends nothing.
+                           host_scope, allow_content, allow_runbooks, bookstack}
+                           host_scope, allow_content, allow_runbooks and
+                           bookstack are optional target guards. A host_scope is
+                           enforced here: if the message names a host outside the
+                           permitted list (or its subdomains), notify.sh exits
+                           non-zero and sends nothing. bookstack is an object
+                           with an https url and a comma-separated books list.
   NOTIFY_DEFAULT_TARGET    target name used when -t is omitted
   The name must exist in NOTIFY_TARGETS; unknown names fail without sending.
   A target cannot be combined with DISCORD_WEBHOOK_URL.
@@ -205,6 +206,42 @@ if [ -n "${NOTIFY_TARGETS:-}" ]; then
         || fail "could not validate NOTIFY_TARGETS allow_runbooks"
     if [ -n "$bad_runbooks_targets" ]; then
         fail "invalid allow_runbooks for target(s) ${bad_runbooks_targets}: expected a boolean"
+    fi
+
+    # bookstack is optional per target. When present it must be an object with
+    # an https URL and a non-empty comma-separated book list. Report bad
+    # entries by name only, never their ids or values.
+    bad_bookstack_targets=$(printf '%s' "$targets_json" | jq -r '
+        def valid_entry:
+            ascii_downcase as $e
+            | if ($e | test("^[0-9]+$")) then ($e | tonumber) > 0
+              else ($e | test("^[a-z0-9][a-z0-9._-]{0,99}$")) end;
+        def valid_books:
+            type == "string"
+            and (split(",")
+                 | map(gsub("^\\s+|\\s+$"; ""))
+                 | map(select(length > 0)) as $entries
+                 | ($entries | length) > 0
+                   and ($entries | length) <= 16
+                   and all($entries[]; valid_entry));
+        def valid_url:
+            type == "string"
+            and length > 8
+            and test("^https://[^/?#@]+(/[^?#]*)?$");
+        def valid_bookstack:
+            type == "object"
+            and (.url | valid_url)
+            and (.books | valid_books);
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("bookstack"))
+          | select((.value.bookstack | valid_bookstack) | not)
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) \
+        || fail "could not validate NOTIFY_TARGETS bookstack"
+    if [ -n "$bad_bookstack_targets" ]; then
+        fail "invalid bookstack for target(s) ${bad_bookstack_targets}: expected an object with an https url and a comma-separated books list"
     fi
 fi
 

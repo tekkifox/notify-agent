@@ -330,6 +330,33 @@ else
     pass "malformed allow_runbooks message names the target only"
 fi
 
+# 3e. A malformed bookstack fails before any request and names the target,
+#     never its id or values.
+bad_case=0
+for bad in \
+    '{"general":{"channel_id":"111111111111111111","bookstack":"nope"}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"http://bad.example.test","books":"runbooks"}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":""}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"not a book!"}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"0"}}}'; do
+    bad_case=$((bad_case + 1))
+    expect_fail "malformed bookstack case $bad_case fails without a request" \
+        send NOTIFY_TARGETS="$bad"
+done
+set +e
+out=$(send NOTIFY_TARGETS='{"general":{"channel_id":"111111111111111111","bookstack":{"url":"http://bad.example.test","books":"runbooks"}}}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "malformed bookstack: expected failure"
+elif ! contains "$out" "general"; then
+    no "malformed bookstack: message did not name the target"
+elif contains "$out" "111111111111111111" || contains "$out" "bad.example.test"; then
+    no "malformed bookstack: message leaked an id or value"
+else
+    pass "malformed bookstack message names the target only"
+fi
+
 # 4. -t is rejected when a webhook is configured.
 expect_fail "-t rejected when DISCORD_WEBHOOK_URL is set" \
     send_target general NOTIFY_TARGETS="$targets" \

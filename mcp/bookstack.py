@@ -8,10 +8,10 @@ because OpenCode names an MCP tool ``<server>_<tool>``:
   name, book and a short excerpt.
 * ``read(page)`` fetches one page's text by page id or slug.
 
-The wiki also holds the deployment inventory (real hostnames, channel ids,
+A wiki also holds the deployment inventory (real hostnames, channel ids,
 connection ids, the Auth0 wiring). That content must stay unreachable, so this
-is not a general wiki client. It can see exactly the books named in
-``BOOKSTACK_ALLOWED_BOOKS`` and nothing else:
+is not a general wiki client. Each run is pointed at one target's own instance
+and can see exactly the books named for that run and nothing else:
 
 * A page is read only after its ``book_id`` is checked against the allowlist.
 * Search is issued per allowed book (``/api/search/book/{id}``), so a result
@@ -27,22 +27,26 @@ line, an error or tool output. HTTP redirects are refused rather than followed,
 so a redirect cannot carry the header to another host. Response bodies are
 never echoed in errors: only the HTTP status and a fixed short reason.
 
-Access is default-deny and explicit. ``run-prompt.sh`` and
-``scripts/discord_inbound.py`` export ``NOTIFY_RUNBOOKS_ALLOWED=1`` only for a
-target whose ``allow_runbooks`` is true; every other run, including one with
-content enabled, refuses both tools immediately, before configuration is read
-or a socket is opened. A target with ``allow_content: false`` is a
-host-data-only run and exports ``NOTIFY_CONTENT_DISABLED=1``; that is kept as an
-additional refusal, so a run that is both content-disabled and runbook-allowed
-still gets nothing.
+Access is default-deny, explicit and per target. ``run-prompt.sh`` and
+``scripts/discord_inbound.py`` export ``NOTIFY_RUNBOOKS_ALLOWED=1``,
+``NOTIFY_BOOKSTACK_URL`` and ``NOTIFY_BOOKSTACK_BOOKS`` only for a target that
+has ``allow_runbooks: true`` and its own ``bookstack`` settings; every other
+run refuses both tools immediately, before configuration is read or a socket is
+opened. The URL must be ``https``. A run is therefore bound to one instance:
+an ``admin-chat`` run can reach the Vortex wiki and never the operator's, and
+an ``automations`` run can reach the operator's wiki and never the Vortex one.
 
-Configuration (all but the timeout are required, and a missing or malformed
-value fails loudly at startup naming the variable):
+The CMS content gate (``NOTIFY_CONTENT_DISABLED``) is separate and is enforced
+by ``mcp/oracle_query.py``. It does not gate runbooks: a target may be
+host-data-only for the operator's CMS and still read its own runbook wiki.
 
-    BOOKSTACK_URL, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET,
-    BOOKSTACK_ALLOWED_BOOKS, BOOKSTACK_TIMEOUT_SECONDS
+Configuration (the tokens and timeout are global; the URL and books are per
+run, and a missing or malformed value fails loudly naming the variable):
 
-``BOOKSTACK_ALLOWED_BOOKS`` is a comma-separated list of book ids or slugs. A
+    NOTIFY_BOOKSTACK_URL, NOTIFY_BOOKSTACK_BOOKS,
+    BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET, BOOKSTACK_TIMEOUT_SECONDS
+
+``NOTIFY_BOOKSTACK_BOOKS`` is a comma-separated list of book ids or slugs. A
 slug is resolved to its id through ``/api/books`` on first use; the resolved ids
 are cached for the life of the process.
 
@@ -80,18 +84,15 @@ PROTOCOL_VERSIONS = (
 )
 
 # Set by run-prompt.sh and discord_inbound.py only for a target whose
-# ``allow_runbooks`` is true. The MCP server inherits the environment of the
-# opencode process that spawns it, so a missing, empty or non-"1" value is a
+# ``allow_runbooks`` is true and that carries its own ``bookstack`` settings.
+# The MCP server inherits the environment of the opencode process that spawns
+# it, so a missing, empty or non-"1" grant, or a missing URL/books value, is a
 # hard, default-deny block even when the model ignores the instruction.
 RUNBOOKS_ALLOWED_ENV = "NOTIFY_RUNBOOKS_ALLOWED"
+BOOKSTACK_URL_ENV = "NOTIFY_BOOKSTACK_URL"
+BOOKSTACK_BOOKS_ENV = "NOTIFY_BOOKSTACK_BOOKS"
 # The wording names neither the wiki nor the book that is withheld.
 RUNBOOKS_DENIED_ERROR = "access is not enabled for this run"
-
-# Set by run-prompt.sh for a target with ``allow_content`` false. This is an
-# additional refusal on top of the runbooks gate. The wording names neither the
-# wiki nor the book that is withheld.
-CONTENT_DISABLED_ENV = "NOTIFY_CONTENT_DISABLED"
-CONTENT_DISABLED_ERROR = "content access is disabled for this run"
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_TIMEOUT_SECONDS = 60.0
@@ -247,29 +248,23 @@ def _env(name: str) -> str:
 
 
 def runbooks_allowed() -> bool:
-    """Return true only when this run was explicitly granted runbooks."""
+    """Return true only when this run was explicitly granted its own wiki."""
 
     return os.environ.get(RUNBOOKS_ALLOWED_ENV, "").strip() == "1"
-
-
-def content_disabled() -> bool:
-    """Return true when the current notification target forbids content."""
-
-    return bool(os.environ.get(CONTENT_DISABLED_ENV))
 
 
 def access_error() -> str | None:
     """Return the refusal for this run, or None when both tools may run.
 
-    The runbooks gate is checked first: a run that was never granted the
-    capability gets nothing, whatever its other flags say. The content gate is
-    kept as an additional refusal.
+    The grant and the per-run instance settings are checked first: a run that
+    was never granted the capability, or that carries no URL or books for this
+    run, gets nothing. This happens before configuration is read.
     """
 
     if not runbooks_allowed():
         return RUNBOOKS_DENIED_ERROR
-    if content_disabled():
-        return CONTENT_DISABLED_ERROR
+    if not _env(BOOKSTACK_URL_ENV) or not _env(BOOKSTACK_BOOKS_ENV):
+        return RUNBOOKS_DENIED_ERROR
     return None
 
 
@@ -298,7 +293,7 @@ def _valid_token(name: str, value: str) -> None:
 
 
 def parse_allowed_books(value: str) -> tuple[frozenset[int], frozenset[str]]:
-    """Split BOOKSTACK_ALLOWED_BOOKS into ids and slugs.
+    """Split NOTIFY_BOOKSTACK_BOOKS into ids and slugs.
 
     An invalid entry is a configuration error, not a silently ignored one: a
     truncated list must fail closed rather than widening what can be read.
@@ -314,18 +309,18 @@ def parse_allowed_books(value: str) -> tuple[frozenset[int], frozenset[str]]:
             number = int(entry, 10)
             if number <= 0:
                 raise ConfigError(
-                    "BOOKSTACK_ALLOWED_BOOKS contains an invalid entry"
+                    "NOTIFY_BOOKSTACK_BOOKS contains an invalid entry"
                 )
             ids.add(number)
         elif SLUG_PATTERN.fullmatch(entry):
             slugs.add(entry)
         else:
-            raise ConfigError("BOOKSTACK_ALLOWED_BOOKS contains an invalid entry")
+            raise ConfigError("NOTIFY_BOOKSTACK_BOOKS contains an invalid entry")
     if not ids and not slugs:
-        raise ConfigError("BOOKSTACK_ALLOWED_BOOKS has no usable entries")
+        raise ConfigError("NOTIFY_BOOKSTACK_BOOKS has no usable entries")
     if len(ids) + len(slugs) > MAX_ALLOWED_BOOKS:
         raise ConfigError(
-            f"BOOKSTACK_ALLOWED_BOOKS may name at most {MAX_ALLOWED_BOOKS} books"
+            f"NOTIFY_BOOKSTACK_BOOKS may name at most {MAX_ALLOWED_BOOKS} books"
         )
     return frozenset(ids), frozenset(slugs)
 
@@ -333,13 +328,13 @@ def parse_allowed_books(value: str) -> tuple[frozenset[int], frozenset[str]]:
 def load_settings() -> Settings:
     """Read and validate settings without ever echoing their values."""
 
-    raw_url = _env("BOOKSTACK_URL")
+    raw_url = _env(BOOKSTACK_URL_ENV)
     if not raw_url:
-        raise ConfigError("BOOKSTACK_URL is not set")
+        raise ConfigError(f"{BOOKSTACK_URL_ENV} is not set")
     base_url = raw_url.rstrip("/")
     parts = urllib.parse.urlsplit(base_url)
     if (
-        parts.scheme not in ("http", "https")
+        parts.scheme != "https"
         or not parts.netloc
         or parts.query
         or parts.fragment
@@ -347,7 +342,8 @@ def load_settings() -> Settings:
         or parts.password
     ):
         raise ConfigError(
-            "BOOKSTACK_URL must be an http(s) URL without credentials or query"
+            f"{BOOKSTACK_URL_ENV} must be an https URL without credentials or "
+            "query"
         )
 
     token_id = _env("BOOKSTACK_TOKEN_ID")
@@ -365,9 +361,9 @@ def load_settings() -> Settings:
     _valid_token("BOOKSTACK_TOKEN_ID", token_id)
     _valid_token("BOOKSTACK_TOKEN_SECRET", token_secret)
 
-    raw_books = _env("BOOKSTACK_ALLOWED_BOOKS")
+    raw_books = _env(BOOKSTACK_BOOKS_ENV)
     if not raw_books:
-        raise ConfigError("BOOKSTACK_ALLOWED_BOOKS is not set")
+        raise ConfigError(f"{BOOKSTACK_BOOKS_ENV} is not set")
     allowed_ids, allowed_slugs = parse_allowed_books(raw_books)
 
     return Settings(
@@ -577,9 +573,16 @@ def _resolve_book_ids(settings: Settings) -> frozenset[int]:
         # Filter by slug, then match it exactly in Python: if a server ignores
         # the filter, the exact match still decides, so a wrong book is never
         # adopted as the allowed one.
-        payload = _request_json(
-            settings, "/api/books", {"filter[slug]": slug, "count": 500}
-        )
+        try:
+            payload = _request_json(
+                settings, "/api/books", {"filter[slug]": slug, "count": 500}
+            )
+        except RequestError as exc:
+            # A configured slug that is not on this instance is skipped. One
+            # stale entry must not fail every search in the run.
+            if exc.status == 404:
+                continue
+            raise
         entries = payload.get("data")
         if not isinstance(entries, list):
             raise RequestError(None, "unexpected response shape")
@@ -591,11 +594,11 @@ def _resolve_book_ids(settings: Settings) -> frozenset[int]:
             book_id = _as_int(entry.get("id"))
             if book_id is not None and book_id > 0:
                 resolved.add(book_id)
-    if not resolved and not settings.allowed_book_ids:
-        raise ConfigError(
-            "BOOKSTACK_ALLOWED_BOOKS names a book this token cannot read"
-        )
 
+    # A configured slug that does not exist on this instance is skipped, not a
+    # configuration failure: one stale entry must not poison the whole run. A
+    # search with no resolvable books returns an empty result and a read is
+    # refused.
     _RESOLVED_BOOKS[key] = frozenset(resolved)
     return settings.allowed_book_ids | frozenset(resolved)
 
@@ -670,9 +673,9 @@ def search(
 
     book_ids = _resolve_book_ids(settings)
     if not book_ids:
-        raise ConfigError(
-            "BOOKSTACK_ALLOWED_BOOKS names a book this token cannot read"
-        )
+        # Every configured book is missing on this instance. Do not fail the
+        # whole run: this search has nothing permitted to read.
+        return {"results": [], "count": 0, "limit": limit}
 
     results: list[dict[str, Any]] = []
     seen: set[int] = set()
@@ -768,9 +771,8 @@ def read_page(settings: Settings, page: Any) -> dict[str, Any]:
 
     book_ids = _resolve_book_ids(settings)
     if not book_ids:
-        raise ConfigError(
-            "BOOKSTACK_ALLOWED_BOOKS names a book this token cannot read"
-        )
+        # No configured book exists on this instance; no page is available.
+        raise PageUnavailable()
 
     kind, reference = prepare_page(page)
     if kind == "slug":
@@ -883,7 +885,7 @@ def selftest() -> int:
 
     # Names only, never values: no URL and no token.
     print(
-        "selftest: bookstack configured: BOOKSTACK_URL set; token set; "
+        "selftest: bookstack configured: NOTIFY_BOOKSTACK_URL set; token set; "
         f"allowed books {len(settings.allowed_book_ids) + len(settings.allowed_book_slugs)}; "
         f"timeout {settings.timeout:g}s"
     )
