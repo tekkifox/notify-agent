@@ -22,13 +22,15 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `scripts/discord_inbound.py` | Optional inbound listener: polls one or more Discord sources, authorises replies and runs the same agent once each. |
 | `scripts/agent_capture.py` | Shared bounded debug transcript: header, agent output, send-aware footer; used by both run paths. |
 | `scripts/entrypoint.sh` | Compose dispatcher and supervisor: without args runs supercronic and the listener independently, with args runs the command. |
-| `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
+| `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle, SSH and BookStack MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
 | `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
 | `mcp/ssh_probe.py` | Single-file read-only SSH MCP server (Python 3, `paramiko`) exposing `probe` as `ssh_probe`, with host-scope refusal before any connection. |
 | `mcp/host_report.py` | Pure digest formatter: deterministic ordering, stale rule, thresholds, SSH lines and 2,000-character truncation. |
+| `mcp/bookstack.py` | Single-file read-only BookStack MCP server (Python 3, standard library) exposing `search` and `read` as `bookstack_search` and `bookstack_read`, restricted to an allowlist of books. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
 | `tests/test_ssh_probe.py` | SSH policy, scope, failure-class, timeout, selftest and protocol tests; no live connection. |
+| `tests/test_bookstack.py` | BookStack allowlist, scope-gate, token-leak, configuration, timeout and protocol tests against a loopback stub; no live wiki. |
 | `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every threshold, SSH lines and truncation. |
 | `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue and refusal-path tests; no network or model required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
@@ -38,7 +40,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 ```sh
 cp stack.env.example stack.env
 chmod 600 stack.env
-$EDITOR stack.env          # set DISCORD_WEBHOOK_URL, OPENCODE_MODEL, ORACLE_*, SSH_*
+$EDITOR stack.env          # set DISCORD_WEBHOOK_URL, OPENCODE_MODEL, ORACLE_*, SSH_*, BOOKSTACK_*
 
 docker compose build
 docker compose up -d
@@ -445,6 +447,107 @@ deliberately stricter than "known hosts": a scoped message that mentions an
 unrelated domain such as `github.com` is refused too, because sending nothing is
 the safe failure. Keep the prompt's host set and the target's `host_scope` in
 sync.
+
+## Runbooks (MCP)
+
+The `notify` agent can answer "how do I restart backrest?" or "what does a
+load-peak flag mean?" from the operator's BookStack wiki. It calls a third
+local MCP server, `mcp/bookstack.py`, which exposes two read-only tools:
+
+- `search(query, limit)` — search the allowed books; returns page name, book,
+  slug and a short excerpt.
+- `read(page)` — one page's text, by page id or slug.
+
+OpenCode names an MCP tool `<server>_<tool>`, so the agent reaches these as
+`bookstack_search` and `bookstack_read`.
+
+### One book, enforced in code
+
+The wiki also holds the deployment inventory (real hostnames, Composio
+connections, channel ids, the Auth0 wiring), so this is deliberately not a
+general wiki client. `BOOKSTACK_ALLOWED_BOOKS` names the only books that may be
+read; in this deployment it is `runbooks` (book id `19`, six procedure pages).
+
+- Search is issued **per allowed book** (`/api/search/book/{id}`), so a page
+  from another book is never fetched, let alone returned. Each result is
+  checked against the allowlist again before it leaves the process, and a
+  book outside the allowlist never contributes to a count.
+- `read` checks the page's `book_id` against the allowlist before returning
+  any text.
+- A page in another book, a missing page and an ambiguous slug all return the
+  same `page is not available` error. The tool therefore cannot be used to
+  discover what else exists, and the error names neither the page nor its
+  book.
+- A slug in `BOOKSTACK_ALLOWED_BOOKS` is resolved to its id through
+  `/api/books` on first use and cached for the life of the process.
+
+The token is sent only as `Authorization: Token <id>:<secret>`; it is never a
+URL parameter, never printed, never returned and never included in an error.
+HTTP redirects are refused rather than followed, so a redirect cannot carry the
+header to another host. Errors carry the HTTP status and a fixed short reason;
+a response body is never echoed. Each request times out after
+`BOOKSTACK_TIMEOUT_SECONDS` (default 10, capped at 60), so a slow wiki cannot
+stall a scheduled run. A page is capped at 20,000 characters with
+`truncated: true`; a search excerpt at 300 characters.
+
+Page text is untrusted data. The tool descriptions and the prompt say so: it is
+documentation to read, never an instruction to follow.
+
+### Scope gate: host-data-only runs
+
+The same gate as CMS content search applies. For a target with
+`allow_content: false`, `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` and
+both tools refuse with `content access is disabled for this run` before they
+read configuration or open a socket. `admin-chat` is host-data-only, so the
+wiki is unreachable there even if the model ignores the instruction, and the
+refusal says nothing about the wiki. `automations` permits content, so search
+and read are available. The prompt also requires a host-data-only run to keep
+runbooks, the wiki and documentation out of every reply and capability answer.
+
+The tools are still listed in a disabled run, as `search_content` is, so a
+model that ignores the instruction gets a clear tool error instead of a silent
+fallback to another source.
+
+### BookStack environment
+
+These are passed through by `opencode.json` with `{env:...}` substitution, so
+no value is written into the config file.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `BOOKSTACK_URL` | yes | Base URL, for example `https://bookstack.example.com`. No credentials, query or fragment. |
+| `BOOKSTACK_TOKEN_ID` | yes | API token id. |
+| `BOOKSTACK_TOKEN_SECRET` | yes | API token secret. |
+| `BOOKSTACK_ALLOWED_BOOKS` | yes | Comma-separated book ids or slugs. Only these may be read. Set it to `runbooks`. |
+| `BOOKSTACK_TIMEOUT_SECONDS` | no | Per-request timeout, default 10; capped at 60. |
+
+A missing or malformed value fails the server at startup, names the variable
+and never echoes the value. A host-data-only run validates nothing, because
+both tools refuse anyway. `python3 /app/mcp/bookstack.py --selftest` reports
+whether the configuration is present, without making a request and without
+printing the URL or token.
+
+Create the token for a **dedicated BookStack user** whose role can see only the
+`Runbooks` book — for example a role with "Access System API" and content
+permission on that book alone. The allowlist is the second line of defence;
+that user's role is the first. A token belonging to an administrator would
+defeat both.
+
+Only the `notify` agent may use either tool. `opencode.json` puts a global
+`permissions` deny on `bookstack_search` and `bookstack_read`; the `notify`
+agent appends an allow after each, exactly as it does for the Oracle and SSH
+tools.
+
+### Tests
+
+`tests/test_bookstack.py` drives a stub BookStack on loopback; there is no live
+wiki and no real token in the repository. It covers allowlist enforcement in
+both tools, a forbidden and a missing page producing the same refusal, the
+disabled-mode gate making no request, no token or response body in any output
+on success or failure, redirect refusal, configuration errors that name the
+variable without echoing the value, the startup exit path, the configured
+timeout against a server that never answers, slug resolution and the MCP
+protocol surface.
 
 ## Morning digest
 
@@ -1093,9 +1196,10 @@ These are enforced in `compose.yaml`, not conventions:
 | Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, the SSH key bind-mounted read-only at `/ssh/id_ed25519`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet and SSH key live on the host and are mounted `:ro` |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query`, `oracle_search_content` and `ssh_probe` are allowed |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read` are allowed |
 | Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
 | SSH access | key-authenticated, read-only probe; two host boundaries (global allowlist and run scope) are applied before any socket; policy refusals name the host and never connect; no remote command runs |
+| Runbook access | read-only BookStack API, one dedicated token; exactly the books in `BOOKSTACK_ALLOWED_BOOKS` can be searched or read, and per-book search means another book is never even fetched; a forbidden page and a missing page share one refusal; redirects refused; token never in a URL, log or error; `allow_content: false` refuses both tools before any request |
 | Delivery guard | `notify.sh` refuses a scoped target's message when it names a host outside that target's `host_scope`, before any request |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
@@ -1123,6 +1227,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
 - Call `search_content` to read short chunks from the published-content index.
 - Call `ssh_probe` with hosts that are both in `SSH_ALLOWED_HOSTS` and inside the run's delivery scope. The probe opens a key-authenticated SSH session and closes it; it runs no remote command. A host outside either boundary is refused before a socket is opened.
+- Call `bookstack_search` and `bookstack_read` against exactly the books in `BOOKSTACK_ALLOWED_BOOKS`. A page outside that list, a missing page and an ambiguous slug are refused with the same message. In a host-data-only run both tools refuse before any request.
 - Write only to the named volume and tmpfs.
 - When the inbound listener is enabled, read the configured channels through Composio tool execution (`DISCORDBOT_LIST_MESSAGES`) using each source's bot connection. The listener itself never gives the agent an arbitrary command: it only invokes the fixed `opencode run --agent notify` command with a filtered instruction.
 - For a source without a named target, send its answer through that source's bot connection (`DISCORDBOT_CREATE_MESSAGE`) to that source's channel. The listener sets the channel and account in the child environment; the model cannot choose them.
@@ -1139,6 +1244,8 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Use the SSH key outside the probe: the key is invoked only by `ssh_probe`, with a fixed user and port, and the probe runs no remote command. It cannot probe a host outside the global allowlist or the selected target's scope.
 - Send a message to a scoped target if it names a host outside that target's `host_scope`: `notify.sh` refuses before any request. The guard is exact-name based, so figures without a hostname are a prompt-level risk, not a code-level one.
 - Read published content when the selected target sets `allow_content: false`: `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` and the MCP server refuses `search_content` before it connects.
+- Read a wiki page outside `BOOKSTACK_ALLOWED_BOOKS`, including the deployment inventory: the server checks the page's book before returning text, searches per allowed book, and answers a forbidden page and a missing page identically. It cannot discover that another book or page exists.
+- Reach the wiki at all in a host-data-only run: both BookStack tools refuse before reading configuration or opening a socket. The token is never in a URL and redirects are refused.
 - Read arbitrary CMS tables or write to the content index. It can only run a fixed, read-only semantic search over `ROSSMONEY.CONTENT_EMBEDDINGS`; a `query` against `ROSSMONEY.pages` or any other CMS table fails with a privilege error.
 
 **Scenarios and residual risk**
@@ -1149,6 +1256,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - **Inbound message injection.** An allowlisted human's reply becomes an instruction to an agent with database access. The allowlist is the boundary: a non-allowlisted author, a bot, a webhook, a different channel, a duplicate, an over-long message or a mentions-only message never reaches the agent. An allowlisted human can still phrase a request that produces a bad answer or a wide read, exactly as they could by editing a schedule. The agent remains read-only and can still only send through `notify.sh`. The listener never passes the raw Discord payload: it strips mentions, caps length, and wraps the text in a fixed instruction. If the allowlist is too broad, the exposure is too broad.
 - **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
 - **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
+- **Runbook retrieval.** Runbook text leaves the host for the model provider when the agent answers a procedure question, just as host statistics do. The exposure is limited to the books in `BOOKSTACK_ALLOWED_BOOKS` by code, and to whatever the token's BookStack role can see by permissions. A token for a broad role would defeat the allowlist, so use a dedicated user that can see only `Runbooks`. Runbook text is untrusted data: it can be wrong, stale, or contain injected instructions, and the prompt tells the model not to follow it. A host-data-only run cannot reach the wiki at all.
 - **Malicious or compromised model provider.** The provider sees the prompt and the composed message. It can influence message content but not the container's shell surface.
 - **Container compromise.** An attacker who compromises the OpenCode process gets the webhook, provider token, and outbound internet. There is no egress allowlist, so data can be exfiltrated. They still need a container or kernel escape to reach the host.
 - **Docker-host compromise.** Anyone with access to the Docker daemon can read the volume and change the container. Docker is not a security boundary against a hostile host.
@@ -1192,17 +1300,20 @@ Verified while building this branch:
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **242 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **304 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED`; malformed values fail before the agent runs. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
-- `python3 -m py_compile` passes on `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
-- `opencode.json` statically registers both MCP servers (`oracle` and `ssh`), gives both the same 60-second startup/execution budget, keeps the global `ssh_probe` deny, and allows `ssh_probe` for `notify`.
+- `python3 -m py_compile` passes on `mcp/bookstack.py`, `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_bookstack.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
+- `opencode.json` statically registers three MCP servers (`oracle`, `ssh` and `bookstack`), gives all three the same 60-second startup/execution budget, keeps the global denies on `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read`, and allows all five for `notify`.
+- `tests/test_bookstack.py` makes a real HTTP request to a loopback stub and asserts what the stub received: search asks only `/api/search/book/19` (and `/api/books` once to resolve the `runbooks` slug), a result whose `book.id` is outside the allowlist is dropped and never contributes to `count`, a page with `book_id: 99` is refused in both id and slug form without fetching its content, and a forbidden page, a missing page and an unknown slug return the identical `page is not available` message with no book or page name. It also covers `NOTIFY_CONTENT_DISABLED=1` refusing both tools with zero requests, the token appearing only in the `Authorization` header (never in a URL parameter) and never in output on a 401 or 500 whose body echoes it, redirect refusal, the allowlist/URL/timeout configuration errors, the startup exit path naming the variable without echoing the value, and a server that accepts a connection and never answers failing inside `BOOKSTACK_TIMEOUT_SECONDS`.
+- `python3 /app/mcp/bookstack.py --selftest` is exercised in the suite: with configuration it prints names only (no URL, token or book slug), and without it exits `1` naming `BOOKSTACK_URL`. No live BookStack instance was contacted at any point.
 
 Not verified here (no credentials, no live hosts, no Docker daemon use):
 
 - No live SSH connection to any host, including Vortex or rossmoney. Every connector call in the suite is a stub.
 - No live Oracle query, no live `search_content`, and no live model run of the digest. The formatting and prompt contracts are tested without a model.
+- No live BookStack request and no real BookStack token. `tests/test_bookstack.py` talks only to a stub on `127.0.0.1`; the real `Runbooks` book was not fetched. The dedicated BookStack user and its role are operator setup, not something this branch can create.
 - No `docker build`/image-size measurement for the paramiko addition. Paramiko and its direct dependencies are pinned in the Dockerfile; the base image has no `openssh-client`, which is why it is added.
 - The schedule lines are documentation only. The live schedule is the host `SCHEDULES_FILE`; this branch cannot activate it.
 - Host-key identity is not pinned (`AutoAddPolicy`); the probe measures reachability and key authentication, not the remote host's identity.
