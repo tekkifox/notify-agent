@@ -193,6 +193,12 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(discord_inbound.ConfigError):
             self.load(OPENCODE_MODEL=None)
 
+    def test_fallback_model_whitespace_refuses(self) -> None:
+        with self.assertRaises(discord_inbound.ConfigError) as raised:
+            self.load(OPENCODE_MODEL_FALLBACK="bad value")
+        self.assertIn("OPENCODE_MODEL_FALLBACK", str(raised.exception))
+        self.assertNotIn("bad value", str(raised.exception))
+
     def test_state_file_must_be_absolute(self) -> None:
         with self.assertRaises(discord_inbound.ConfigError):
             self.load(NOTIFY_INBOUND_STATE_FILE="state.json")
@@ -614,6 +620,95 @@ class ReplyRoutingTests(unittest.TestCase):
             environment["COMPOSIO_ARGS"], '{"channel_id":"999999999999999999"}'
         )
 
+
+class FallbackRunAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.env = base_env(self.temp.name)
+        self.env["OPENCODE_MODEL_FALLBACK"] = "fallback/model"
+
+    def _config(self) -> discord_inbound.Config:
+        return discord_inbound.load_config(self.env)
+
+    def test_quota_failure_retries_with_fallback_and_summary_shows_it(self) -> None:
+        calls: list[int] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            calls.append(1)
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            if len(calls) == 1:
+                return FakeProcess(1, io.BytesIO(b"Free usage limit reached\n"))
+            pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(0)
+
+        config = self._config()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ) as popen:
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = discord_inbound.run_agent(config, "instruction")
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "fallback/model")
+        self.assertIn("model=fallback/model", stderr.getvalue())
+
+    def test_already_sent_is_not_retried(self) -> None:
+        calls: list[int] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            calls.append(1)
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(1, io.BytesIO(b"Free usage limit reached\n"))
+
+        config = self._config()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ):
+                result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_ordinary_failure_is_not_retried(self) -> None:
+        calls: list[int] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            calls.append(1)
+            return FakeProcess(1, io.BytesIO(b"something broke\n"))
+
+        config = self._config()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ):
+                result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_fallback_failing_too_stops_after_two(self) -> None:
+        calls: list[int] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            calls.append(1)
+            return FakeProcess(1, io.BytesIO(b"Free usage limit reached\n"))
+
+        config = self._config()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ):
+                result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 2)
 
 class MainTests(unittest.TestCase):
     def test_empty_allowlist_makes_the_listener_exit_nonzero(self) -> None:

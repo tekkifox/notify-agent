@@ -373,6 +373,7 @@ run_attempt() {
             before_size=$(wc -c < "$debug_log" | tr -d ' ')
         fi
         # run through agent_capture, capturing its exit code
+        set +e
         python3 "$script_dir/agent_capture.py" \
             --log "$debug_log" \
             --origin "schedule" \
@@ -380,13 +381,14 @@ run_attempt() {
             --instruction "$prompt" \
             --marker "${attempt_marker:-}" \
             -- "$@"
-        rc=$?
+        ATTEMPT_RC=$?
+        set -e
         # extract this attempt's slice of the transcript for inspection
         if [ -f "$debug_log" ]; then
             tail -c +$((before_size + 1)) "$debug_log" > "$attempt_output" 2>/dev/null || true
         fi
         if [ -n "$attempt_marker" ]; then
-            if [ -e "$attempt_marker" ]; then
+            if grep -q 'sent=yes' "$attempt_output" 2>/dev/null; then
                 : > "$attempt_output.sent"
             else
                 rm -f "$attempt_output.sent"
@@ -395,18 +397,20 @@ run_attempt() {
         else
             rm -f "$attempt_output.sent"
         fi
-        return $rc
+        return 0
     fi
 
     # No transcript: run directly, capturing output for inspection.
+    set +e
     "$@" >"$attempt_output" 2>&1
-    rc=$?
+    ATTEMPT_RC=$?
+    set -e
     if [ -n "${NOTIFY_SEND_MARKER:-}" ] && [ -e "${NOTIFY_SEND_MARKER}" ]; then
         : > "$attempt_output.sent"
     else
         rm -f "$attempt_output.sent"
     fi
-    return $rc
+    return 0
 }
 
 model_unavailable() {
@@ -430,8 +434,10 @@ attempt_output=$(mktemp "${TMPDIR:-/tmp}/notify-attempt.XXXXXX" 2>/dev/null) || 
 : > "$attempt_output"
 
 # First attempt on the preferred model.
+set +e
 run_attempt "$OPENCODE_MODEL" "$attempt_output"
-rc=$?
+set -e
+rc=$ATTEMPT_RC
 
 sent=0
 if send_marker_present "$attempt_output"; then
@@ -448,8 +454,10 @@ if [ "$rc" -ne 0 ] && [ "$sent" -eq 0 ] && [ -n "$fallback" ] && model_unavailab
     fi
     printf 'run-prompt: preferred model unavailable; retrying with %s\n' "$fallback" >&2
 
+    set +e
     run_attempt "$fallback" "$attempt_output"
-    rc=$?
+    set -e
+    rc=$ATTEMPT_RC
 fi
 
 rm -f "$attempt_output" "$attempt_output.sent"
