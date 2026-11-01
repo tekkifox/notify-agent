@@ -32,6 +32,9 @@ fi
 if [ -n "${CAPTURE_ENV:-}" ]; then
     printf '%s' "${NOTIFY_CONTENT_DISABLED-}" > "$CAPTURE_ENV"
 fi
+if [ -n "${CAPTURE_RUNBOOKS:-}" ]; then
+    printf '%s' "${NOTIFY_RUNBOOKS_ALLOWED-}" > "$CAPTURE_RUNBOOKS"
+fi
 if [ -n "${CAPTURE_SCOPE:-}" ]; then
     printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
 fi
@@ -140,7 +143,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 PY
 
-targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false}}'
+targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true}}'
 
 failures=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -150,7 +153,7 @@ no() { printf 'FAIL - %s\n' "$1" >&2; failures=$((failures + 1)); }
 capture() {
     out=$1
     shift
-    rm -f "$out" "$out.env" "$out.scope"
+    rm -f "$out" "$out.env" "$out.scope" "$out.runbooks"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
@@ -158,6 +161,7 @@ capture() {
         CAPTURE="$out" \
         CAPTURE_ENV="$out.env" \
         CAPTURE_SCOPE="$out.scope" \
+        CAPTURE_RUNBOOKS="$out.runbooks" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -328,6 +332,69 @@ elif contains "$err" "222222222222222222"; then
     no "malformed allow_content: message leaked an id"
 else
     pass "malformed allow_content fails by name and sends nothing"
+fi
+
+# 7b. allow_runbooks true is the only thing that mentions runbooks in the
+#     instruction and exports NOTIFY_RUNBOOKS_ALLOWED=1.
+set +e
+capture "$tmp/runbooks" NOTIFY_TARGETS="$targets" \
+    "$run_prompt" -t automations "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    no "allow_runbooks target: run-prompt.sh failed: $(cat "$tmp/runbooks.stderr")"
+elif ! contains "$(cat "$tmp/runbooks")" "Runbooks are available for this run"; then
+    no "allow_runbooks target: instruction did not mention runbooks"
+elif [ "$(cat "$tmp/runbooks.runbooks")" != "1" ]; then
+    no "allow_runbooks target: NOTIFY_RUNBOOKS_ALLOWED was not exported"
+elif [ -s "$tmp/runbooks.env" ]; then
+    no "allow_runbooks target: NOTIFY_CONTENT_DISABLED was exported"
+else
+    pass "allow_runbooks true mentions runbooks and exports the grant"
+fi
+
+# 7c. admin-chat with allow_content flipped true but no allow_runbooks is still
+#     refused: no mention and no exported grant, even if the parent environment
+#     already has one.
+set +e
+capture "$tmp/content-on" \
+    NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","host_scope":"host3.example.com","allow_content":true}}' \
+    NOTIFY_RUNBOOKS_ALLOWED=1 \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+prompt=$(cat "$tmp/content-on" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "content-enabled admin-chat: run-prompt.sh failed: $(cat "$tmp/content-on.stderr")"
+elif contains "$prompt" "Runbooks" || contains "$prompt" "runbook"; then
+    no "content-enabled admin-chat: instruction mentioned runbooks"
+elif [ -s "$tmp/content-on.runbooks" ]; then
+    no "content-enabled admin-chat: NOTIFY_RUNBOOKS_ALLOWED was not cleared"
+elif contains "$prompt" "Report host data only"; then
+    no "content-enabled admin-chat: instruction added the host-data block"
+else
+    pass "content-enabled admin-chat is still refused runbooks"
+fi
+
+# 7d. A malformed allow_runbooks fails before opencode runs, names the target,
+#     and never echoes its id or value.
+set +e
+capture "$tmp/bad-runbooks" NOTIFY_TARGETS='{"admin-chat":{"channel_id":"222222222222222222","allow_runbooks":"true"}}' \
+    "$run_prompt" -t admin-chat "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/bad-runbooks.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "malformed allow_runbooks: expected a non-zero exit"
+elif [ -e "$tmp/bad-runbooks" ]; then
+    no "malformed allow_runbooks: opencode ran despite the failure"
+elif ! contains "$err" "admin-chat"; then
+    no "malformed allow_runbooks: message did not name the target"
+elif contains "$err" "222222222222222222" || contains "$err" '"true"' \
+    || contains "$err" "allow_runbooks\":\"true"; then
+    no "malformed allow_runbooks: message leaked an id or value"
+else
+    pass "malformed allow_runbooks fails by name and sends nothing"
 fi
 
 # 8. A server that does not advertise both tools fails the run before

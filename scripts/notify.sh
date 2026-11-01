@@ -32,11 +32,12 @@ Delivery selection:
 Named targets (Composio only):
   -t, --target NAME        send to a name defined in NOTIFY_TARGETS
   NOTIFY_TARGETS           JSON object: name -> {channel_id, connected_account_id,
-                           host_scope, allow_content}
-                           host_scope and allow_content are optional target guards.
-                           A host_scope is enforced here: if the message names a
-                           host outside the permitted list (or its subdomains),
-                           notify.sh exits non-zero and sends nothing.
+                           host_scope, allow_content, allow_runbooks}
+                           host_scope, allow_content and allow_runbooks are
+                           optional target guards. A host_scope is enforced here:
+                           if the message names a host outside the permitted list
+                           (or its subdomains), notify.sh exits non-zero and
+                           sends nothing.
   NOTIFY_DEFAULT_TARGET    target name used when -t is omitted
   The name must exist in NOTIFY_TARGETS; unknown names fail without sending.
   A target cannot be combined with DISCORD_WEBHOOK_URL.
@@ -189,6 +190,21 @@ if [ -n "${NOTIFY_TARGETS:-}" ]; then
         || fail "could not validate NOTIFY_TARGETS allow_content"
     if [ -n "$bad_content_targets" ]; then
         fail "invalid allow_content for target(s) ${bad_content_targets}: expected a boolean"
+    fi
+
+    # allow_runbooks is optional and must be a JSON boolean when present.
+    # Report bad entries by name only, never their ids.
+    bad_runbooks_targets=$(printf '%s' "$targets_json" | jq -r '
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("allow_runbooks"))
+          | select((.value.allow_runbooks | type) != "boolean")
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) \
+        || fail "could not validate NOTIFY_TARGETS allow_runbooks"
+    if [ -n "$bad_runbooks_targets" ]; then
+        fail "invalid allow_runbooks for target(s) ${bad_runbooks_targets}: expected a boolean"
     fi
 fi
 

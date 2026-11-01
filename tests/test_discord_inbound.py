@@ -107,6 +107,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.target.name, "admin-chat")
         self.assertEqual(config.target.connected_account_id, ACCOUNT)
         self.assertFalse(config.target.allow_content)
+        self.assertFalse(config.target.allow_runbooks)
         self.assertIn("host3.example.com", config.target.host_scope)
 
     def test_empty_allowlist_refuses_to_start(self) -> None:
@@ -160,6 +161,26 @@ class ConfigTests(unittest.TestCase):
         targets["admin-chat"]["allow_content"] = "false"
         with self.assertRaises(discord_inbound.ConfigError):
             self.load(NOTIFY_TARGETS=json.dumps(targets))
+
+    def test_target_allow_runbooks_defaults_to_false(self) -> None:
+        self.assertFalse(self.load().target.allow_runbooks)
+
+    def test_target_allow_runbooks_must_be_boolean(self) -> None:
+        targets = json.loads(self.env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_runbooks"] = "true"
+        with self.assertRaises(discord_inbound.ConfigError) as raised:
+            self.load(NOTIFY_TARGETS=json.dumps(targets))
+        message = str(raised.exception)
+        self.assertIn("admin-chat", message)
+        self.assertIn("allow_runbooks", message)
+        self.assertNotIn("true", message)
+        self.assertNotIn(CHANNEL, message)
+
+    def test_target_allow_runbooks_true_is_read(self) -> None:
+        targets = json.loads(self.env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_runbooks"] = True
+        config = self.load(NOTIFY_TARGETS=json.dumps(targets))
+        self.assertTrue(config.target.allow_runbooks)
 
     def test_webhook_mode_rejects_named_target(self) -> None:
         with self.assertRaises(discord_inbound.ConfigError):
@@ -1241,6 +1262,42 @@ class RunAgentTests(unittest.TestCase):
                 discord_inbound.run_agent(config, "instruction")
         self.assertNotIn("NOTIFY_CONTENT_DISABLED", popen.call_args.kwargs["env"])
 
+    def test_runbooks_flag_is_not_exported_for_a_content_enabled_target(self) -> None:
+        # admin-chat with allow_content flipped true but no allow_runbooks: the
+        # misconfiguration most likely to happen. It must still be refused.
+        env = dict(self.env)
+        targets = json.loads(env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_content"] = True
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+        config = discord_inbound.load_config(env)
+        with mock.patch.dict(os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": "1"}):
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
+            ) as popen:
+                discord_inbound.run_agent(config, "instruction")
+        environment = popen.call_args.kwargs["env"]
+        self.assertNotIn("NOTIFY_RUNBOOKS_ALLOWED", environment)
+        instruction = discord_inbound.build_instruction(config, "instruction")
+        self.assertNotIn("runbook", instruction.lower())
+
+    def test_runbooks_flag_is_exported_only_for_an_allowed_target(self) -> None:
+        env = dict(self.env)
+        targets = json.loads(env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_content"] = True
+        targets["admin-chat"]["allow_runbooks"] = True
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+        config = discord_inbound.load_config(env)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_RUNBOOKS_ALLOWED", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
+            ) as popen:
+                discord_inbound.run_agent(config, "instruction")
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["NOTIFY_RUNBOOKS_ALLOWED"], "1")
+        instruction = discord_inbound.build_instruction(config, "instruction")
+        self.assertIn("runbook", instruction.lower())
+
     def _popen_side_effect(
         self, attempts: list[tuple[int, bool]]
     ) -> tuple[object, list[dict[str, object]]]:
@@ -1626,7 +1683,18 @@ class ContentBoundaryTests(unittest.TestCase):
             config, "what can you do?"
         )
         lowered = instruction.lower()
-        for word in ("cv", "site", "website", "portfolio", "project", "page", "content"):
+        for word in (
+            "cv",
+            "site",
+            "website",
+            "portfolio",
+            "project",
+            "page",
+            "content",
+            "runbook",
+            "wiki",
+            "documentation",
+        ):
             self.assertNotIn(word, lowered, f"forbidden word {word!r} present")
 
     def test_enabled_target_mentions_published_content(self) -> None:
@@ -1641,6 +1709,36 @@ class ContentBoundaryTests(unittest.TestCase):
             config, "what can you do?"
         )
         self.assertIn("published content", instruction.lower())
+
+    def test_content_enabled_target_without_the_flag_does_not_mention_runbooks(
+        self,
+    ) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        env = base_env(temp.name)
+        targets = json.loads(env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_content"] = True
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+        config = discord_inbound.load_config(env)
+        instruction = discord_inbound.build_instruction(
+            config, "what can you do?"
+        )
+        self.assertIn("published content", instruction.lower())
+        self.assertNotIn("runbook", instruction.lower())
+
+    def test_runbook_allowed_target_mentions_runbooks(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        env = base_env(temp.name)
+        targets = json.loads(env["NOTIFY_TARGETS"])
+        targets["admin-chat"]["allow_content"] = True
+        targets["admin-chat"]["allow_runbooks"] = True
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+        config = discord_inbound.load_config(env)
+        instruction = discord_inbound.build_instruction(
+            config, "what can you do?"
+        )
+        self.assertIn("runbook", instruction.lower())
 
 
 class SummaryOperatorMessageTests(unittest.TestCase):

@@ -291,6 +291,7 @@ def environment(stub: StubBookStack, **overrides: str) -> dict[str, str]:
         "BOOKSTACK_TOKEN_SECRET": stub.token_secret,
         "BOOKSTACK_ALLOWED_BOOKS": "runbooks",
         "BOOKSTACK_TIMEOUT_SECONDS": "2",
+        "NOTIFY_RUNBOOKS_ALLOWED": "1",
     }
     env.update(overrides)
     return env
@@ -304,6 +305,11 @@ class StubTestCase(unittest.TestCase):
 
     def call(self, name: str, arguments: dict) -> tuple[str, bool]:
         env = environment(self.stub)
+        return self.call_with(name, arguments, env)
+
+    def call_with(
+        self, name: str, arguments: dict, env: dict[str, str]
+    ) -> tuple[str, bool]:
         with mock.patch.dict(os.environ, env, clear=True):
             if name == "search":
                 return bookstack.call_search(arguments)
@@ -494,14 +500,101 @@ class AllowlistTests(StubTestCase):
         )
 
 
-class DisabledModeTests(StubTestCase):
-    def test_both_tools_refuse_when_the_run_is_host_data_only(self) -> None:
+class RunbooksGateTests(StubTestCase):
+    def test_both_tools_refuse_by_default(self) -> None:
         self.stub.install_runbooks()
-        env = environment(self.stub, NOTIFY_CONTENT_DISABLED="1")
+        env = environment(self.stub)
+        env.pop("NOTIFY_RUNBOOKS_ALLOWED")
 
-        with mock.patch.dict(os.environ, env, clear=True):
-            search_text, search_error = bookstack.call_search({"query": "restart"})
-            read_text, read_error = bookstack.call_read({"page": 5})
+        search_text, search_error = self.call_with("search", {"query": "restart"}, env)
+        read_text, read_error = self.call_with("read", {"page": 5}, env)
+
+        self.assertTrue(search_error)
+        self.assertTrue(read_error)
+        self.assertEqual(
+            json.loads(search_text)["error"], bookstack.RUNBOOKS_DENIED_ERROR
+        )
+        self.assertEqual(
+            json.loads(read_text)["error"], bookstack.RUNBOOKS_DENIED_ERROR
+        )
+        # Refused before configuration was read or a socket was opened.
+        self.assertEqual(self.stub.requests, [])
+
+    def test_a_content_enabled_run_without_the_flag_is_still_refused(self) -> None:
+        # This is the admin-chat misconfiguration: allow_content true, but no
+        # allow_runbooks. There is no NOTIFY_CONTENT_DISABLED here at all.
+        self.stub.install_runbooks()
+        env = environment(self.stub)
+        env.pop("NOTIFY_RUNBOOKS_ALLOWED")
+
+        text, is_error = self.call_with("search", {"query": "restart"}, env)
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertEqual(self.stub.requests, [])
+
+    def test_only_exactly_one_allows_the_tools(self) -> None:
+        self.stub.install_runbooks()
+
+        for value in ("", "0", "true", "yes", " 1x", "01"):
+            env = environment(self.stub, NOTIFY_RUNBOOKS_ALLOWED=value)
+            text, is_error = self.call_with("search", {"query": "restart"}, env)
+            self.assertTrue(is_error, value)
+            self.assertEqual(
+                json.loads(text)["error"],
+                bookstack.RUNBOOKS_DENIED_ERROR,
+                value,
+            )
+        self.assertEqual(self.stub.requests, [])
+
+    def test_a_refused_run_needs_no_bookstack_configuration(self) -> None:
+        text, is_error = self.call_with(
+            "search",
+            {"query": "restart"},
+            {"NOTIFY_RUNBOOKS_ALLOWED": ""},
+        )
+
+        self.assertTrue(is_error)
+        self.assertEqual(json.loads(text)["error"], bookstack.RUNBOOKS_DENIED_ERROR)
+        self.assertNotIn("BOOKSTACK_URL", text)
+
+    def test_the_refusal_says_nothing_about_the_wiki(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(self.stub)
+        env.pop("NOTIFY_RUNBOOKS_ALLOWED")
+
+        search_text, _ = self.call_with("search", {"query": "restart"}, env)
+        read_text, _ = self.call_with("read", {"page": "restart-backrest"}, env)
+
+        for output in (search_text, read_text):
+            for word in ("bookstack", "book", "wiki", "runbook", "page"):
+                self.assertNotIn(word, output.lower())
+
+    def test_a_refused_run_serves_the_protocol_without_configuration(self) -> None:
+        requests = (
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
+        )
+        responses = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": ""}, clear=True
+        ), mock.patch.object(bookstack.sys, "stdin", io.StringIO(requests)), \
+                contextlib.redirect_stdout(responses):
+            self.assertEqual(bookstack.main(), 0)
+        messages = [json.loads(line) for line in responses.getvalue().splitlines()]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("result", messages[0])
+
+    def test_the_content_gate_is_an_additional_refusal(self) -> None:
+        self.stub.install_runbooks()
+        env = environment(
+            self.stub,
+            NOTIFY_RUNBOOKS_ALLOWED="1",
+            NOTIFY_CONTENT_DISABLED="1",
+        )
+
+        search_text, search_error = self.call_with("search", {"query": "restart"}, env)
+        read_text, read_error = self.call_with("read", {"page": 5}, env)
 
         self.assertTrue(search_error)
         self.assertTrue(read_error)
@@ -511,29 +604,36 @@ class DisabledModeTests(StubTestCase):
         self.assertEqual(
             json.loads(read_text)["error"], bookstack.CONTENT_DISABLED_ERROR
         )
-        # Refused before configuration was read or a socket was opened.
         self.assertEqual(self.stub.requests, [])
 
-    def test_the_refusal_says_nothing_about_the_wiki(self) -> None:
+    def test_the_content_refusal_says_nothing_about_the_wiki(self) -> None:
         self.stub.install_runbooks()
-        env = environment(self.stub, NOTIFY_CONTENT_DISABLED="1")
+        env = environment(
+            self.stub,
+            NOTIFY_RUNBOOKS_ALLOWED="1",
+            NOTIFY_CONTENT_DISABLED="1",
+        )
 
-        with mock.patch.dict(os.environ, env, clear=True):
-            text, _ = bookstack.call_search({"query": "restart"})
-            read_text, _ = bookstack.call_read({"page": "restart-backrest"})
+        text, _ = self.call_with("search", {"query": "restart"}, env)
+        read_text, _ = self.call_with("read", {"page": "restart-backrest"}, env)
 
         for output in (text, read_text):
             for word in ("bookstack", "book", "wiki", "runbook", "page"):
                 self.assertNotIn(word, output.lower())
 
-    def test_a_disabled_run_does_not_need_bookstack_configuration(self) -> None:
+    def test_a_content_disabled_run_does_not_need_bookstack_configuration(self) -> None:
         requests = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
         )
         responses = io.StringIO()
         with mock.patch.dict(
-            os.environ, {"NOTIFY_CONTENT_DISABLED": "1"}, clear=True
+            os.environ,
+            {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
+                "NOTIFY_CONTENT_DISABLED": "1",
+            },
+            clear=True,
         ), mock.patch.object(bookstack.sys, "stdin", io.StringIO(requests)), \
                 contextlib.redirect_stdout(responses):
             self.assertEqual(bookstack.main(), 0)
@@ -765,7 +865,9 @@ class ConfigurationTests(unittest.TestCase):
     def test_selftest_without_configuration_fails_and_names_the_variable(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {}, clear=True), \
+        with mock.patch.dict(
+            os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": "1"}, clear=True
+        ), \
                 contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
             rc = bookstack.selftest()
@@ -776,12 +878,28 @@ class ConfigurationTests(unittest.TestCase):
     def test_selftest_in_a_disabled_run_makes_no_claim_about_the_wiki(self) -> None:
         stdout = io.StringIO()
         with mock.patch.dict(
-            os.environ, {"NOTIFY_CONTENT_DISABLED": "1"}, clear=True
+            os.environ,
+            {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
+                "NOTIFY_CONTENT_DISABLED": "1",
+            },
+            clear=True,
         ), contextlib.redirect_stdout(stdout):
             rc = bookstack.selftest()
         self.assertEqual(rc, 0)
         self.assertIn("content access is disabled", stdout.getvalue())
         self.assertNotIn("bookstack", stdout.getvalue().lower())
+
+    def test_selftest_in_a_refused_run_makes_no_claim_about_the_wiki(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"NOTIFY_RUNBOOKS_ALLOWED": "0"}, clear=True
+        ), contextlib.redirect_stdout(stdout):
+            rc = bookstack.selftest()
+        self.assertEqual(rc, 0)
+        self.assertIn("access is not enabled", stdout.getvalue())
+        self.assertNotIn("bookstack", stdout.getvalue().lower())
+        self.assertNotIn("runbook", stdout.getvalue().lower())
 
 
 class StartupTests(unittest.TestCase):
@@ -799,6 +917,7 @@ class StartupTests(unittest.TestCase):
         sentinel = "SENTINEL-TOKEN-VALUE"
         result = self.run_server(
             {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "BOOKSTACK_URL": "https://bookstack.example.com",
                 "BOOKSTACK_TOKEN_SECRET": sentinel,
                 "BOOKSTACK_ALLOWED_BOOKS": "runbooks",
@@ -815,6 +934,7 @@ class StartupTests(unittest.TestCase):
         sentinel = "SENTINEL-BOOK-NAME"
         result = self.run_server(
             {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 "BOOKSTACK_URL": "https://bookstack.example.com",
                 "BOOKSTACK_TOKEN_ID": TOKEN_ID,
                 "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
@@ -827,9 +947,19 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn(sentinel, result.stderr)
         self.assertNotIn(TOKEN_SECRET, result.stderr)
 
+    def test_startup_without_the_runbooks_grant_needs_no_configuration(self) -> None:
+        result = self.run_server(
+            {},
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        message = json.loads(result.stdout.strip())
+        self.assertEqual(message["result"]["serverInfo"]["name"], "notify-bookstack")
+
     def test_startup_does_not_contact_the_wiki(self) -> None:
         result = self.run_server(
             {
+                "NOTIFY_RUNBOOKS_ALLOWED": "1",
                 # Port 9 (discard) on loopback: reachable enough to refuse fast
                 # if the server ever tried to connect at startup.
                 "BOOKSTACK_URL": "http://127.0.0.1:9",
@@ -866,6 +996,7 @@ class TimeoutTests(unittest.TestCase):
 
     def test_a_slow_wiki_fails_within_the_configured_timeout(self) -> None:
         env = {
+            "NOTIFY_RUNBOOKS_ALLOWED": "1",
             "BOOKSTACK_URL": f"http://127.0.0.1:{self.server.port}",
             "BOOKSTACK_TOKEN_ID": TOKEN_ID,
             "BOOKSTACK_TOKEN_SECRET": TOKEN_SECRET,
@@ -995,6 +1126,7 @@ class RepositoryRegistrationTests(unittest.TestCase):
             "BOOKSTACK_TOKEN_SECRET",
             "BOOKSTACK_ALLOWED_BOOKS",
             "BOOKSTACK_TIMEOUT_SECONDS",
+            "NOTIFY_RUNBOOKS_ALLOWED",
             "NOTIFY_CONTENT_DISABLED",
         ):
             self.assertEqual(

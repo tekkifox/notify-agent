@@ -27,10 +27,14 @@ line, an error or tool output. HTTP redirects are refused rather than followed,
 so a redirect cannot carry the header to another host. Response bodies are
 never echoed in errors: only the HTTP status and a fixed short reason.
 
-A target with ``allow_content: false`` is a host-data-only run. ``run-prompt.sh``
-exports ``NOTIFY_CONTENT_DISABLED=1`` and both tools refuse immediately, before
-configuration is read or a socket is opened. This mirrors the existing
-``search_content`` gate.
+Access is default-deny and explicit. ``run-prompt.sh`` and
+``scripts/discord_inbound.py`` export ``NOTIFY_RUNBOOKS_ALLOWED=1`` only for a
+target whose ``allow_runbooks`` is true; every other run, including one with
+content enabled, refuses both tools immediately, before configuration is read
+or a socket is opened. A target with ``allow_content: false`` is a
+host-data-only run and exports ``NOTIFY_CONTENT_DISABLED=1``; that is kept as an
+additional refusal, so a run that is both content-disabled and runbook-allowed
+still gets nothing.
 
 Configuration (all but the timeout are required, and a missing or malformed
 value fails loudly at startup naming the variable):
@@ -75,11 +79,17 @@ PROTOCOL_VERSIONS = (
     "2025-11-25",
 )
 
-# Set by run-prompt.sh for a target with ``allow_content`` false. The MCP
-# server inherits the environment of the opencode process that spawns it, so
-# this is a hard block even when the model ignores the instruction. Any
-# non-empty value disables both tools. The wording names neither the wiki nor
-# the book that is withheld.
+# Set by run-prompt.sh and discord_inbound.py only for a target whose
+# ``allow_runbooks`` is true. The MCP server inherits the environment of the
+# opencode process that spawns it, so a missing, empty or non-"1" value is a
+# hard, default-deny block even when the model ignores the instruction.
+RUNBOOKS_ALLOWED_ENV = "NOTIFY_RUNBOOKS_ALLOWED"
+# The wording names neither the wiki nor the book that is withheld.
+RUNBOOKS_DENIED_ERROR = "access is not enabled for this run"
+
+# Set by run-prompt.sh for a target with ``allow_content`` false. This is an
+# additional refusal on top of the runbooks gate. The wording names neither the
+# wiki nor the book that is withheld.
 CONTENT_DISABLED_ENV = "NOTIFY_CONTENT_DISABLED"
 CONTENT_DISABLED_ERROR = "content access is disabled for this run"
 
@@ -236,10 +246,31 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def runbooks_allowed() -> bool:
+    """Return true only when this run was explicitly granted runbooks."""
+
+    return os.environ.get(RUNBOOKS_ALLOWED_ENV, "").strip() == "1"
+
+
 def content_disabled() -> bool:
     """Return true when the current notification target forbids content."""
 
     return bool(os.environ.get(CONTENT_DISABLED_ENV))
+
+
+def access_error() -> str | None:
+    """Return the refusal for this run, or None when both tools may run.
+
+    The runbooks gate is checked first: a run that was never granted the
+    capability gets nothing, whatever its other flags say. The content gate is
+    kept as an additional refusal.
+    """
+
+    if not runbooks_allowed():
+        return RUNBOOKS_DENIED_ERROR
+    if content_disabled():
+        return CONTENT_DISABLED_ERROR
+    return None
 
 
 def _positive_float(name: str, default: float, maximum: float) -> float:
@@ -783,8 +814,9 @@ def _error_payload(message: str, status: int | None = None) -> str:
 def _call(tool: Any) -> tuple[str, bool]:
     """Run one tool body with the shared gate, config and error handling."""
 
-    if content_disabled():
-        return _error_payload(CONTENT_DISABLED_ERROR), True
+    refusal = access_error()
+    if refusal is not None:
+        return _error_payload(refusal), True
 
     try:
         settings = load_settings()
@@ -807,8 +839,9 @@ def _call(tool: Any) -> tuple[str, bool]:
 def call_search(arguments: dict[str, Any]) -> tuple[str, bool]:
     """Return (text, is_error) for one search invocation."""
 
-    if content_disabled():
-        return _error_payload(CONTENT_DISABLED_ERROR), True
+    refusal = access_error()
+    if refusal is not None:
+        return _error_payload(refusal), True
 
     try:
         query = prepare_query(arguments.get("query"))
@@ -822,8 +855,9 @@ def call_search(arguments: dict[str, Any]) -> tuple[str, bool]:
 def call_read(arguments: dict[str, Any]) -> tuple[str, bool]:
     """Return (text, is_error) for one read invocation."""
 
-    if content_disabled():
-        return _error_payload(CONTENT_DISABLED_ERROR), True
+    refusal = access_error()
+    if refusal is not None:
+        return _error_payload(refusal), True
 
     page = arguments.get("page")
     try:
@@ -837,8 +871,9 @@ def call_read(arguments: dict[str, Any]) -> tuple[str, bool]:
 def selftest() -> int:
     """Report configuration without making any request."""
 
-    if content_disabled():
-        print("selftest: content access is disabled for this run")
+    refusal = access_error()
+    if refusal is not None:
+        print(f"selftest: {refusal}")
         return 0
     try:
         settings = load_settings()
@@ -995,11 +1030,12 @@ def main() -> int:
     """Validate configuration, then serve JSON-RPC until stdin closes.
 
     A missing or malformed setting fails loudly before the first request, and
-    the message names the variable without echoing its value. A host-data-only
-    run validates nothing: both tools refuse before configuration is read.
+    the message names the variable without echoing its value. A run that was
+    not granted runbooks validates nothing: both tools refuse before
+    configuration is read.
     """
 
-    if not content_disabled():
+    if access_error() is None:
         try:
             load_settings()
         except ConfigError as exc:

@@ -304,6 +304,32 @@ else
     pass "malformed allow_content message names the target only"
 fi
 
+# 3d. A malformed allow_runbooks fails before any request and names the target,
+#     never its id or value.
+bad_case=0
+for bad in \
+    '{"general":{"channel_id":"111111111111111111","allow_runbooks":"true"}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_runbooks":1}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_runbooks":null}}' \
+    '{"general":{"channel_id":"111111111111111111","allow_runbooks":[]}}'; do
+    bad_case=$((bad_case + 1))
+    expect_fail "malformed allow_runbooks case $bad_case fails without a request" \
+        send NOTIFY_TARGETS="$bad"
+done
+set +e
+out=$(send NOTIFY_TARGETS='{"general":{"channel_id":"111111111111111111","allow_runbooks":"true"}}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "malformed allow_runbooks: expected failure"
+elif ! contains "$out" "general"; then
+    no "malformed allow_runbooks: message did not name the target"
+elif contains "$out" "111111111111111111" || contains "$out" '"true"'; then
+    no "malformed allow_runbooks: message leaked an id or value"
+else
+    pass "malformed allow_runbooks message names the target only"
+fi
+
 # 4. -t is rejected when a webhook is configured.
 expect_fail "-t rejected when DISCORD_WEBHOOK_URL is set" \
     send_target general NOTIFY_TARGETS="$targets" \
