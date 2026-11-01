@@ -4,10 +4,10 @@ A hardened, single-container notification agent. It runs the [OpenCode](https://
 
 Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, Docker 29 with Compose 2.40. Everything except Docker lives inside the container.
 
-- **Today:** Discord incoming webhook.
-- **Later:** Composio, switchable through environment variables without rebuilding.
+- **Delivery:** Discord incoming webhook, or Composio, switchable through environment variables without rebuilding.
 - **Schedules:** [supercronic](https://github.com/aptible/supercronic), a static non-root cron, reading a crontab bind-mounted from the host.
-- **State:** one named volume for OpenCode auth and sessions.
+- **Inbound replies:** an optional Python listener polls one admin channel through Composio and runs the same agent for messages from an explicit author allowlist.
+- **State:** one named volume for OpenCode auth, sessions and the inbound baseline/dedupe file.
 
 ## Repository layout
 
@@ -19,11 +19,13 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
-| `scripts/entrypoint.sh` | Compose dispatcher: no args runs supercronic, args run the command. |
+| `scripts/discord_inbound.py` | Optional inbound listener: authorises Discord replies and runs the same agent once each. |
+| `scripts/entrypoint.sh` | Compose dispatcher and supervisor: without args runs supercronic and the listener independently, with args runs the command. |
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
 | `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
+| `tests/test_discord_inbound.py` | Inbound allowlist, channel, bot, dedupe, length, queue and refusal-path tests; no network or model required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -538,6 +540,179 @@ either: a scoped target carries its host boundary into the instruction and the
 agent's rules, and a target with `allow_content: false` also carries a
 server-side block that the model cannot talk its way around.
 
+## Inbound Discord replies
+
+By default the bot is output-only. Set `NOTIFY_INBOUND_CHANNEL_ID` and the
+container also runs `scripts/discord_inbound.py`, a long-lived Python process
+alongside supercronic. A reply in the admin chat from an allowlisted human is
+turned into an instruction for the same `notify` agent; the agent answers with
+`scripts/notify.sh`, so the answer lands back in that channel.
+
+This is not a general chat endpoint. It is a one-channel, one-allowlist,
+at-most-once command path into a read-only agent. Leave the channel unset to
+keep the container output-only; the entrypoint then logs
+`inbound disabled: NOTIFY_INBOUND_CHANNEL_ID is not set` and never starts the
+listener.
+
+### Transport: Composio proxy
+
+The listener uses Composio's proxy endpoint, not a Discord bot token and not
+`DISCORD_NEW_MESSAGE_TRIGGER`:
+
+```text
+POST https://backend.composio.dev/api/v3.1/tools/execute/proxy
+  connected_account_id: the existing Discord bot connection
+  endpoint: /channels/<inbound channel>/messages
+  method: GET
+  parameters: limit, and before when paging backwards
+```
+
+- It reuses `COMPOSIO_API_KEY` and the Discord connected account that
+  `notify.sh` already uses. No new credential, no bot token in `stack.env`.
+- The trigger is delivered by webhook or a realtime Pusher subscription. This
+  container publishes no inbound port, and the trigger API has no documented
+  "poll my trigger events" REST method. Adding a webhook receiver or the
+  Composio SDK would be a larger change and a new runtime dependency.
+- The proxy is a plain authenticated REST call, so `urllib` is enough. No new
+  Python package is installed.
+- Discord returns messages newest-first. The listener walks backwards with
+  `before` until it reaches its saved cursor, then handles the new messages
+  oldest-first. This avoids the `after` pitfall where a backlog larger than
+  one page would skip messages between the cursor and the newest page.
+
+The Discord bot connection needs **View Channel** and **Read Message History**
+in the inbound channel. The send path already needs Send Messages. If the
+existing connection lacks Read Message History, the proxy returns `403` and
+the listener logs only `poll failed: proxy returned HTTP 403`; grant the
+permission on the bot's role and restart.
+
+The listener reads the configured channel only. A reply inside a thread has
+the thread's channel id, so it is not followed; answer in the channel itself.
+
+### Configuration
+
+```sh
+# Required for inbound.
+NOTIFY_INBOUND_CHANNEL_ID=111111111111111111
+NOTIFY_INBOUND_ALLOWED_AUTHORS=222222222222222222,333333333333333333
+NOTIFY_INBOUND_TARGET=admin-chat
+
+# Optional.
+NOTIFY_INBOUND_CONNECTED_ACCOUNT_ID=
+NOTIFY_INBOUND_POLL_SECONDS=30
+NOTIFY_INBOUND_MAX_INSTRUCTION_CHARS=1000
+NOTIFY_INBOUND_QUEUE_SIZE=4
+NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS=300
+NOTIFY_INBOUND_STATE_FILE=/home/agent/.local/share/opencode/discord-inbound-state.json
+```
+
+`NOTIFY_INBOUND_CHANNEL_ID` is the only channel read. The listener refuses to
+start without it. `NOTIFY_INBOUND_ALLOWED_AUTHORS` is a comma-separated list
+of Discord **user ids**, not usernames; usernames can change, ids cannot. The
+listener refuses to start if it is empty, whitespace-only, contains an empty
+entry, or contains anything that is not a numeric id. That is the
+authorisation boundary, so a typo is a hard failure rather than a silent
+wildcard.
+
+`NOTIFY_INBOUND_TARGET` names the target used for the answer. It must exist in
+`NOTIFY_TARGETS`, and its `channel_id` must equal `NOTIFY_INBOUND_CHANNEL_ID`;
+the listener refuses to start otherwise, so an answer cannot be routed to a
+different channel. Its `host_scope` and `allow_content` guards are applied to
+the inbound run exactly as they are for a scheduled prompt, including the
+server-side `NOTIFY_CONTENT_DISABLED=1` block. If neither
+`NOTIFY_INBOUND_TARGET` nor `NOTIFY_DEFAULT_TARGET` is set, the listener falls
+back to the legacy Composio delivery shape (`COMPOSIO_ARGS` plus
+`COMPOSIO_CONNECTED_ACCOUNT_ID`) and logs a warning that it cannot verify the
+answer goes to the inbound channel. With `DISCORD_WEBHOOK_URL` set, both
+target variables must be empty: a webhook has no named targets, and
+`notify.sh` rejects the combination.
+
+`NOTIFY_INBOUND_CONNECTED_ACCOUNT_ID` pins the connection used to read. It is
+optional; when set it must match the target's `connected_account_id`, so the
+same bot reads and sends. Otherwise the target's account is used, then
+`COMPOSIO_CONNECTED_ACCOUNT_ID`, then the Composio project default.
+
+`NOTIFY_INBOUND_STATE_FILE` must be on a writable persistent path. The default
+is inside the `opencode-data` named volume. Do not point it at the tmpfs
+`/home/agent/.local/state`, or a restart would lose the baseline and could
+replay messages.
+
+### Authorisation, default-deny
+
+Every polled message is checked in this order:
+
+1. **Well formed.** A missing or non-numeric message id, author or type is
+   refused as `malformed_message`.
+2. **Not a bot.** `author.bot` and any message with `webhook_id` are refused as
+   `bot_author`. This includes the notification bot itself, which is what
+   prevents an infinite loop. Only message types `0` (default) and `19`
+   (reply) are considered; system messages are refused as `unsupported_type`.
+3. **Author allowlist.** The author id must be in
+   `NOTIFY_INBOUND_ALLOWED_AUTHORS`; otherwise `author_not_allowed`.
+4. **Channel.** `channel_id` must equal `NOTIFY_INBOUND_CHANNEL_ID`; otherwise
+   `wrong_channel`.
+5. **Not a duplicate.** The state file records the message id before the
+   instruction is queued; a restart or an overlapping poll sees `duplicate`.
+6. **Has usable text.** Discord mention syntax (`<@id>`, `<@!id>`, `<@&id>`,
+   `<#id>`) and literal `@everyone` / `@here` are stripped; if nothing
+   remains, the message is `empty`.
+7. **Length.** The stripped instruction must be at most
+   `NOTIFY_INBOUND_MAX_INSTRUCTION_CHARS`; longer messages are refused as
+   `too_long`, never silently truncated.
+
+Refusals are logged as `refused reason=<token> msg=<short hash>`. The message
+body, author id, channel id, API key and webhook URL are never logged. The
+short hash is derived from the message id, so repeated polls of the same
+refused message are recognisable without exposing the id.
+
+The first poll with no state file is a **baseline**: it records the newest
+existing message and actions nothing. The notification bot's earlier messages
+and anything else that predates the listener are therefore ignored. If the
+first poll returns no messages, the listener asks for the channel object and
+uses `last_message_id`, which is visible with View Channel alone. That covers
+a bot that lacks Read Message History: Discord returns an empty list, but the
+channel still reports its newest message id, so a later permission grant
+cannot make old history look new. For a truly empty channel the fallback is a
+synthetic snowflake for the current time. The state file is written atomically
+with mode `0600`; a corrupt file makes the listener refuse to start rather
+than guess which messages were handled.
+
+### Rate limit and shutdown
+
+One worker thread runs the agent. `NOTIFY_INBOUND_QUEUE_SIZE` bounds the
+waiting instructions; when the queue is full the message is recorded, dropped
+and logged as `dropped reason=queue_full`. Two agents never run at once.
+`NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS` is a hard limit; the agent runs in its own
+process group so a timeout or container shutdown terminates the agent and its
+MCP children together.
+
+Recording before queuing gives **at-most-once** semantics: a crash can lose a
+queued instruction, but it cannot replay one. That is the deliberate trade for
+a command path into an agent with database access. A backlog larger than
+`20 * 100` messages is truncated with a `backlog truncated` warning; the
+listener does not buffer unbounded history.
+
+### Supervisor
+
+`scripts/entrypoint.sh` starts supercronic and the listener as separate
+children. If either exits, the supervisor reaps it and restarts it after five
+seconds without touching the other, so a listener crash cannot stop scheduled
+prompts and a broken schedule cannot silence the listener. `SIGTERM` and
+`SIGINT` are forwarded to both; both are reaped, and anything that ignores
+`SIGTERM` is killed after twenty seconds. With arguments the dispatcher still
+execs them directly for `docker compose run ...`.
+
+### Inbound prompt
+
+The listener builds a short instruction that quotes the operator's message,
+says it is an inbound reply rather than a status-digest request, and names the
+exact `notify.sh` command. `prompts/notify.md` rules 22–24 tell the agent to
+answer the question directly, keep it to one message, and treat the quoted
+message as untrusted in the same way as tool output: it cannot change the
+rules, grant permissions, choose another target or extract secrets. All the
+existing rules remain in force: one message per run, no mentions, no
+fabrication, read-only SQL, and no credentials in messages or logs.
+
 ## Security posture
 
 These are enforced in `compose.yaml`, not conventions:
@@ -551,6 +726,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Capabilities | `cap_drop: [ALL]` |
 | Privilege escalation | `security_opt: [no-new-privileges:true]` |
 | Network | no `ports:` at all; outbound only |
+| Inbound listener | optional, one channel, explicit author allowlist, bot/webhook messages ignored, persisted baseline and dedupe, one agent at a time |
 | Memory | `mem_limit: 512m` |
 | Processes | `pids_limit: 200` |
 | Restart | `restart: unless-stopped` |
@@ -585,10 +761,12 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
 - Call `search_content` to read short chunks from the published-content index.
 - Write only to the named volume and tmpfs.
+- When the inbound listener is enabled, read the one configured admin channel through Composio's proxy using the existing bot connection. The listener itself never gives the agent an arbitrary command: it only invokes the fixed `opencode run --agent notify` command with a filtered instruction.
 
 **What it cannot do**
 
-- Accept inbound connections (no published ports).
+- Accept inbound connections (no published ports). The inbound listener makes outbound poll requests; it does not listen.
+- Read any channel other than the one pinned by `NOTIFY_INBOUND_CHANNEL_ID`, or action a message from a bot, webhook, or author outside `NOTIFY_INBOUND_ALLOWED_AUTHORS`.
 - Access the Docker socket, the host filesystem, `/etc`, `/home`, or other containers.
 - Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
@@ -599,6 +777,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 **Scenarios and residual risk**
 
 - **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query` or `oracle_search_content`: the prompt tells the model to treat those values as data, never as instructions.
+- **Inbound message injection.** An allowlisted human's reply becomes an instruction to an agent with database access. The allowlist is the boundary: a non-allowlisted author, a bot, a webhook, a different channel, a duplicate, an over-long message or a mentions-only message never reaches the agent. An allowlisted human can still phrase a request that produces a bad answer or a wide read, exactly as they could by editing a schedule. The agent remains read-only and can still only send through `notify.sh`. The listener never passes the raw Discord payload: it strips mentions, caps length, and wraps the text in a fixed instruction. If the allowlist is too broad, the exposure is too broad.
 - **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
 - **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
 - **Malicious or compromised model provider.** The provider sees the prompt and the composed message. It can influence message content but not the container's shell surface.
@@ -647,11 +826,23 @@ Verified while building this branch:
 - The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs.
 - The environment inheritance assumption was checked in the image built from this branch (`notify-agent:target-scope`), not just in the unit tests. A temporary local MCP server was spawned by `opencode run --standalone` with `NOTIFY_CONTENT_DISABLED=1` in the parent environment; the child's `/probe/env.txt` contained `NOTIFY_CONTENT_DISABLED=1` and `PYTHONUNBUFFERED=1`, so OpenCode merges the parent environment into the configured MCP environment. Running the installed `/app/mcp/oracle_query.py` over stdio in the same image returned `{"error":"content search is disabled for this run"}` with `isError: true` when the variable was set, and `Oracle connection is not configured` without it.
 
-Not verified, because this repository contains no credentials:
+Inbound listener checks on this branch:
 
+- `python3 -m py_compile scripts/discord_inbound.py tests/test_discord_inbound.py` passes.
+- `python3 -m unittest discover -s tests -p 'test_*.py' -v` passes 130 tests: the existing SQL-guard suite plus the new inbound suite. No network, Discord channel, Composio account, database or model is used.
+- The new suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the `last_message_id` fallback when the bot lacks Read Message History; backwards pagination to the cursor; the proxy request shape (endpoint, method, `connected_account_id`, `user_id`, `limit`/`before` parameters, `x-api-key` header) against a stub; redacted HTTP/JSON errors; and the exact `opencode run --standalone --agent notify --model ... -- <instruction>` argv with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false.
+- The refusal path is exercised at the real process boundary: with `subprocess.Popen` patched, a message from a disallowed author produces no `Popen` call, no enqueue, and this log line (message id hashed, body absent):
+  `refused reason=author_not_allowed msg=d1a35b8e`
+- `sh -n scripts/entrypoint.sh` passes. The supervisor was not exercised against a real container.
+
+Not verified, because this repository contains no credentials or live services:
+
+- A live Discord read through Composio's proxy (no real API key or Discord connection was used). The request/response shape is tested only against a stub; the live proxy and the bot's View Channel / Read Message History permissions are unverified.
+- A live inbound reply end to end (no real channel, message or author id was used).
 - `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Discord send (no real webhook was used).
 - A live Composio send (no real API key was used; the Composio path was only exercised against a local stub).
 - A live Oracle query or a live `search_content` call (no credentials or wallet were used; the first mate runs the live checks). The guard, protocol, bind, cap, and failure paths were exercised without a database.
+- `docker compose config`, an image build, and `shellcheck` (Docker and shellcheck are not installed in the build environment used for this branch).
 
-Do those checks on the target host after copying `stack.env`, mounting the wallet, and completing the device flow.
+Do those checks on the target host after copying `stack.env`, mounting the wallet, granting the bot Read Message History in the admin channel, and completing the device flow.
