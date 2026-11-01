@@ -229,6 +229,16 @@ class OpenCodeConfigTests(unittest.TestCase):
         self.assertIn("export NOTIFY_HOST_SCOPE", RUN_PROMPT)
         self.assertIn("HOST_REPORT_HOSTS", RUN_PROMPT)
 
+    def test_runbooks_are_default_deny_for_the_mcp_child(self) -> None:
+        self.assertIn("NOTIFY_RUNBOOKS_ALLOWED=1", RUN_PROMPT)
+        self.assertIn("export NOTIFY_RUNBOOKS_ALLOWED", RUN_PROMPT)
+        self.assertIn("unset NOTIFY_RUNBOOKS_ALLOWED", RUN_PROMPT)
+        bookstack = CONFIG["mcp"]["servers"]["bookstack"]
+        self.assertEqual(
+            bookstack["environment"]["NOTIFY_RUNBOOKS_ALLOWED"],
+            "{env:NOTIFY_RUNBOOKS_ALLOWED}",
+        )
+
 
 class PreflightScriptTests(unittest.TestCase):
     def test_preflight_speaks_mcp_before_opencode(self) -> None:

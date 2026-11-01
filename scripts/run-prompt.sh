@@ -141,6 +141,7 @@ fi
 target_host_scope=
 target_host_scope_json='[]'
 target_content_disabled=0
+target_runbooks_allowed=0
 if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
     command -v jq >/dev/null 2>&1 || {
         printf 'run-prompt: jq is required to resolve target host_scope\n' >&2
@@ -206,6 +207,27 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
     fi
     target_content_disabled=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
         if has($name) and (.[$name].allow_content == false) then "1" else "0" end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
+    bad_runbooks_targets=$(printf '%s' "$targets_json" | jq -r '
+        [ to_entries[]
+          | select((.value | type) == "object")
+          | select(.value | has("allow_runbooks"))
+          | select((.value.allow_runbooks | type) != "boolean")
+          | .key
+        ] | join(", ")
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not validate NOTIFY_TARGETS allow_runbooks\n' >&2
+        exit 1
+    }
+    if [ -n "$bad_runbooks_targets" ]; then
+        printf 'run-prompt: invalid allow_runbooks for target(s) %s: expected a boolean\n' "$bad_runbooks_targets" >&2
+        exit 1
+    fi
+    target_runbooks_allowed=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name].allow_runbooks == true) then "1" else "0" end
     ' 2>/dev/null) || {
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
         exit 1
@@ -290,6 +312,10 @@ The known hosts for this run are ${known_hosts_rendered}. Include one line for e
         prompt="${prompt}
 
 Report host data only: do not include any other material."
+    elif [ "$target_runbooks_allowed" -eq 1 ]; then
+        prompt="${prompt}
+
+Runbooks are available for this run: when the instruction asks how to carry out an operational task, or what a runbook flag or alert means, you may use the runbook tools."
     fi
 else
     prompt=$instruction
@@ -301,6 +327,16 @@ fi
 if [ "$target_content_disabled" -eq 1 ]; then
     NOTIFY_CONTENT_DISABLED=1
     export NOTIFY_CONTENT_DISABLED
+fi
+
+# Runbooks are default-deny: export the explicit allow only for a target whose
+# allow_runbooks is true, and clear any inherited value otherwise. bookstack.py
+# refuses both tools unless it sees exactly "1".
+if [ "$target_runbooks_allowed" -eq 1 ]; then
+    NOTIFY_RUNBOOKS_ALLOWED=1
+    export NOTIFY_RUNBOOKS_ALLOWED
+else
+    unset NOTIFY_RUNBOOKS_ALLOWED
 fi
 
 # Export the effective host scope so ssh_probe.py refuses a host outside it

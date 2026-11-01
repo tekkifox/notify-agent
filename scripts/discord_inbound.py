@@ -189,6 +189,7 @@ class InboundTarget:
     connected_account_id: str
     host_scope: str
     allow_content: bool
+    allow_runbooks: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -420,12 +421,23 @@ def _load_target_by_name(
             )
         allow_content = entry["allow_content"]
 
+    # Runbooks are default-deny and independent of allow_content: only a
+    # target that names this flag gets them.
+    allow_runbooks = False
+    if "allow_runbooks" in entry:
+        if not isinstance(entry["allow_runbooks"], bool):
+            raise ConfigError(
+                f"target {name!r} allow_runbooks must be a boolean"
+            )
+        allow_runbooks = entry["allow_runbooks"]
+
     return InboundTarget(
         name=name,
         channel_id=target_channel.strip(),
         connected_account_id=target_account,
         host_scope=host_scope,
         allow_content=allow_content,
+        allow_runbooks=allow_runbooks,
     )
 
 
@@ -1320,13 +1332,18 @@ def build_instruction(
                 f"{target.host_scope or 'the hosts in scope'}."
             )
         else:
-            lines.append(
+            capabilities = (
                 "\nIf the operator asks what you can do, answer with what this "
                 "run allows: host health (CPU, memory, load, disk, sample "
                 "freshness), SSH reachability for "
                 f"{target.host_scope or 'the hosts in scope'}, and published "
                 "content (pages and projects)."
             )
+            if target.allow_runbooks:
+                capabilities = capabilities[:-1] + (
+                    ", and runbook procedures for operational tasks."
+                )
+            lines.append(capabilities)
     else:
         lines.append(
             "Send exactly one reply with:\n"
@@ -1435,6 +1452,12 @@ def _run_agent_once(
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
+    # Runbooks are default-deny and independent of allow_content: export the
+    # explicit allow only for a target that has the flag, and clear any
+    # inherited value otherwise.
+    environment.pop("NOTIFY_RUNBOOKS_ALLOWED", None)
+    if chosen.target is not None and chosen.target.allow_runbooks:
+        environment["NOTIFY_RUNBOOKS_ALLOWED"] = "1"
     if chosen.reply_mode == "bot":
         # notify.sh treats DISCORD_WEBHOOK_URL and NOTIFY_DEFAULT_TARGET as
         # stronger than COMPOSIO_ARGS.  Remove both so this run can only reach
