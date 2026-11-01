@@ -88,4 +88,8 @@ ENV HOME=/home/agent \
 
 USER 10001:10001
 
-ENTRYPOINT ["supercronic", "/app/crontab"]
+# The dispatcher runs supercronic and the inbound listener as independent
+# children and forwards signals to both. With arguments it execs them directly,
+# so `docker run ... opencode auth login` and `docker run ... notify.sh` keep
+# working.
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]

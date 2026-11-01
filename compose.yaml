@@ -10,9 +10,10 @@ services:
     image: notify-agent:2.2.1
     container_name: notify-agent
 
-    # The image ENTRYPOINT is ["supercronic", "/app/crontab"]. This dispatcher
-    # execs that exact command with no arguments, and keeps `docker compose run
-    # agent <command>` working for auth, manual sends, and debugging.
+    # With no arguments this dispatcher runs supercronic and, when an inbound
+    # channel is configured, the Discord listener as independent children. It
+    # also keeps `docker compose run agent <command>` working for auth, manual
+    # sends, and debugging.
     entrypoint: ["/app/scripts/entrypoint.sh"]
 
     user: "10001:10001"
