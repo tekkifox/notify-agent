@@ -12,6 +12,81 @@
 # instruction, and notify.sh resolves it against the NOTIFY_TARGETS allowlist.
 set -eu
 
+# Resolve the repository root so the MCP preflight works both in the image
+# (/app/scripts -> /app/mcp) and from a checkout. NOTIFY_MCP_SERVER exists for
+# the shell tests; it is not needed in normal operation.
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
+mcp_server=${NOTIFY_MCP_SERVER:-${repo_dir}/mcp/oracle_query.py}
+
+# Prove that the MCP server starts and advertises both tools before OpenCode
+# runs. The handshake does not touch the database, so this is cheap. Server
+# output is captured, never printed: it must not reach the log, and the
+# environment may contain credentials.
+preflight_mcp() {
+    server=$1
+
+    if [ ! -f "$server" ]; then
+        printf 'run-prompt: MCP preflight failed: server not found: %s\n' "$server" >&2
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'run-prompt: MCP preflight failed: python3 is not installed or not on PATH\n' >&2
+        exit 1
+    fi
+
+    responses=$(
+        printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"run-prompt-preflight","version":"1.0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | python3 "$server" 2>/dev/null
+    ) || {
+        printf 'run-prompt: MCP preflight failed: %s did not start\n' "$server" >&2
+        exit 1
+    }
+
+    if ! printf '%s' "$responses" | python3 -c '
+import json
+import sys
+
+initialized = False
+tools = set()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(message, dict):
+        continue
+    if message.get("id") == 1 and isinstance(message.get("result"), dict):
+        initialized = True
+    if message.get("id") == 2:
+        result = message.get("result")
+        if isinstance(result, dict):
+            for tool in result.get("tools", []):
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if isinstance(name, str):
+                    tools.add(name)
+sys.exit(0 if initialized and {"query", "search_content"} <= tools else 1)
+' 2>/dev/null; then
+        printf 'run-prompt: MCP preflight failed: %s did not expose query and search_content\n' "$server" >&2
+        exit 1
+    fi
+
+    # The tool listing is not enough: prove the database is reachable too, so a
+    # run cannot message the channel and only then discover Oracle is down.
+    # The selftest's own reason stays suppressed; it is available by running
+    # `python3 /app/mcp/oracle_query.py --selftest` by hand.
+    if ! python3 "$server" --selftest >/dev/null 2>&1; then
+        printf 'run-prompt: MCP preflight failed: %s Oracle self-test failed\n' "$server" >&2
+        exit 1
+    fi
+}
+
 usage() {
     printf 'usage: run-prompt.sh [-t TARGET] "instruction"\n' >&2
     exit 64
@@ -164,6 +239,10 @@ if [ "$target_content_disabled" -eq 1 ]; then
     NOTIFY_CONTENT_DISABLED=1
     export NOTIFY_CONTENT_DISABLED
 fi
+
+# Fail before OpenCode starts if the MCP server cannot answer initialize and
+# tools/list under the same environment the agent will use.
+preflight_mcp "$mcp_server"
 
 # OpenCode 2 removed --pure. --standalone runs a private server for this one
 # invocation instead of attaching to (or leaving behind) a shared background

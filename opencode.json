@@ -22,7 +22,7 @@
         "command": ["python3", "/app/mcp/oracle_query.py"],
         "codemode": false,
         "timeout": {
-          "startup": 20000,
+          "startup": 60000,
           "execution": 60000
         },
         "environment": {
@@ -40,7 +40,7 @@
     "notify": {
       "description": "Composes one notification and sends it through notify.sh. Read-only Oracle tools only.",
       "mode": "primary",
-      "steps": 6,
+      "steps": 12,
       "prompt": "{file:./prompts/notify.md}",
       "permission": {
         "*": "deny",
@@ -65,7 +65,8 @@
         "bash": {
           "*": "deny",
           "/app/scripts/notify.sh -m *": "allow",
-          "/app/scripts/notify.sh -t * -m *": "allow"
+          "/app/scripts/notify.sh -t * -m *": "allow",
+          "/bin/sleep 5": "allow"
         }
       }
     }

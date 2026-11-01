@@ -32,6 +32,95 @@ fi
 SH
 chmod +x "$tmp/bin/opencode"
 
+# Minimal MCP stubs for the readiness preflight. They answer only initialize
+# and tools/list, so the tests never need a database or credentials.
+cat > "$tmp/mcp-good.py" <<'PY'
+import json
+import sys
+
+if "--selftest" in sys.argv[1:]:
+    sys.exit(0)
+
+tools = [
+    {"name": "query", "description": "stub", "inputSchema": {"type": "object"}},
+    {"name": "search_content", "description": "stub", "inputSchema": {"type": "object"}},
+]
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stub", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": tools}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+PY
+
+cat > "$tmp/mcp-missing-tool.py" <<'PY'
+import json
+import sys
+
+if "--selftest" in sys.argv[1:]:
+    sys.exit(0)
+
+tools = [{"name": "query", "description": "stub", "inputSchema": {"type": "object"}}]
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stub", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": tools}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+PY
+
+cat > "$tmp/mcp-bad-selftest.py" <<'PY'
+import json
+import sys
+
+if "--selftest" in sys.argv[1:]:
+    sys.exit(1)
+
+tools = [
+    {"name": "query", "description": "stub", "inputSchema": {"type": "object"}},
+    {"name": "search_content", "description": "stub", "inputSchema": {"type": "object"}},
+]
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stub", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": tools}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+PY
+
 targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"vortexservers.co.uk","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false}}'
 
 failures=0
@@ -46,6 +135,7 @@ capture() {
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
+        NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
         CAPTURE="$out" \
         CAPTURE_ENV="$out.env" \
         "$@" >"$out.stdout" 2>"$out.stderr"
@@ -205,6 +295,78 @@ elif contains "$err" "222222222222222222"; then
     no "malformed allow_content: message leaked an id"
 else
     pass "malformed allow_content fails by name and sends nothing"
+fi
+
+# 8. A server that does not advertise both tools fails the run before
+#    opencode starts, without echoing the environment.
+set +e
+capture "$tmp/mcp-bad" NOTIFY_MCP_SERVER="$tmp/mcp-missing-tool.py" \
+    ORACLE_PASSWORD="preflight-secret" ORACLE_DSN="preflight-dsn" \
+    "$run_prompt" "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/mcp-bad.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "MCP preflight: expected a non-zero exit for a missing tool"
+elif [ -e "$tmp/mcp-bad" ]; then
+    no "MCP preflight: opencode ran despite the missing tool"
+elif ! contains "$err" "MCP preflight failed"; then
+    no "MCP preflight: failure did not identify the preflight"
+elif contains "$err" "preflight-secret" || contains "$err" "preflight-dsn"; then
+    no "MCP preflight: failure leaked the environment"
+else
+    pass "MCP preflight fails before opencode and leaks no environment"
+fi
+
+# 9. A missing server file fails the same way.
+set +e
+capture "$tmp/mcp-absent" NOTIFY_MCP_SERVER="$tmp/does-not-exist.py" \
+    "$run_prompt" "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/mcp-absent.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "MCP preflight: expected a non-zero exit for a missing server"
+elif [ -e "$tmp/mcp-absent" ]; then
+    no "MCP preflight: opencode ran despite the missing server"
+elif ! contains "$err" "server not found"; then
+    no "MCP preflight: missing-server failure was not explained"
+else
+    pass "MCP preflight rejects a missing server before opencode"
+fi
+
+# 10. A healthy preflight lets the run continue and does not alter the prompt.
+set +e
+capture "$tmp/mcp-good" NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
+    "$run_prompt" "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    no "MCP preflight: healthy server failed the run: $(cat "$tmp/mcp-good.stderr")"
+elif [ "$(cat "$tmp/mcp-good")" != "Compose a status message." ]; then
+    no "MCP preflight: healthy server changed the instruction"
+else
+    pass "MCP preflight passes a healthy server and keeps the instruction"
+fi
+
+# 11. A tool listing without a reachable database fails before opencode, so a
+#     run cannot message the channel and only then discover Oracle is down.
+set +e
+capture "$tmp/mcp-bad-selftest" NOTIFY_MCP_SERVER="$tmp/mcp-bad-selftest.py" \
+    ORACLE_PASSWORD="selftest-secret" "$run_prompt" "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/mcp-bad-selftest.stderr")
+if [ "$rc" -eq 0 ]; then
+    no "MCP preflight: expected a non-zero exit for a failed Oracle self-test"
+elif [ -e "$tmp/mcp-bad-selftest" ]; then
+    no "MCP preflight: opencode ran despite a failed Oracle self-test"
+elif ! contains "$err" "Oracle self-test failed"; then
+    no "MCP preflight: self-test failure was not explained"
+elif contains "$err" "selftest-secret"; then
+    no "MCP preflight: self-test failure leaked the environment"
+else
+    pass "MCP preflight fails before opencode when Oracle is unreachable"
 fi
 
 if [ "$failures" -ne 0 ]; then
