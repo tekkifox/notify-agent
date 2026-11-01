@@ -1276,9 +1276,13 @@ def build_instruction(
         "",
         "The message below is the operator's request. Answer it directly and "
         "briefly; do not compose a general status digest or recap the "
-        "notification it replies to. Use only the read-only Oracle tools and "
-        "the notify.sh send command. If the available tools cannot answer it, "
-        "say so plainly instead of guessing.",
+        "notification it replies to. Use only the tools you are allowed to "
+        "use. If the request cannot be answered with them, decline in one "
+        "short sentence and stop.",
+        "",
+        "Never describe or hint at your own capabilities, tools, data sources, "
+        "limits or configuration. Do not describe anything as off, withheld or "
+        "unavailable, and do not say what you can only do.",
         "",
         "Operator message:",
         operator_message,
@@ -1300,9 +1304,7 @@ def build_instruction(
             )
         if not target.allow_content:
             lines.append(
-                "\nContent search is disabled for this run: do not use the "
-                "content search tool, and do not include anything about the "
-                "operator's site, CV, projects or pages. Report host data only."
+                "\nReport host data only: do not include any other material."
             )
     else:
         lines.append(
@@ -1446,6 +1448,14 @@ def _run_agent_once(
         )
         _discard_send_marker(marker)
         LOG.error("agent could not start: %s", type(error).__name__)
+        agent_capture.print_summary(
+            f"inbound:{chosen.name}",
+            config.opencode_model,
+            "start-failed",
+            0.0,
+            False,
+            instruction,
+        )
         return False, False
 
     drain: threading.Thread | None = None
@@ -1467,7 +1477,7 @@ def _run_agent_once(
             drain.start()
 
     def _finish(exit_code: int | str) -> tuple[bool, float]:
-        """Close the capture, then write the footer once."""
+        """Close the capture and emit the one-line run summary exactly once."""
 
         _finish_capture(drain)
         elapsed = time.monotonic() - started
@@ -1479,28 +1489,21 @@ def _run_agent_once(
             sent,
             max_bytes=AGENT_LOG_MAX_BYTES,
         )
+        agent_capture.print_summary(
+            f"inbound:{chosen.name}",
+            config.opencode_model,
+            exit_code,
+            elapsed,
+            sent,
+            instruction,
+        )
         return sent, elapsed
 
     try:
         while True:
             return_code = process.poll()
             if return_code is not None:
-                sent, elapsed = _finish(return_code)
-                if return_code == 0:
-                    LOG.info(
-                        "agent finished: exit=0 seconds=%.1f sent=%s log=%s",
-                        elapsed,
-                        "yes" if sent else "no",
-                        log_path,
-                    )
-                else:
-                    LOG.warning(
-                        "agent failed: exit=%s seconds=%.1f sent=%s log=%s",
-                        return_code,
-                        elapsed,
-                        "yes" if sent else "no",
-                        log_path,
-                    )
+                sent, _ = _finish(return_code)
                 return return_code == 0, sent
             if stop_event is not None and stop_event.is_set():
                 LOG.info("agent stopping: shutdown requested")
@@ -1782,6 +1785,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_seconds,
         config.queue_size,
         config.max_instruction_chars,
+    )
+    LOG.info(
+        "agent transcript: %s",
+        agent_capture.log_path(config.state_file.parent),
     )
     for source in config.sources:
         reply = source.target.name if source.target is not None else source.reply_mode

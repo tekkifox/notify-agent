@@ -39,6 +39,10 @@ MAX_BYTES = 256 * 1024
 MIN_ROOM_BYTES = 16 * 1024
 # Keep enough room for the footer after the agent output.
 FOOTER_RESERVE = 512
+# One-line container-log summary.  The instruction excerpt is short and the
+# whole line is hard-capped so a long source name or model cannot balloon it.
+SUMMARY_MAX_CHARS = 200
+SUMMARY_INSTRUCTION_CHARS = 80
 
 
 def log_path(state_dir: Path) -> Path:
@@ -94,6 +98,109 @@ def _stamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+
+def flatten_instruction(
+    text: str, limit: int = SUMMARY_INSTRUCTION_CHARS
+) -> str:
+    """Collapse all whitespace to single spaces, then hard-truncate."""
+
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    if limit <= 3:
+        return collapsed[: max(0, limit)]
+    return collapsed[: limit - 3].rstrip() + "..."
+
+
+def _shorten(value: str, room: int) -> str:
+    """Fit ``value`` into ``room`` characters, marking a cut with an ellipsis."""
+
+    if room <= 0:
+        return ""
+    if len(value) <= room:
+        return value
+    if room <= 3:
+        return value[:room]
+    return value[: room - 3].rstrip() + "..."
+
+
+def summary_line(
+    origin: str,
+    model: str,
+    exit_code: int | str,
+    duration: float,
+    sent: bool | None,
+    instruction: str,
+    *,
+    max_chars: int = SUMMARY_MAX_CHARS,
+) -> str:
+    """Build the single-line container-log summary for one run.
+
+    ``origin`` is ``inbound:<source>`` or ``schedule``.  The instruction is
+    flattened to one line, capped at about 80 characters with an ellipsis, and
+    the whole line is at most ``max_chars`` even when the source name or model
+    is long.  The exit/duration/sent fields are never dropped: a long source or
+    model is shortened first.
+    """
+
+    if sent is None:
+        sent_text = "unknown"
+    else:
+        sent_text = "yes" if sent else "no"
+    origin_text = " ".join(str(origin).split())
+    model_text = " ".join(str(model).split()) or "unknown"
+    stamp = _stamp()
+    tail = f"exit={exit_code} {duration:.1f}s sent={sent_text}"
+
+    def build(run_field: str, model_field: str, excerpt: str) -> str:
+        return (
+            f'{stamp} run={run_field} model={model_field} {tail} '
+            f'"{excerpt}"'
+        )
+
+    empty = build(origin_text, model_text, "")
+    if len(empty) > max_chars:
+        model_room = max_chars - len(build(origin_text, "", ""))
+        model_text = _shorten(model_text, model_room)
+        empty = build(origin_text, model_text, "")
+    if len(empty) > max_chars:
+        origin_room = max_chars - len(build("", model_text, ""))
+        origin_text = _shorten(origin_text, origin_room)
+        empty = build(origin_text, model_text, "")
+
+    excerpt_room = max_chars - (len(empty) - 3) - 3
+    limit = min(SUMMARY_INSTRUCTION_CHARS, max(0, excerpt_room))
+    excerpt = flatten_instruction(instruction, limit) if limit > 0 else ""
+    line = build(origin_text, model_text, excerpt)
+    return line.replace("\r", " ").replace("\n", " ")
+
+
+def print_summary(
+    origin: str,
+    model: str,
+    exit_code: int | str,
+    duration: float,
+    sent: bool | None,
+    instruction: str,
+    *,
+    stream: Any = None,
+    max_chars: int = SUMMARY_MAX_CHARS,
+) -> None:
+    """Write exactly one summary line to the stream that reaches docker logs."""
+
+    target = sys.stderr if stream is None else stream
+    line = summary_line(
+        origin,
+        model,
+        exit_code,
+        duration,
+        sent,
+        instruction,
+        max_chars=max_chars,
+    )
+    target.write(line + "\n")
+    target.flush()
 
 
 def record_start(
@@ -270,6 +377,10 @@ def _run(command: Sequence[str], args: argparse.Namespace) -> int:
             f"run-prompt: agent could not start: {type(error).__name__}",
             file=sys.stderr,
         )
+        print_summary(
+            args.origin, args.model, "start-failed", 0.0, False,
+            args.instruction,
+        )
         return 127
 
     drain: threading.Thread | None = None
@@ -295,11 +406,20 @@ def _run(command: Sequence[str], args: argparse.Namespace) -> int:
         except OSError:
             pass
         _discard_marker(marker)
+        elapsed = time.monotonic() - started
         record_end(
             log,
             f"signal-{signum}",
-            time.monotonic() - started,
+            elapsed,
             False,
+        )
+        print_summary(
+            args.origin,
+            args.model,
+            f"signal-{signum}",
+            elapsed,
+            False,
+            args.instruction,
         )
         raise SystemExit(128 + signum)
 
@@ -311,8 +431,12 @@ def _run(command: Sequence[str], args: argparse.Namespace) -> int:
 
     returncode = process.wait()
     _finish_capture(drain)
+    elapsed = time.monotonic() - started
     sent = marker.exists() if marker is not None else None
-    record_end(log, returncode, time.monotonic() - started, sent)
+    record_end(log, returncode, elapsed, sent)
+    print_summary(
+        args.origin, args.model, returncode, elapsed, sent, args.instruction
+    )
     _discard_marker(marker)
     return returncode
 

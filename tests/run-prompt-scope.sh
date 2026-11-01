@@ -193,10 +193,12 @@ else
         no "scoped target: instruction did not state the scope"
     elif ! contains "$prompt" "Nothing about any other host may appear in the message"; then
         no "scoped target: instruction did not state the host boundary"
-    elif ! contains "$prompt" "Content search is disabled for this run"; then
-        no "scoped target: instruction did not state the content block"
-    elif ! contains "$prompt" "do not include anything about the operator's site, CV, projects or pages"; then
-        no "scoped target: instruction did not state the content boundary"
+    elif ! contains "$prompt" "Report host data only"; then
+        no "scoped target: instruction did not state the host-data boundary"
+    elif contains "$prompt" "disabled" \
+        || contains "$prompt" "content search" \
+        || contains "$prompt" "site, CV, projects or pages"; then
+        no "scoped target: instruction named a withheld capability"
     elif ! contains "$prompt" '/app/scripts/notify.sh -t admin-chat -m'; then
         no "scoped target: instruction lost the target command"
     elif [ "$(cat "$tmp/scoped.env")" != "1" ]; then
@@ -220,8 +222,8 @@ elif [ "$(cat "$tmp/unscoped")" != "$expected_unscoped" ]; then
     no "unscoped target: instruction changed"
 elif contains "$(cat "$tmp/unscoped")" "delivery scope"; then
     no "unscoped target: instruction mentioned a scope"
-elif contains "$(cat "$tmp/unscoped")" "Content search is disabled"; then
-    no "unscoped target: instruction mentioned content"
+elif contains "$(cat "$tmp/unscoped")" "Report host data only"; then
+    no "unscoped target: instruction mentioned a host-data restriction"
 elif [ -s "$tmp/unscoped.env" ]; then
     no "unscoped target: NOTIFY_CONTENT_DISABLED was exported"
 elif [ -s "$tmp/unscoped.scope" ]; then
@@ -257,8 +259,8 @@ if [ "$rc" -ne 0 ]; then
     no "array scope: run-prompt.sh failed: $(cat "$tmp/multi.stderr")"
 elif ! contains "$(cat "$tmp/multi")" "\`a.example\`, \`b.example\`"; then
     no "array scope: instruction did not list both hosts"
-elif contains "$(cat "$tmp/multi")" "Content search is disabled"; then
-    no "array scope: instruction mentioned content"
+elif contains "$(cat "$tmp/multi")" "Report host data only"; then
+    no "array scope: instruction mentioned a host-data restriction"
 elif [ -s "$tmp/multi.env" ]; then
     no "array scope: NOTIFY_CONTENT_DISABLED was exported"
 elif [ "$(cat "$tmp/multi.scope")" != '["a.example","b.example"]' ]; then
@@ -275,8 +277,11 @@ rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
     no "content-off target: run-prompt.sh failed: $(cat "$tmp/content-off.stderr")"
-elif ! contains "$(cat "$tmp/content-off")" "Content search is disabled for this run"; then
-    no "content-off target: instruction did not state the content block"
+elif ! contains "$(cat "$tmp/content-off")" "Report host data only"; then
+    no "content-off target: instruction did not state the host-data boundary"
+elif contains "$(cat "$tmp/content-off")" "disabled" \
+    || contains "$(cat "$tmp/content-off")" "content search"; then
+    no "content-off target: instruction named a withheld capability"
 elif contains "$(cat "$tmp/content-off")" "delivery scope"; then
     no "content-off target: instruction mentioned a host scope"
 elif [ "$(cat "$tmp/content-off.env")" != "1" ]; then
@@ -416,7 +421,8 @@ elif [ ! -f "$log" ]; then
     no "transcript: no debug log was written"
 else
     output=$(cat "$log")
-    if ! contains "$output" "path: schedule:general"; then
+    summary=$(cat "$tmp/transcript.stderr")
+    if ! contains "$output" "path: schedule"; then
         no "transcript: header did not name the path"
     elif ! contains "$output" "model: test/model"; then
         no "transcript: header did not name the model"
@@ -436,6 +442,18 @@ else
         no "transcript: footer did not record the duration"
     elif ! contains "$output" "sent=yes"; then
         no "transcript: footer did not record the send"
+    elif ! contains "$summary" "run=schedule"; then
+        no "summary: container log line did not name the path"
+    elif ! contains "$summary" "model=test/model"; then
+        no "summary: container log line did not name the model"
+    elif ! contains "$summary" "exit=0"; then
+        no "summary: container log line did not record the exit code"
+    elif ! contains "$summary" "sent=yes"; then
+        no "summary: container log line did not record the send"
+    elif ! contains "$summary" "Compose a status message."; then
+        no "summary: container log line lost the instruction excerpt"
+    elif [ "$(grep -c ' run=schedule ' "$tmp/transcript.stderr")" -ne 1 ]; then
+        no "summary: expected exactly one run summary line"
     else
         pass "the transcript has a header, output and a send-aware footer"
     fi
@@ -481,12 +499,17 @@ capture "$tmp/failed" \
 rc=$?
 set -e
 output=$(cat "$tmp/data-failed/opencode/notify-debug.log" 2>/dev/null || true)
+summary=$(cat "$tmp/failed.stderr" 2>/dev/null || true)
 if [ "$rc" -eq 0 ]; then
     no "transcript failure: run-prompt.sh exited 0"
 elif ! contains "$output" "--- run end: exit=3"; then
     no "transcript failure: footer did not record the exit code"
 elif ! contains "$output" "sent=no"; then
     no "transcript failure: footer did not record the missing send"
+elif ! contains "$summary" "exit=3"; then
+    no "transcript failure: summary did not record the exit code"
+elif ! contains "$summary" "sent=no"; then
+    no "transcript failure: summary did not record the missing send"
 else
     pass "a failed run records its exit code and sent=no"
 fi

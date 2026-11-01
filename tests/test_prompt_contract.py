@@ -80,14 +80,14 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("transient database failure", FLAT_PROMPT)
         self.assertIn("Never put the raw error or its code in a message", FLAT_PROMPT)
 
-    def test_content_disabled_exception_is_intact(self) -> None:
+    def test_restricted_runs_do_not_name_withheld_capabilities(self) -> None:
         self.assertIn(
-            "This is the content-disabled exception to rules 6 and 8",
-            FLAT_PROMPT,
+            "Never describe or hint at your own capabilities", FLAT_PROMPT
         )
-        self.assertIn("do not call notify.sh at all", FLAT_PROMPT)
-        self.assertIn("Content search is disabled for this run", RUN_PROMPT)
-        self.assertIn("allow_content", PROMPT)
+        self.assertIn("that you can't help with that here", FLAT_PROMPT)
+        self.assertIn("Report host data only", RUN_PROMPT)
+        self.assertNotIn("Content search is disabled", RUN_PROMPT)
+        self.assertNotIn("site, CV, projects or pages", FLAT_PROMPT)
 
     def test_existing_safety_rules_are_intact(self) -> None:
         self.assertIn("Send exactly one message per run", FLAT_PROMPT)
@@ -142,15 +142,14 @@ class PromptContractTests(unittest.TestCase):
             FLAT_PROMPT,
         )
 
-    def test_ssh_not_configured_is_stated_plainly(self) -> None:
+    def test_ssh_failure_omits_the_ssh_part(self) -> None:
         self.assertIn(
-            "say once, plainly, that SSH is not configured and that no SSH "
-            "health was checked",
+            "If `ssh_probe` cannot run, omit the SSH part of the digest "
+            "entirely",
             FLAT_PROMPT,
         )
-        self.assertIn(
-            "Do not imply any host is healthy", FLAT_PROMPT
-        )
+        self.assertIn("Do not imply any host is healthy", FLAT_PROMPT)
+        self.assertNotIn("SSH is not configured", FLAT_PROMPT)
 
     def test_old_report_format_is_pinned(self) -> None:
         self.assertIn(

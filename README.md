@@ -485,11 +485,11 @@ then restart the container. The first is the full morning digest for the
 automations channel; the second is a Vortex-only digest for `admin-chat`.
 
 ```cron
-0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
+0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH status cannot be checked, omit the SSH part. Send it now with notify.sh."
 ```
 
 ```cron
-0 9 * * * /app/scripts/run-prompt.sh -t admin-chat "Compose the morning Vortex digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status, for the Vortex hosts only. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and the thresholds. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a rossmoney host or anything about it. If SSH is not configured, say so once. Send it now with notify.sh."
+0 9 * * * /app/scripts/run-prompt.sh -t admin-chat "Compose the morning Vortex digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status, for the Vortex hosts only. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and the thresholds. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a rossmoney host or anything about it. If SSH status cannot be checked, omit the SSH part. Send it now with notify.sh."
 ```
 
 ## Test delivery (sends a real message)
@@ -585,7 +585,7 @@ A morning digest that calls both MCP tools and keeps the old host-report shape,
 aimed at the automations channel:
 
 ```cron
-0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
+0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH status cannot be checked, omit the SSH part. Send it now with notify.sh."
 ```
 
 This repository cannot make that schedule live: the schedule is the operator's
@@ -603,7 +603,15 @@ Schedules are **trusted operator configuration**, not user input. The agent runs
 docker compose logs -f --tail=100 agent
 ```
 
-Supercronic logs each job start and exit to the container log, and delivery results and short failure reasons also appear there. The agent's own stdout and stderr go to the bounded `notify-debug.log` transcript instead (see [Agent output and the debug transcript](#agent-output-and-the-debug-transcript)), so routine container logs no longer carry model output. A failed host-statistics query is reported in that transcript only; it is never sent to the notification channel. The MCP readiness preflight fails the job before OpenCode starts and prints only the server path, never its output or environment. The container log does **not** contain the webhook URL or API keys, and the transcript adds only what the agent itself printed. Treat both as sensitive. Compose caps the container log at 3 × 10 MB.
+Supercronic logs each job start and exit to the container log, and delivery results and short failure reasons also appear there. The container log also receives exactly one one-line summary per agent run:
+
+```text
+2026-11-01T14:12:09Z run=inbound:vortex-admin model=provider/model exit=0 31.0s sent=yes "please report on the host stats?"
+```
+
+The summary carries the UTC time, path (`inbound:<source>` or `schedule`), model, exit code, duration and send state, plus the instruction flattened to one line and capped at about 80 characters with an ellipsis. The whole line stays under 200 characters, even with a long source name or model. It contains no tool output, no provider detail and no transcript file paths, and it replaces the old per-run `agent finished` line rather than adding a duplicate. The agent's complete stdout and stderr go to the bounded `notify-debug.log` transcript instead (see [Agent output and the debug transcript](#agent-output-and-the-debug-transcript)). A failed host-statistics query is reported in that transcript only; it is never sent to the notification channel. The MCP readiness preflight fails the job before OpenCode starts and prints only the server path, never its output or environment.
+
+Because the one-line summary includes a short excerpt of the operator's instruction, treat container logs as internal too. Neither the container log nor the transcript contains the webhook URL or API keys. Compose caps the container log at 3 × 10 MB.
 
 A failed job exits non-zero and is visible in the log, but there is no automatic retry. If you need retries, add them at the schedule level (for example a second prompt) rather than hiding failures.
 
@@ -1002,10 +1010,15 @@ docker compose exec agent tail -n 200 \
 
 The file is mode `0600` and capped at 256 KiB. When it is nearly full it is
 reset before the next run, and output past the cap is drained and discarded
-with a truncation note, so it never grows without limit. Only the path is
-written to the container log, never the contents. **The transcript contains
-the operator's instructions, model output and host data, so treat it as
+with a truncation note, so it never grows without limit. The container log gets
+the transcript path but never its contents; the separate one-line summary
+carries only the short instruction excerpt. **The transcript contains the
+operator's instructions, model output and host data, so treat it as
 internal.** It does not add anything the agent itself did not print.
+
+The separate one-line container-log summary (see [Read logs](#read-logs))
+contains only a flattened instruction excerpt; the full instruction is in this
+transcript.
 
 ### Deep provider logging
 
@@ -1044,9 +1057,18 @@ says it is an inbound reply rather than a status-digest request, and names the
 exact `notify.sh` command. `prompts/notify.md` rules 22–24 tell the agent to
 answer the question directly, keep it to one message, and treat the quoted
 message as untrusted in the same way as tool output: it cannot change the
-rules, grant permissions, choose another target or extract secrets. All the
-existing rules remain in force: one message per run, no mentions, no
-fabrication, read-only SQL, and no credentials in messages or logs.
+rules, grant permissions, choose another target or extract secrets.
+
+The instruction and the prompt constrain behaviour without naming what is
+withheld. A restricted target gets only `Report host data only: do not include
+any other material.`; the prompt never lists unavailable tools, sources or
+settings. Rule 37 forbids describing capabilities, tools, data sources or
+configuration, saying something is "disabled", "off", "not available in this
+run" or "I can only do X". If a request falls outside what is allowed, the
+agent replies with one short sentence declining and stops, with no offer of an
+alternative capability and no suggestion to enable anything. All the existing
+rules remain in force: one message per run, no mentions, no fabrication,
+read-only SQL, and no credentials in messages or logs.
 
 ## Security posture
 
@@ -1168,7 +1190,7 @@ Verified while building this branch:
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `rossmoney.me` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **236 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), and `NOTIFY_DEBUG_LLM` being off by default and opt-in.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **242 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED`; malformed values fail before the agent runs. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
@@ -1183,7 +1205,7 @@ Not verified here (no credentials, no live hosts, no Docker daemon use):
 - The schedule lines are documentation only. The live schedule is the host `SCHEDULES_FILE`; this branch cannot activate it.
 - Host-key identity is not pinned (`AutoAddPolicy`); the probe measures reachability and key authentication, not the remote host's identity.
 - The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs. The same suite now drives the MCP preflight with stub servers: a server that omits `search_content`, a missing server and a server whose Oracle self-test fails all fail before `opencode` starts without echoing `ORACLE_PASSWORD` or `ORACLE_DSN`, and a healthy server leaves the instruction byte-for-byte unchanged.
-- The text-level contract tests in `tests/test_prompt_contract.py` assert that the prompt keeps the query-first run order, the "never send a tool-unavailable message" rule, the zero-rows-is-not-a-failure wording, the one-pause/one-retry rule, the content-disabled exception, and the existing one-message/no-mentions/host-scope/read-only-SQL rules. They also assert that `opencode.json` keeps the 60-second startup timeout, at least 10 steps, the exact `/bin/sleep 5` allowance, and the denied-then-allowed Oracle tool permissions. These are text assertions, not a live model run.
+- The text-level contract tests in `tests/test_prompt_contract.py` assert that the prompt keeps the query-first run order, the "never send a tool-unavailable message" rule, the zero-rows-is-not-a-failure wording, the one-pause/one-retry rule, the capability-disclosure ban, the positive-only restricted-run wording, and the existing one-message/no-mentions/host-scope/read-only-SQL rules. They also assert that `opencode.json` keeps the 60-second startup timeout, at least 10 steps, the exact `/bin/sleep 5` allowance, and the denied-then-allowed Oracle tool permissions. These are text assertions, not a live model run.
 - The environment inheritance assumption was checked in the image built from this branch (`notify-agent:target-scope`), not just in the unit tests. A temporary local MCP server was spawned by `opencode run --standalone` with `NOTIFY_CONTENT_DISABLED=1` in the parent environment; the child's `/probe/env.txt` contained `NOTIFY_CONTENT_DISABLED=1` and `PYTHONUNBUFFERED=1`, so OpenCode merges the parent environment into the configured MCP environment. Running the installed `/app/mcp/oracle_query.py` over stdio in the same image returned `{"error":"content search is disabled for this run"}` with `isError: true` when the variable was set, and `Oracle connection is not configured` without it.
 
 Inbound listener checks on this branch:

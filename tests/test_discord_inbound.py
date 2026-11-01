@@ -1239,7 +1239,8 @@ class RunAgentTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound.subprocess, "Popen", side_effect=fake
         ):
-            with self.assertLogs("discord-inbound", level="INFO") as logs:
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
                 self.assertTrue(
                     discord_inbound.run_agent(self.config, "instruction")
                 )
@@ -1262,9 +1263,10 @@ class RunAgentTests(unittest.TestCase):
         self.assertLess(
             text.index("model output"), text.index("--- run end:")
         )
-        output = "\n".join(logs.output)
-        self.assertIn(str(log_path), output)
-        self.assertNotIn("model output", output)
+        summary = stderr.getvalue()
+        self.assertIn("run=inbound:default", summary)
+        self.assertNotIn("model output", summary)
+        self.assertNotIn(str(log_path), summary)
 
     def test_agent_output_log_is_capped_and_notes_the_truncation(self) -> None:
         limit = 1024
@@ -1313,6 +1315,83 @@ class RunAgentTests(unittest.TestCase):
         self.assertIn("--print-logs", command)
         self.assertIn("--log-level", command)
         self.assertIn("debug", command)
+
+
+    def test_run_emits_exactly_one_summary_line(self) -> None:
+        side_effect, _ = self._popen_side_effect([(0, True)])
+        stderr = io.StringIO()
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with mock.patch("sys.stderr", stderr):
+                self.assertTrue(
+                    discord_inbound.run_agent(self.config, "instruction")
+                )
+        lines = [line for line in stderr.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("run=inbound:default", lines[0])
+        self.assertIn("model=test/model", lines[0])
+        self.assertIn("exit=0", lines[0])
+        self.assertIn("sent=yes", lines[0])
+
+    def test_each_retry_attempt_gets_its_own_summary_line(self) -> None:
+        side_effect, _ = self._popen_side_effect([(0, False), (0, True)])
+        stderr = io.StringIO()
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with mock.patch("sys.stderr", stderr):
+                with self.assertLogs("discord-inbound", level="INFO"):
+                    self.assertTrue(
+                        discord_inbound.run_agent(self.config, "instruction")
+                    )
+        lines = [line for line in stderr.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("sent=no", lines[0])
+        self.assertIn("sent=yes", lines[1])
+
+
+class SummaryTests(unittest.TestCase):
+    def test_summary_is_one_flattened_truncated_line(self) -> None:
+        instruction = "first line\n\nsecond\t\tline " + "x" * 200
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:vortex-admin", "test/model", 0, 31.04, True, instruction
+        )
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\r", line)
+        self.assertNotIn("\t", line)
+        self.assertLessEqual(len(line), 200)
+        self.assertIn("run=inbound:vortex-admin", line)
+        self.assertIn("model=test/model", line)
+        self.assertIn("exit=0", line)
+        self.assertIn("31.0s", line)
+        self.assertIn("sent=yes", line)
+        self.assertIn("first line second line", line)
+        self.assertIn("...", line)
+        self.assertTrue(line.endswith('..."'))
+
+    def test_long_source_name_cannot_exceed_the_cap(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "inbound:" + "s" * 64,
+            "m" * 120,
+            1,
+            2.0,
+            False,
+            "y" * 500,
+        )
+        self.assertNotIn("\n", line)
+        self.assertLessEqual(len(line), 200)
+        self.assertIn("sent=no", line)
+
+    def test_summary_has_utc_timestamp_and_schedule_path(self) -> None:
+        line = discord_inbound.agent_capture.summary_line(
+            "schedule", "test/model", 0, 1.0, True, "do the thing"
+        )
+        self.assertRegex(
+            line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z "
+        )
+        self.assertIn("run=schedule", line)
+        self.assertTrue(line.endswith('"do the thing"'))
 
 
 class IngestTests(unittest.TestCase):
@@ -1368,7 +1447,7 @@ class IngestTests(unittest.TestCase):
         self.assertIn("what is the disk usage?", enqueued[0])
         self.assertIn("/app/scripts/notify.sh -t admin-chat", enqueued[0])
         self.assertIn("vortexservers.co.uk", enqueued[0])
-        self.assertIn("Content search is disabled", enqueued[0])
+        self.assertIn("Report host data only", enqueued[0])
         self.assertTrue(self.store.is_seen("900000000000000001"))
 
         second = discord_inbound.ingest_messages(
@@ -1379,6 +1458,21 @@ class IngestTests(unittest.TestCase):
         )
         self.assertEqual([decision.reason for decision in second], ["duplicate"])
         self.assertEqual(len(enqueued), 1)
+
+    def test_inbound_instruction_never_names_withheld_capabilities(self) -> None:
+        instruction = discord_inbound.build_instruction(
+            self.config, "what is on the site?"
+        )
+        lowered = instruction.lower()
+        for phrase in (
+            "disabled",
+            "content search",
+            "browse",
+            "read files",
+        ):
+            self.assertNotIn(phrase, lowered)
+        self.assertIn("Report host data only", instruction)
+        self.assertIn("capabilities", lowered)
 
     def test_queue_full_drops_instead_of_racing(self) -> None:
         with self.assertLogs("discord-inbound", level="WARNING") as logs:

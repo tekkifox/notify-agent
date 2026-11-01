@@ -271,7 +271,7 @@ The known hosts for this run are ${known_hosts_rendered}. Include one line for e
     if [ "$target_content_disabled" -eq 1 ]; then
         prompt="${prompt}
 
-Content search is disabled for this run: do not use the content search tool, and do not include anything about the operator's site, CV, projects or pages. Report host data only."
+Report host data only: do not include any other material."
     fi
 else
     prompt=$instruction
@@ -345,7 +345,7 @@ if [ -n "$debug_log" ]; then
     fi
     set -- python3 "$script_dir/agent_capture.py" \
         --log "$debug_log" \
-        --origin "schedule:${target:-default}" \
+        --origin "schedule" \
         --model "$OPENCODE_MODEL" \
         --instruction "$prompt" \
         --marker "${send_marker:-}" \
