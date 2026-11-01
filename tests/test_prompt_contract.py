@@ -235,7 +235,7 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertIn('python3 "$server" --selftest', RUN_PROMPT)
         self.assertLess(
             RUN_PROMPT.index('preflight_mcp "$mcp_server"'),
-            RUN_PROMPT.index("exec opencode run"),
+            RUN_PROMPT.index("set -- opencode run"),
         )
 
     def test_preflight_fails_loudly_without_printing_server_output(self) -> None:

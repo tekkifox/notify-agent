@@ -61,7 +61,11 @@ Default-deny rules
 
 Everything that could carry a secret is redacted from logs: the API key,
 webhook URL, channel id, author ids and the operator's message body are never
-printed.  Message ids are logged only as a short hash.
+printed.  Message ids are logged only as a short hash.  The agent's own output
+is not printed either: it goes to a private, size-capped capture file under the
+state directory, and only that path is logged.  The capture is treated as
+sensitive (it can echo model and tool output) and is never shipped to the
+container log.
 """
 
 from __future__ import annotations
@@ -83,8 +87,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
+
+# The capture helpers live beside this script.  They are imported directly so
+# the listener and run-prompt.sh share one transcript format.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import agent_capture  # noqa: E402  (path set up above)
 
 LOG = logging.getLogger("discord-inbound")
 
@@ -102,6 +114,9 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
 MIN_RUN_TIMEOUT_SECONDS = 30.0
 MAX_RUN_TIMEOUT_SECONDS = 3_600.0
 DEFAULT_STATE_FILE = "/home/agent/.local/share/opencode/discord-inbound-state.json"
+AGENT_LOG_NAME = agent_capture.DEBUG_LOG_NAME
+AGENT_LOG_MAX_BYTES = agent_capture.MAX_BYTES
+SEND_MARKER_PREFIX = ".discord-inbound-send-"
 STATE_VERSION = 1
 SEEN_ID_LIMIT = 500
 MESSAGE_PAGE_LIMIT = 100
@@ -1319,37 +1334,60 @@ def _terminate(process: subprocess.Popen[Any]) -> None:
         pass
 
 
-def run_agent(
+def agent_log_path(config: Config) -> Path:
+    """The shared debug transcript, under the state directory."""
+
+    return agent_capture.log_path(config.state_file.parent)
+
+
+def _finish_capture(thread: threading.Thread | None) -> None:
+    """Wait briefly for the log drain to see EOF after the agent exits."""
+
+    if thread is not None:
+        thread.join(timeout=5.0)
+
+
+def _new_send_marker(config: Config) -> Path:
+    """Reserve a unique, listener-owned send-record path for one attempt."""
+
+    return config.state_file.parent / (
+        f"{SEND_MARKER_PREFIX}{uuid.uuid4().hex}.marker"
+    )
+
+
+def _discard_send_marker(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _run_agent_once(
     config: Config,
+    chosen: InboundSource,
     instruction: str,
-    stop_event: threading.Event | None = None,
-    source: InboundSource | None = None,
-) -> bool:
-    """Run the notify agent once, non-interactively.
+    stop_event: threading.Event | None,
+) -> tuple[bool, bool]:
+    """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
 
-    stdout and stderr are discarded: the agent already sends its answer to
-    Discord, and discarding keeps model output (which could contain a mistake)
-    out of the listener's logs.  Only the exit status and duration are logged.
-
-    A source without a named target replies through the bot: notify.sh is
-    pinned to that source's channel and connected account for this run, so the
-    answer cannot go to another server.  The environment is rebuilt for every
-    run; the worker is single-threaded, so these values never race.
-    """
-
-    chosen = _resolve_source(config, source)
-
-    command = [
-        config.opencode_bin,
-        "run",
-        "--standalone",
-        "--agent",
-        "notify",
-        "--model",
-        config.opencode_model,
-        "--",
-        instruction,
-    ]
+    command = [config.opencode_bin, "run"]
+    if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
+        # Explicitly requested for one debugging run: provider-level detail.
+        # It is far too verbose to enable by default.
+        command.extend(["--print-logs", "--log-level", "debug"])
+    command.extend(
+        [
+            "--standalone",
+            "--agent",
+            "notify",
+            "--model",
+            config.opencode_model,
+            "--",
+            instruction,
+        ]
+    )
 
     environment = os.environ.copy()
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
@@ -1369,50 +1407,196 @@ def run_agent(
             {"channel_id": chosen.channel_id}, separators=(",", ":")
         )
 
+    marker = _new_send_marker(config)
+    environment["NOTIFY_SEND_MARKER"] = str(marker)
+
+    log_path = agent_log_path(config)
+    log_fd, budget = agent_capture.record_start(
+        log_path,
+        f"inbound:{chosen.name}",
+        config.opencode_model,
+        instruction,
+        max_bytes=AGENT_LOG_MAX_BYTES,
+    )
+    capture = log_fd is not None
+
     started = time.monotonic()
     try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if capture else subprocess.DEVNULL,
             env=environment,
             start_new_session=True,
             close_fds=True,
         )
     except OSError as error:
+        if log_fd is not None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+        agent_capture.record_end(
+            log_path,
+            "start-failed",
+            0.0,
+            False,
+            max_bytes=AGENT_LOG_MAX_BYTES,
+        )
+        _discard_send_marker(marker)
         LOG.error("agent could not start: %s", type(error).__name__)
-        return False
+        return False, False
+
+    drain: threading.Thread | None = None
+    if capture:
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+        else:
+            drain = threading.Thread(
+                target=agent_capture.drain_output,
+                args=(stream, log_fd, budget),
+                kwargs={"max_bytes": AGENT_LOG_MAX_BYTES},
+                name="discord-inbound-agent-log",
+                daemon=True,
+            )
+            drain.start()
+
+    def _finish(exit_code: int | str) -> tuple[bool, float]:
+        """Close the capture, then write the footer once."""
+
+        _finish_capture(drain)
+        elapsed = time.monotonic() - started
+        sent = marker.exists()
+        agent_capture.record_end(
+            log_path,
+            exit_code,
+            elapsed,
+            sent,
+            max_bytes=AGENT_LOG_MAX_BYTES,
+        )
+        return sent, elapsed
 
     try:
         while True:
             return_code = process.poll()
             if return_code is not None:
-                elapsed = time.monotonic() - started
+                sent, elapsed = _finish(return_code)
                 if return_code == 0:
-                    LOG.info("agent finished: exit=0 seconds=%.1f", elapsed)
+                    LOG.info(
+                        "agent finished: exit=0 seconds=%.1f sent=%s log=%s",
+                        elapsed,
+                        "yes" if sent else "no",
+                        log_path,
+                    )
                 else:
                     LOG.warning(
-                        "agent failed: exit=%s seconds=%.1f",
+                        "agent failed: exit=%s seconds=%.1f sent=%s log=%s",
                         return_code,
                         elapsed,
+                        "yes" if sent else "no",
+                        log_path,
                     )
-                return return_code == 0
+                return return_code == 0, sent
             if stop_event is not None and stop_event.is_set():
                 LOG.info("agent stopping: shutdown requested")
                 _terminate(process)
-                return False
+                _finish("stopped")
+                return False, False
             if time.monotonic() - started > config.run_timeout_seconds:
                 LOG.warning(
                     "agent timed out after %.0f seconds",
                     config.run_timeout_seconds,
                 )
                 _terminate(process)
-                return False
+                _finish("timeout")
+                return False, False
             time.sleep(0.5)
     except BaseException:
         _terminate(process)
+        _finish("interrupted")
         raise
+    finally:
+        _discard_send_marker(marker)
+
+
+def run_agent(
+    config: Config,
+    instruction: str,
+    stop_event: threading.Event | None = None,
+    source: InboundSource | None = None,
+) -> bool:
+    """Run the notify agent, retrying once when it exits without sending.
+
+    Every attempt's complete stdout and stderr go to the shared, size-capped
+    ``notify-debug.log`` under the state directory, framed by a header (time,
+    path, model and exact instruction) and a footer (exit code, duration and
+    whether a send was recorded).  Only the path is logged in the container
+    log, never the contents.  The file is private (mode 0600) and never
+    exceeds ``AGENT_LOG_MAX_BYTES``; excess output is drained and discarded.
+
+    A clean exit does not prove the agent delivered an answer.  ``notify.sh``
+    touches the per-attempt ``NOTIFY_SEND_MARKER`` path only on a confirmed
+    2xx send, so a missing marker after exit 0 means the run sent nothing.
+    That is logged as ``agent finished without sending`` and the same
+    instruction is retried exactly once; a second miss stops there.  A
+    non-zero exit keeps the previous behaviour and is not retried.  The retry
+    is still one queued instruction: the dedupe cursor is not involved, so no
+    message is replayed.
+
+    Set ``NOTIFY_DEBUG_LLM=1`` to pass ``--print-logs --log-level debug`` to
+    ``opencode run`` for one run being actively debugged.  It is off by default
+    because provider-level logs are very verbose.
+
+    A source without a named target replies through the bot: notify.sh is
+    pinned to that source's channel and connected account for this run, so the
+    answer cannot go to another server.  The environment is rebuilt for every
+    attempt; the worker is single-threaded, so these values never race.
+    """
+
+    chosen = _resolve_source(config, source)
+    log_path = agent_log_path(config)
+
+    clean_exit, sent = _run_agent_once(
+        config, chosen, instruction, stop_event
+    )
+    if not clean_exit:
+        return False
+    if sent:
+        return True
+
+    LOG.warning(
+        "agent finished without sending: source=%s log=%s; retrying once",
+        chosen.name,
+        log_path,
+    )
+    if stop_event is not None and stop_event.is_set():
+        LOG.info("agent retry skipped: shutdown requested")
+        return False
+
+    clean_exit, sent = _run_agent_once(
+        config, chosen, instruction, stop_event
+    )
+    if not clean_exit:
+        LOG.warning(
+            "agent retry failed: source=%s log=%s; not retrying again",
+            chosen.name,
+            log_path,
+        )
+        return False
+    if not sent:
+        LOG.error(
+            "agent retry finished without sending: source=%s log=%s; "
+            "not retrying again",
+            chosen.name,
+            log_path,
+        )
+        return False
+    return True
 
 
 class InstructionWorker:

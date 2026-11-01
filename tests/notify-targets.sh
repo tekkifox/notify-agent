@@ -53,7 +53,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fh.write(body)
         with open(os.path.join(captures, "req-%d.path" % index), "w") as fh:
             fh.write(self.path)
-        self.send_response(200)
+        # A path containing REJECT stands in for a remote refusal.
+        status = 500 if "REJECT" in self.path else 200
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b"{}")
@@ -521,6 +523,8 @@ fi
 # 13. A URL or code span does not evade the guard.
 before=$(count_requests)
 set +e
+# The backticks are literal message text, not a command substitution.
+# shellcheck disable=SC2016
 out=$(send_message admin-chat 'See `https://rossmoney.me/status` for details.' NOTIFY_TARGETS="$scoped_targets" 2>&1)
 rc=$?
 set -e
@@ -542,6 +546,97 @@ if [ "$rc" -ne 0 ] || [ "$after" -ne $((before + 1)) ]; then
     no "host-scope unscoped: other rejected a normal report: $out"
 else
     pass "an unscoped target is not host-guarded"
+fi
+
+# 15. NOTIFY_SEND_MARKER records a successful Composio send.
+marker="$tmp/marker-composio"
+rm -f "$marker"
+before=$(count_requests)
+set +e
+out=$(send NOTIFY_SEND_MARKER="$marker" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "send marker: notify.sh failed: $out"
+elif [ ! -f "$marker" ]; then
+    no "send marker: successful composio send did not write the marker"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "send marker: expected one request"
+else
+    pass "a successful composio send writes NOTIFY_SEND_MARKER"
+fi
+
+# 16. NOTIFY_SEND_MARKER also records a successful webhook send.
+marker="$tmp/marker-webhook"
+rm -f "$marker"
+before=$(count_requests)
+set +e
+out=$(send DISCORD_WEBHOOK_URL="$api_base/webhook" \
+    NOTIFY_SEND_MARKER="$marker" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "send marker webhook: notify.sh failed: $out"
+elif [ ! -f "$marker" ]; then
+    no "send marker webhook: successful send did not write the marker"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "send marker webhook: expected one request"
+else
+    pass "a successful webhook send writes NOTIFY_SEND_MARKER"
+fi
+
+# 17. A failed send writes no marker and still exits non-zero.
+marker="$tmp/marker-rejected"
+rm -f "$marker"
+before=$(count_requests)
+set +e
+out=$(send COMPOSIO_TOOL="REJECT" NOTIFY_SEND_MARKER="$marker" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -eq 0 ]; then
+    no "send marker failure: a rejected send exited 0"
+elif [ -e "$marker" ]; then
+    no "send marker failure: a rejected send wrote the marker"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "send marker failure: expected the rejected request to be attempted"
+else
+    pass "a rejected send writes no marker and keeps its non-zero exit"
+fi
+
+# 18. With the variable unset, nothing changes.
+before=$(count_requests)
+set +e
+out=$(send 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ] || [ "$after" -ne $((before + 1)) ]; then
+    no "send marker unset: notify.sh changed behaviour: $out"
+else
+    pass "no NOTIFY_SEND_MARKER means no behaviour change"
+fi
+
+# 19. An unwritable marker never turns a delivered message into a failure.
+marker="$tmp/no-such-directory/marker"
+before=$(count_requests)
+set +e
+out=$(send NOTIFY_SEND_MARKER="$marker" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "send marker unwritable: a delivered send exited non-zero: $out"
+elif [ -e "$marker" ]; then
+    no "send marker unwritable: the marker unexpectedly exists"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "send marker unwritable: expected one request"
+elif ! contains "$out" "warning: could not record the send marker"; then
+    no "send marker unwritable: no warning was printed"
+else
+    pass "an unwritable marker does not change the exit status"
 fi
 
 if [ "$failures" -ne 0 ]; then

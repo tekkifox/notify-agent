@@ -26,11 +26,27 @@ cat > "$tmp/bin/opencode" <<'SH'
 #!/bin/sh
 for arg do last=$arg; done
 printf '%s' "$last" > "$CAPTURE"
+if [ -n "${CAPTURE_ARGS:-}" ]; then
+    printf '%s\n' "$@" > "$CAPTURE_ARGS"
+fi
 if [ -n "${CAPTURE_ENV:-}" ]; then
     printf '%s' "${NOTIFY_CONTENT_DISABLED-}" > "$CAPTURE_ENV"
 fi
 if [ -n "${CAPTURE_SCOPE:-}" ]; then
     printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
+fi
+if [ -n "${CAPTURE_OUTPUT:-}" ]; then
+    printf 'agent stdout line\n'
+    printf 'agent stderr line\n' >&2
+fi
+if [ -n "${CAPTURE_BYTES:-}" ]; then
+    dd if=/dev/zero bs=1024 count="$CAPTURE_BYTES" 2>/dev/null
+fi
+if [ -n "${CAPTURE_MARKER:-}" ] && [ -n "${NOTIFY_SEND_MARKER:-}" ]; then
+    : > "$NOTIFY_SEND_MARKER"
+fi
+if [ -n "${CAPTURE_EXIT:-}" ]; then
+    exit "$CAPTURE_EXIT"
 fi
 SH
 chmod +x "$tmp/bin/opencode"
@@ -379,6 +395,118 @@ elif contains "$err" "selftest-secret"; then
     no "MCP preflight: self-test failure leaked the environment"
 else
     pass "MCP preflight fails before opencode when Oracle is unreachable"
+fi
+
+# 12. The shared transcript frames the run: path, model, exact prompt and
+#     output, then a footer with exit code, duration and the send marker.
+data="$tmp/data"
+set +e
+capture "$tmp/transcript" \
+    XDG_DATA_HOME="$data" \
+    CAPTURE_ARGS="$tmp/transcript.args" \
+    CAPTURE_OUTPUT=1 \
+    CAPTURE_MARKER=1 \
+    "$run_prompt" -t general "Compose a status message."
+rc=$?
+set -e
+log="$data/opencode/notify-debug.log"
+if [ "$rc" -ne 0 ]; then
+    no "transcript: run-prompt.sh failed: $(cat "$tmp/transcript.stderr")"
+elif [ ! -f "$log" ]; then
+    no "transcript: no debug log was written"
+else
+    output=$(cat "$log")
+    if ! contains "$output" "path: schedule:general"; then
+        no "transcript: header did not name the path"
+    elif ! contains "$output" "model: test/model"; then
+        no "transcript: header did not name the model"
+    elif ! contains "$output" "instruction:"; then
+        no "transcript: header did not introduce the instruction"
+    elif ! contains "$output" "Compose a status message."; then
+        no "transcript: header lost the prompt"
+    elif ! contains "$output" "The target for this run is \`general\`"; then
+        no "transcript: header did not carry the full prompt"
+    elif ! contains "$output" "agent stdout line"; then
+        no "transcript: stdout was not captured"
+    elif ! contains "$output" "agent stderr line"; then
+        no "transcript: stderr was not captured"
+    elif ! contains "$output" "--- run end: exit=0"; then
+        no "transcript: footer did not record the exit code"
+    elif ! contains "$output" "duration="; then
+        no "transcript: footer did not record the duration"
+    elif ! contains "$output" "sent=yes"; then
+        no "transcript: footer did not record the send"
+    else
+        pass "the transcript has a header, output and a send-aware footer"
+    fi
+fi
+
+# 13. Deep provider logging is off by default.
+if contains "$(cat "$tmp/transcript.args")" "--print-logs" \
+    || contains "$(cat "$tmp/transcript.args")" "--log-level"; then
+    no "deep mode: provider logging was enabled by default"
+else
+    pass "deep provider logging is off by default"
+fi
+
+# 14. NOTIFY_DEBUG_LLM=1 adds --print-logs and --log-level debug.
+set +e
+capture "$tmp/deep" \
+    XDG_DATA_HOME="$tmp/data-deep" \
+    CAPTURE_ARGS="$tmp/deep.args" \
+    NOTIFY_DEBUG_LLM=1 \
+    "$run_prompt" -t general "Compose a status message."
+rc=$?
+set -e
+args=$(cat "$tmp/deep.args")
+if [ "$rc" -ne 0 ]; then
+    no "deep mode: run-prompt.sh failed: $(cat "$tmp/deep.stderr")"
+elif ! contains "$args" "--print-logs"; then
+    no "deep mode: --print-logs was not passed"
+elif ! contains "$args" "--log-level"; then
+    no "deep mode: --log-level was not passed"
+elif ! contains "$args" "debug"; then
+    no "deep mode: the debug level was not passed"
+else
+    pass "NOTIFY_DEBUG_LLM=1 adds provider logging"
+fi
+
+# 15. A failed run still gets a footer with its exit code and sent=no.
+set +e
+capture "$tmp/failed" \
+    XDG_DATA_HOME="$tmp/data-failed" \
+    CAPTURE_EXIT=3 \
+    CAPTURE_OUTPUT=1 \
+    "$run_prompt" "Compose a status message."
+rc=$?
+set -e
+output=$(cat "$tmp/data-failed/opencode/notify-debug.log" 2>/dev/null || true)
+if [ "$rc" -eq 0 ]; then
+    no "transcript failure: run-prompt.sh exited 0"
+elif ! contains "$output" "--- run end: exit=3"; then
+    no "transcript failure: footer did not record the exit code"
+elif ! contains "$output" "sent=no"; then
+    no "transcript failure: footer did not record the missing send"
+else
+    pass "a failed run records its exit code and sent=no"
+fi
+
+# 16. Output past the cap is drained, and the transcript stays bounded.
+set +e
+capture "$tmp/bounded" \
+    XDG_DATA_HOME="$tmp/data-bounded" \
+    CAPTURE_BYTES=300 \
+    "$run_prompt" "Compose a status message."
+rc=$?
+set -e
+log="$tmp/data-bounded/opencode/notify-debug.log"
+size=$(wc -c < "$log" 2>/dev/null | tr -d ' ' || true)
+if [ "$rc" -ne 0 ]; then
+    no "transcript cap: run-prompt.sh failed: $(cat "$tmp/bounded.stderr")"
+elif [ -z "$size" ] || [ "$size" -gt 262144 ]; then
+    no "transcript cap: log grew past 256 KiB (size=${size:-unknown})"
+else
+    pass "the transcript stays bounded when output is large"
 fi
 
 if [ "$failures" -ne 0 ]; then

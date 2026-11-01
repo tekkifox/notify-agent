@@ -11,9 +11,11 @@ Run with:
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,8 @@ ALLOWED = "222222222222222222"
 OTHER_ALLOWED = "333333333333333333"
 DISALLOWED = "444444444444444444"
 ACCOUNT = "ca_test_account"
+# /bin/true exists on the Linux image but not on every development host.
+TRUE_BIN = shutil.which("true") or "/bin/true"
 
 
 def base_env(tmpdir: str) -> dict[str, str]:
@@ -59,7 +63,7 @@ def base_env(tmpdir: str) -> dict[str, str]:
             }
         ),
         "OPENCODE_MODEL": "test/model",
-        "OPENCODE_BIN": "/bin/true",
+        "OPENCODE_BIN": TRUE_BIN,
         "NOTIFY_INBOUND_STATE_FILE": str(pathlib.Path(tmpdir) / "state.json"),
         "NOTIFY_INBOUND_POLL_SECONDS": "5",
         "NOTIFY_INBOUND_MAX_INSTRUCTION_CHARS": "1000",
@@ -553,10 +557,15 @@ class ReplyRoutingTests(unittest.TestCase):
             "NOTIFY_CONTENT_DISABLED": "1",
         }
         with mock.patch.dict(os.environ, base, clear=False):
+            def fake(command: object, **kwargs: object) -> FakeProcess:
+                marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+                pathlib.Path(marker).write_text("", encoding="utf-8")
+                return FakeProcess(0)
+
             with mock.patch.object(
                 discord_inbound.subprocess,
                 "Popen",
-                return_value=FakeProcess(0),
+                side_effect=fake,
             ) as popen:
                 self.assertTrue(
                     discord_inbound.run_agent(
@@ -1066,9 +1075,12 @@ class ToolTests(unittest.TestCase):
 
 
 class FakeProcess:
-    def __init__(self, returncode: int = 0) -> None:
+    def __init__(
+        self, returncode: int = 0, stdout: object | None = None
+    ) -> None:
         self.returncode = returncode
         self.pid = 12345
+        self.stdout = stdout
 
     def poll(self) -> int:
         return self.returncode
@@ -1085,16 +1097,25 @@ class RunAgentTests(unittest.TestCase):
         self.config = discord_inbound.load_config(self.env)
 
     def test_command_shape_and_content_disabled(self) -> None:
-        with mock.patch.object(
-            discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
-        ) as popen:
-            result = discord_inbound.run_agent(self.config, "instruction text")
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(0)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ) as popen:
+                result = discord_inbound.run_agent(
+                    self.config, "instruction text"
+                )
         self.assertTrue(result)
         command = popen.call_args.args[0]
         self.assertEqual(
             command,
             [
-                "/bin/true",
+                TRUE_BIN,
                 "run",
                 "--standalone",
                 "--agent",
@@ -1108,6 +1129,9 @@ class RunAgentTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["NOTIFY_CONTENT_DISABLED"], "1")
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertIn("NOTIFY_SEND_MARKER", environment)
 
     def test_content_flag_is_not_exported_for_an_allowing_target(self) -> None:
         env = dict(self.env)
@@ -1122,11 +1146,173 @@ class RunAgentTests(unittest.TestCase):
                 discord_inbound.run_agent(config, "instruction")
         self.assertNotIn("NOTIFY_CONTENT_DISABLED", popen.call_args.kwargs["env"])
 
+    def _popen_side_effect(
+        self, attempts: list[tuple[int, bool]]
+    ) -> tuple[object, list[dict[str, object]]]:
+        """Simulate attempts; the second tuple item touches the marker."""
+
+        pending = list(attempts)
+        calls: list[dict[str, object]] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            returncode, send = pending.pop(0)
+            calls.append({"command": command, "env": kwargs["env"]})
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            if send:
+                pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(returncode)
+
+        return fake, calls
+
     def test_nonzero_exit_is_reported(self) -> None:
         with mock.patch.object(
             discord_inbound.subprocess, "Popen", return_value=FakeProcess(2)
         ):
             self.assertFalse(discord_inbound.run_agent(self.config, "instruction"))
+
+    def test_exit_zero_without_a_marker_is_logged_and_retried_once(self) -> None:
+        side_effect, calls = self._popen_side_effect([(0, False), (0, True)])
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with self.assertLogs("discord-inbound", level="INFO") as logs:
+                result = discord_inbound.run_agent(
+                    self.config, "instruction"
+                )
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        output = "\n".join(logs.output)
+        self.assertIn("agent finished without sending", output)
+        self.assertIn(discord_inbound.AGENT_LOG_NAME, output)
+
+        markers = [
+            pathlib.Path(call["env"]["NOTIFY_SEND_MARKER"])  # type: ignore[index]
+            for call in calls
+        ]
+        self.assertNotEqual(markers[0], markers[1])
+        for marker in markers:
+            self.assertFalse(marker.exists())
+
+    def test_exit_zero_with_a_marker_is_not_retried(self) -> None:
+        side_effect, calls = self._popen_side_effect([(0, True)])
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            result = discord_inbound.run_agent(self.config, "instruction")
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_second_missing_marker_stops_after_two_attempts(self) -> None:
+        side_effect, calls = self._popen_side_effect([(0, False), (0, False)])
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with self.assertLogs("discord-inbound", level="INFO") as logs:
+                result = discord_inbound.run_agent(
+                    self.config, "instruction"
+                )
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 2)
+        output = "\n".join(logs.output)
+        self.assertIn("agent finished without sending", output)
+        self.assertIn("agent retry finished without sending", output)
+
+    def test_nonzero_exit_is_not_retried_even_without_a_marker(self) -> None:
+        side_effect, calls = self._popen_side_effect([(2, False)])
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            result = discord_inbound.run_agent(self.config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_agent_output_is_captured_privately_and_only_the_path_is_logged(
+        self,
+    ) -> None:
+        stream = io.BytesIO(b"model output that must not reach the log\n")
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(0, stdout=stream)
+
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=fake
+        ):
+            with self.assertLogs("discord-inbound", level="INFO") as logs:
+                self.assertTrue(
+                    discord_inbound.run_agent(self.config, "instruction")
+                )
+
+        log_path = discord_inbound.agent_log_path(self.config)
+        self.assertTrue(log_path.exists())
+        self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn("path: inbound:default", text)
+        self.assertIn("model: test/model", text)
+        self.assertIn("instruction:\ninstruction", text)
+        self.assertIn("--- agent output ---", text)
+        self.assertIn("model output", text)
+        self.assertIn("--- run end: exit=0", text)
+        self.assertIn("sent=yes", text)
+        self.assertLess(
+            text.index("instruction:\ninstruction"),
+            text.index("model output"),
+        )
+        self.assertLess(
+            text.index("model output"), text.index("--- run end:")
+        )
+        output = "\n".join(logs.output)
+        self.assertIn(str(log_path), output)
+        self.assertNotIn("model output", output)
+
+    def test_agent_output_log_is_capped_and_notes_the_truncation(self) -> None:
+        limit = 1024
+        payload = b"x" * 2000
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(0, stdout=io.BytesIO(payload))
+
+        with mock.patch.object(
+            discord_inbound, "AGENT_LOG_MAX_BYTES", limit
+        ):
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=fake
+            ):
+                self.assertTrue(
+                    discord_inbound.run_agent(self.config, "instruction")
+                )
+
+        log_path = discord_inbound.agent_log_path(self.config)
+        raw = log_path.read_bytes()
+        self.assertLessEqual(len(raw), limit)
+        self.assertIn(b"path: inbound:default", raw)
+        self.assertIn(b"truncated", raw)
+        self.assertIn(b"--- run end: exit=0", raw)
+
+    def test_debug_llm_is_off_by_default(self) -> None:
+        side_effect, calls = self._popen_side_effect([(0, True)])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOTIFY_DEBUG_LLM", None)
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=side_effect
+            ):
+                discord_inbound.run_agent(self.config, "instruction")
+        self.assertNotIn("--print-logs", calls[0]["command"])
+
+    def test_debug_llm_adds_provider_logging_when_requested(self) -> None:
+        side_effect, calls = self._popen_side_effect([(0, True)])
+        with mock.patch.dict(os.environ, {"NOTIFY_DEBUG_LLM": "1"}):
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen", side_effect=side_effect
+            ):
+                discord_inbound.run_agent(self.config, "instruction")
+        command = calls[0]["command"]
+        self.assertIn("--print-logs", command)
+        self.assertIn("--log-level", command)
+        self.assertIn("debug", command)
 
 
 class IngestTests(unittest.TestCase):

@@ -18,8 +18,9 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
 | `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
-| `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent. |
+| `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent and captures the debug transcript. |
 | `scripts/discord_inbound.py` | Optional inbound listener: polls one or more Discord sources, authorises replies and runs the same agent once each. |
+| `scripts/agent_capture.py` | Shared bounded debug transcript: header, agent output, send-aware footer; used by both run paths. |
 | `scripts/entrypoint.sh` | Compose dispatcher and supervisor: without args runs supercronic and the listener independently, with args runs the command. |
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
@@ -29,7 +30,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
 | `tests/test_ssh_probe.py` | SSH policy, scope, failure-class, timeout, selftest and protocol tests; no live connection. |
 | `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every threshold, SSH lines and truncation. |
-| `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, length, queue and refusal-path tests; no network or model required. |
+| `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue and refusal-path tests; no network or model required. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -602,7 +603,7 @@ Schedules are **trusted operator configuration**, not user input. The agent runs
 docker compose logs -f --tail=100 agent
 ```
 
-Supercronic logs each job start and exit to the container log, and OpenCode's final response goes to stdout. Delivery results and short failure reasons also appear there. A failed host-statistics query is reported on stdout only; it is never sent to the notification channel. The MCP readiness preflight fails the job before OpenCode starts and prints only the server path, never its output or environment. Logs contain message text and model output; they do **not** contain the webhook URL or API keys. Treat logs as sensitive. Compose caps them at 3 × 10 MB.
+Supercronic logs each job start and exit to the container log, and delivery results and short failure reasons also appear there. The agent's own stdout and stderr go to the bounded `notify-debug.log` transcript instead (see [Agent output and the debug transcript](#agent-output-and-the-debug-transcript)), so routine container logs no longer carry model output. A failed host-statistics query is reported in that transcript only; it is never sent to the notification channel. The MCP readiness preflight fails the job before OpenCode starts and prints only the server path, never its output or environment. The container log does **not** contain the webhook URL or API keys, and the transcript adds only what the agent itself printed. Treat both as sensitive. Compose caps the container log at 3 × 10 MB.
 
 A failed job exits non-zero and is visible in the log, but there is no automatic retry. If you need retries, add them at the schedule level (for example a second prompt) rather than hiding failures.
 
@@ -622,6 +623,10 @@ A failed job exits non-zero and is visible in the log, but there is no automatic
 - Otherwise uses Composio when both `COMPOSIO_API_KEY` and `COMPOSIO_TOOL` are set.
 - Otherwise exits `1` with a short reason.
 - Truncates to 2,000 Unicode characters before sending, and says so on stderr.
+- Honours optional `NOTIFY_SEND_MARKER`: when set, a confirmed 2xx send touches
+  that path. The inbound listener uses it to detect a run that delivered
+  nothing. Unset is a no-op, a failed send never writes it, and an unwritable
+  marker only warns without changing the exit status.
 - Sends `allowed_mentions: {parse: []}`, so `@everyone`, `@here`, and role pings are suppressed.
 - Exits non-zero on network errors, rate limits, and non-2xx responses. It never prints the webhook URL, target ids, or API key.
 - Does not follow redirects and requires `https://`.
@@ -962,6 +967,66 @@ a command path into an agent with database access. A backlog larger than
 `20 * 100` messages is truncated with a `backlog truncated` warning; the
 listener does not buffer unbounded history.
 
+### Agent output and the debug transcript
+
+Both run paths write the agent's complete stdout and stderr to one shared
+transcript, `notify-debug.log`, under the OpenCode data directory:
+`$XDG_DATA_HOME/opencode/notify-debug.log`, defaulting to
+`/home/agent/.local/share/opencode/notify-debug.log`. The inbound listener
+derives the same directory from `NOTIFY_INBOUND_STATE_FILE`, which defaults to
+that path; `run-prompt.sh` derives it from `XDG_DATA_HOME` (falling back to
+`$HOME/.local/share`). That is the writable `opencode-data` volume.
+
+Each attempt is self-describing:
+
+```text
+===== notify run 2026-11-01T14:05:06Z =====
+path: inbound:vortex-admin
+model: provider/model
+instruction:
+<the exact instruction or prompt sent to the agent>
+--- agent output ---
+<the agent's stdout and stderr>
+--- run end: exit=0 duration=29.5s sent=no ---
+```
+
+The footer records the exit code, duration and whether `notify.sh` confirmed a
+send through `NOTIFY_SEND_MARKER` (`sent=yes`, `sent=no`, or `sent=unknown`
+when no marker path could be created). Inbound retries each get their own
+header and footer in the same file. Read it with, for example:
+
+```sh
+docker compose exec agent tail -n 200 \
+  /home/agent/.local/share/opencode/notify-debug.log
+```
+
+The file is mode `0600` and capped at 256 KiB. When it is nearly full it is
+reset before the next run, and output past the cap is drained and discarded
+with a truncation note, so it never grows without limit. Only the path is
+written to the container log, never the contents. **The transcript contains
+the operator's instructions, model output and host data, so treat it as
+internal.** It does not add anything the agent itself did not print.
+
+### Deep provider logging
+
+Set `NOTIFY_DEBUG_LLM=1` for a run that is being actively debugged. Both run
+paths then pass `--print-logs --log-level debug` to `opencode run`, adding
+provider request and server detail to the same transcript (or to stderr when
+the transcript is unavailable). It is off by default because those logs are
+very verbose: a single run can produce far more output than a normal one, so
+the 256 KiB cap will be reached quickly and older detail will be dropped.
+Unset it once debugging is finished.
+
+### A run that sends nothing
+
+A zero exit is not proof of delivery. For every inbound attempt the listener
+sets `NOTIFY_SEND_MARKER` to a unique path, and `notify.sh` touches it only
+after a confirmed 2xx send. If the agent exits 0 and the marker is missing, the
+listener logs `agent finished without sending: source=... log=...; retrying
+once` and runs the same instruction one more time. A second miss logs
+`agent retry finished without sending` and stops; a non-zero exit is unchanged.
+The retry is still one queued instruction, so the dedupe cursor is not touched.
+
 ### Supervisor
 
 `scripts/entrypoint.sh` starts supercronic and the listener as separate
@@ -1102,12 +1167,12 @@ Verified while building this branch:
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
-- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `rossmoney.me` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **228 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`.
+- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `rossmoney.me` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **236 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), and `NOTIFY_DEBUG_LLM` being off by default and opt-in.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
-- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED`; malformed values fail before the agent runs. The MCP preflight cases still pass.
-- `python3 -m py_compile` passes on `mcp/ssh_probe.py`, `mcp/host_report.py`, `tests/test_ssh_probe.py` and `tests/test_host_report.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
+- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED`; malformed values fail before the agent runs. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
+- `python3 -m py_compile` passes on `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
 - `opencode.json` statically registers both MCP servers (`oracle` and `ssh`), gives both the same 60-second startup/execution budget, keeps the global `ssh_probe` deny, and allows `ssh_probe` for `notify`.
 
 Not verified here (no credentials, no live hosts, no Docker daemon use):
