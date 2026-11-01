@@ -119,7 +119,7 @@ Morning digest:
 
     **Host report** — YYYY-MM-DD HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] rossmoney.me: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
+    - [!] host1.example.com: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
 
     The header line is the UTC date and time of this run. The summary line
     counts all hosts in the report, including known hosts with no samples.

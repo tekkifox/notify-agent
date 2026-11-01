@@ -57,7 +57,7 @@ def base_env(tmpdir: str) -> dict[str, str]:
                 "admin-chat": {
                     "channel_id": CHANNEL,
                     "connected_account_id": ACCOUNT,
-                    "host_scope": "vortexservers.co.uk",
+                    "host_scope": "host3.example.com",
                     "allow_content": False,
                 }
             }
@@ -107,7 +107,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.target.name, "admin-chat")
         self.assertEqual(config.target.connected_account_id, ACCOUNT)
         self.assertFalse(config.target.allow_content)
-        self.assertIn("vortexservers.co.uk", config.target.host_scope)
+        self.assertIn("host3.example.com", config.target.host_scope)
 
     def test_empty_allowlist_refuses_to_start(self) -> None:
         with self.assertRaises(discord_inbound.ConfigError):
@@ -1446,7 +1446,7 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(len(enqueued), 1)
         self.assertIn("what is the disk usage?", enqueued[0])
         self.assertIn("/app/scripts/notify.sh -t admin-chat", enqueued[0])
-        self.assertIn("vortexservers.co.uk", enqueued[0])
+        self.assertIn("host3.example.com", enqueued[0])
         self.assertIn("Report host data only", enqueued[0])
         self.assertTrue(self.store.is_seen("900000000000000001"))
 
