@@ -49,10 +49,11 @@ import os
 import re
 import sys
 import tempfile
+import time
 from typing import Any, Iterator, Sequence
 
 SERVER_NAME = "notify-oracle"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 PROTOCOL_VERSIONS = (
     "2024-11-05",
     "2025-03-26",
@@ -67,6 +68,25 @@ MAX_RESPONSE_BYTES = 128 * 1024
 MAX_SQL_CHARS = 100_000
 CALL_TIMEOUT_MS = 15_000
 CONNECT_TIMEOUT_SECONDS = 10
+
+# A single connection blip should not fail a notification run. Only these
+# codes are retried; SQL, permission and audience errors are permanent and are
+# returned immediately so the agent does not hide them behind a retry.
+TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "ORA-03113",
+        "ORA-03114",
+        "ORA-03135",
+        "ORA-12170",
+        "ORA-12537",
+        "ORA-12541",
+        "DPY-6005",
+        "DPY-4011",
+    }
+)
+RETRY_DELAY_SECONDS = 1.0
+ERROR_CODE_PATTERN = re.compile(r"(?:ORA-\d{5}|DPY-\d{4})")
+SELFTEST_SQL = "SELECT 1 FROM dual"
 
 # Content search. The result set is tiny on purpose: it feeds one short
 # notification, so chunks are shortened and the model cannot ask for more than
@@ -203,6 +223,10 @@ class SearchInputError(ValueError):
 
 class ConfigError(RuntimeError):
     """Connection settings are missing or the wallet is not mounted."""
+
+
+class SelftestError(RuntimeError):
+    """The selftest connection worked but the probe query did not."""
 
 
 def _lex(sql: str) -> list[str]:
@@ -576,13 +600,60 @@ def _stdin_guarded() -> Iterator[None]:
             os.close(devnull)
 
 
-def _safe_error(exc: BaseException) -> str:
-    """Return a short error that cannot contain a DSN, password or wallet."""
+def error_code(exc: BaseException) -> str | None:
+    """Return the first ORA/DPY code in the exception, or None.
 
-    match = re.search(r"ORA-\d{5}", str(exc))
-    if match:
-        return f"oracle error {match.group(0)}"
-    return "oracle query failed"
+    The code alone is safe to return: it is a fixed database/driver identifier
+    and never contains the DSN, user, password or wallet path.
+    """
+
+    match = ERROR_CODE_PATTERN.search(str(exc))
+    return match.group(0) if match else None
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Return true only for the transient connection codes we retry."""
+
+    return error_code(exc) in TRANSIENT_ERROR_CODES
+
+
+def _safe_error(exc: BaseException) -> tuple[str, str | None, bool]:
+    """Return (message, code, retryable) without leaking connection details."""
+
+    code = error_code(exc)
+    if code:
+        return f"oracle error {code}", code, code in TRANSIENT_ERROR_CODES
+    return "oracle query failed", None, False
+
+
+def _error_payload(
+    message: str,
+    code: str | None = None,
+    retryable: bool = False,
+) -> str:
+    """Serialise a tool error with its code and retry classification."""
+
+    return _dumps(
+        {"error": message, "code": code, "retryable": retryable}
+    )
+
+
+def _with_retry(operation: Any) -> Any:
+    """Run one database operation, retrying a transient failure once.
+
+    A permanent failure propagates immediately. A transient failure is retried
+    after a short pause; if the retry also fails, that exception propagates and
+    the caller reports it as retryable so the agent can distinguish a database
+    blip from bad SQL or a permission error.
+    """
+
+    try:
+        return operation()
+    except Exception as exc:
+        if not is_retryable(exc):
+            raise
+        time.sleep(RETRY_DELAY_SECONDS)
+        return operation()
 
 
 @contextlib.contextmanager
@@ -631,10 +702,8 @@ def _connection(config: _Config) -> Iterator[Any]:
                     pass
 
 
-def _run_query(statement: str) -> str:
-    # Validate configuration before importing the driver so a missing wallet
-    # fails with a clear, secret-free message even in a bare test environment.
-    config = _config()
+def _query_once(config: _Config, statement: str) -> str:
+    """Connect and run one statement. The caller owns retry policy."""
 
     with _connection(config) as cursor:
         cursor.execute(statement)
@@ -646,6 +715,14 @@ def _run_query(statement: str) -> str:
         rows = [[value for value in row] for row in fetched[:MAX_ROWS]]
 
         return _fit_response(columns, rows, truncated)
+
+
+def _run_query(statement: str) -> str:
+    # Validate configuration before importing the driver so a missing wallet
+    # fails with a clear, secret-free message even in a bare test environment.
+    # Configuration errors are permanent and are not retried.
+    config = _config()
+    return _with_retry(lambda: _query_once(config, statement))
 
 
 def _search_results(
@@ -672,8 +749,8 @@ def _search_results(
     return results
 
 
-def _run_search(query: str, limit: int) -> str:
-    config = _config()
+def _search_once(config: _Config, query: str, limit: int) -> str:
+    """Connect and run the fixed search. The caller owns retry policy."""
 
     with _connection(config) as cursor:
         # The query text and the limit are bind variables. Never interpolate
@@ -686,20 +763,26 @@ def _run_search(query: str, limit: int) -> str:
         return _fit_search_response(_search_results(columns, fetched), limit)
 
 
+def _run_search(query: str, limit: int) -> str:
+    config = _config()
+    return _with_retry(lambda: _search_once(config, query, limit))
+
+
 def call_query(sql: Any) -> tuple[str, bool]:
     """Return (text, is_error) for one tools/call invocation."""
 
     try:
         statement = prepare_sql(sql)
     except SqlGuardError as exc:
-        return _dumps({"error": str(exc)}), True
+        return _error_payload(str(exc)), True
 
     try:
         return _run_query(statement), False
     except ConfigError as exc:
-        return _dumps({"error": str(exc)}), True
+        return _error_payload(str(exc)), True
     except Exception as exc:
-        return _dumps({"error": _safe_error(exc)}), True
+        message, code, retryable = _safe_error(exc)
+        return _error_payload(message, code, retryable), True
 
 
 def content_disabled() -> bool:
@@ -712,25 +795,85 @@ def call_search_content(query: Any, limit: Any = None) -> tuple[str, bool]:
     """Return (text, is_error) for one search_content invocation."""
 
     if content_disabled():
-        return _dumps({"error": CONTENT_DISABLED_ERROR}), True
+        return _error_payload(CONTENT_DISABLED_ERROR), True
 
     try:
         text = prepare_search_query(query)
     except SearchInputError as exc:
-        return _dumps({"error": str(exc)}), True
+        return _error_payload(str(exc)), True
 
     effective_limit = clamp_limit(limit)
     try:
         return _run_search(text, effective_limit), False
     except ConfigError as exc:
-        return _dumps({"error": str(exc)}), True
+        return _error_payload(str(exc)), True
     except Exception as exc:
-        return _dumps({"error": _safe_error(exc)}), True
+        message, code, retryable = _safe_error(exc)
+        return _error_payload(message, code, retryable), True
+
+
+def _selftest_once(config: _Config) -> None:
+    """Connect and run one trivial query. The caller owns retry policy."""
+
+    with _connection(config) as cursor:
+        cursor.execute(SELFTEST_SQL)
+        row = cursor.fetchone()
+    if not row or row[0] != 1:
+        raise SelftestError("probe query returned an unexpected result")
+
+
+def selftest() -> int:
+    """Open a connection and run SELECT 1 FROM dual.
+
+    Prints one short, secret-free line and returns 0 on success or 1 on
+    failure. It is used by the run-prompt preflight so a database that cannot
+    be reached fails the run before OpenCode starts.
+    """
+
+    try:
+        config = _config()
+    except ConfigError as exc:
+        print(f"selftest failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        _with_retry(lambda: _selftest_once(config))
+    except (ConfigError, SelftestError) as exc:
+        print(f"selftest failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        message, _code, _retryable = _safe_error(exc)
+        print(f"selftest failed: {message}", file=sys.stderr)
+        return 1
+
+    print("selftest: ok")
+    return 0
+
+
+def _silence_stdout() -> None:
+    """Point stdout at /dev/null so interpreter shutdown cannot complain."""
+
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(devnull)
 
 
 def _write(message: dict[str, Any]) -> None:
-    sys.stdout.write(_dumps(message) + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(_dumps(message) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        # The client closed the pipe. End quietly instead of printing a
+        # traceback into the cron log.
+        _silence_stdout()
+        raise SystemExit(0)
 
 
 def _result(request_id: Any, result: Any) -> None:
@@ -825,7 +968,14 @@ def _handle(request: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    for line in sys.stdin:
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except (BrokenPipeError, OSError, ValueError):
+            # A closed or unusable stdin is a normal end of stream.
+            return 0
+        if not line:
+            return 0
         line = line.strip()
         if not line:
             continue
@@ -847,6 +997,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+        sys.exit(selftest())
     try:
         sys.exit(main())
     except KeyboardInterrupt:

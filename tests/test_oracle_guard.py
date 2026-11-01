@@ -10,10 +10,13 @@ Run with:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import types
@@ -695,7 +698,14 @@ class SearchExecutionTests(unittest.TestCase):
             )
         )
         self.assertTrue(is_error)
-        self.assertEqual(json.loads(text), {"error": "oracle error ORA-01017"})
+        self.assertEqual(
+            json.loads(text),
+            {
+                "error": "oracle error ORA-01017",
+                "code": "ORA-01017",
+                "retryable": False,
+            },
+        )
         for secret in ("hunter2", "secret-db", "dsn", "/wallet"):
             self.assertNotIn(secret, text)
 
@@ -704,7 +714,14 @@ class SearchExecutionTests(unittest.TestCase):
             connect_error=Exception("password=hunter2 at secret-db")
         )
         self.assertTrue(is_error)
-        self.assertEqual(json.loads(text), {"error": "oracle query failed"})
+        self.assertEqual(
+            json.loads(text),
+            {
+                "error": "oracle query failed",
+                "code": None,
+                "retryable": False,
+            },
+        )
         self.assertNotIn("hunter2", text)
         self.assertNotIn("secret-db", text)
 
@@ -720,12 +737,20 @@ class SearchExecutionTests(unittest.TestCase):
     def test_invalid_input_is_a_tool_error(self) -> None:
         text, is_error = oracle_query.call_search_content("   ")
         self.assertTrue(is_error)
-        self.assertEqual(json.loads(text), {"error": "query is empty"})
+        self.assertEqual(
+            json.loads(text),
+            {"error": "query is empty", "code": None, "retryable": False},
+        )
 
         text, is_error = oracle_query.call_search_content(None)
         self.assertTrue(is_error)
         self.assertEqual(
-            json.loads(text), {"error": "query must be a string"}
+            json.loads(text),
+            {
+                "error": "query must be a string",
+                "code": None,
+                "retryable": False,
+            },
         )
 
 
@@ -739,7 +764,12 @@ class ContentDisabledTests(unittest.TestCase):
             text, is_error = oracle_query.call_search_content("storage servers")
         self.assertTrue(is_error)
         self.assertEqual(
-            json.loads(text), {"error": oracle_query.CONTENT_DISABLED_ERROR}
+            json.loads(text),
+            {
+                "error": oracle_query.CONTENT_DISABLED_ERROR,
+                "code": None,
+                "retryable": False,
+            },
         )
         self.assertNotIn("storage servers", text)
 
@@ -772,6 +802,273 @@ class ContentDisabledTests(unittest.TestCase):
         # exactly as it did before this guard existed.
         self.assertTrue(is_error)
         self.assertIn("not configured", text)
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    """The agent must be able to tell a blip from a permanent failure."""
+
+    def test_transient_codes_are_retryable(self) -> None:
+        for code in sorted(oracle_query.TRANSIENT_ERROR_CODES):
+            with self.subTest(code=code):
+                exc = Exception(f"{code}: connection lost")
+                self.assertEqual(oracle_query.error_code(exc), code)
+                self.assertTrue(oracle_query.is_retryable(exc))
+                message, parsed_code, retryable = oracle_query._safe_error(exc)
+                self.assertEqual(message, f"oracle error {code}")
+                self.assertEqual(parsed_code, code)
+                self.assertTrue(retryable)
+
+    def test_permanent_codes_are_not_retryable(self) -> None:
+        for code in ("ORA-00933", "ORA-00942", "ORA-01031", "ORA-01017"):
+            with self.subTest(code=code):
+                exc = Exception(f"{code}: permanent failure")
+                self.assertEqual(oracle_query.error_code(exc), code)
+                self.assertFalse(oracle_query.is_retryable(exc))
+                payload = json.loads(
+                    oracle_query._error_payload(
+                        *oracle_query._safe_error(exc)
+                    )
+                )
+                self.assertEqual(payload["code"], code)
+                self.assertFalse(payload["retryable"])
+
+    def test_unknown_error_has_no_code_and_is_not_retryable(self) -> None:
+        exc = Exception("password=hunter2 at secret-db")
+        self.assertIsNone(oracle_query.error_code(exc))
+        self.assertFalse(oracle_query.is_retryable(exc))
+        message, code, retryable = oracle_query._safe_error(exc)
+        self.assertEqual(message, "oracle query failed")
+        self.assertIsNone(code)
+        self.assertFalse(retryable)
+
+
+class FailingDriver:
+    """A tiny oracledb stub that fails on connect or execute."""
+
+    def __init__(self, failures: list[str], fail_on: str) -> None:
+        self.failures = list(failures)
+        self.fail_on = fail_on
+        self.connects = 0
+        self.executes = 0
+
+    def module(self) -> types.ModuleType:
+        fake = types.ModuleType("oracledb")
+        fake.defaults = types.SimpleNamespace(fetch_lobs=True)
+        fake.connect = self.connect
+        return fake
+
+    def connect(self, **kwargs: object) -> "FakeConnection":
+        self.connects += 1
+        if self.fail_on == "connect" and self.failures:
+            raise Exception(self.failures.pop(0))
+        return FakeConnection(self)
+
+
+class FakeCursor:
+    description = [("N",)]
+
+    def __init__(self, driver: FailingDriver) -> None:
+        self.driver = driver
+
+    def execute(self, statement: str, binds: object = None) -> None:
+        if statement == "SET TRANSACTION READ ONLY":
+            return
+        self.driver.executes += 1
+        if self.driver.fail_on == "execute" and self.driver.failures:
+            raise Exception(self.driver.failures.pop(0))
+
+    def fetchmany(self, size: int) -> list[tuple[int]]:
+        return [(1,)]
+
+    def fetchone(self) -> tuple[int]:
+        return (1,)
+
+    def close(self) -> None:
+        pass
+
+
+class FakeConnection:
+    def __init__(self, driver: FailingDriver) -> None:
+        self.driver = driver
+        self.call_timeout = None
+
+    def cursor(self) -> FakeCursor:
+        return FakeCursor(self.driver)
+
+    def rollback(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class RetryTests(unittest.TestCase):
+    """A transient failure is retried once; a permanent one is not."""
+
+    CONFIG = oracle_query._Config("user", "password", "dsn", "/wallet")
+
+    def _call_query(
+        self, failures: list[str], fail_on: str
+    ) -> tuple[str, bool, FailingDriver, mock.Mock]:
+        driver = FailingDriver(failures, fail_on)
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=self.CONFIG
+        ), mock.patch.object(oracle_query.time, "sleep") as sleep:
+            text, is_error = oracle_query.call_query("SELECT 1 FROM dual")
+        return text, is_error, driver, sleep
+
+    def test_transient_connect_failure_is_retried_once(self) -> None:
+        text, is_error, driver, sleep = self._call_query(
+            ["ORA-03113: end-of-file on communication channel"], "connect"
+        )
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.connects, 2)
+        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+
+    def test_transient_execute_failure_is_retried_once(self) -> None:
+        text, is_error, driver, sleep = self._call_query(
+            ["ORA-03114: not connected to ORACLE"], "execute"
+        )
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.connects, 2)
+        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+
+    def test_permanent_failure_is_not_retried(self) -> None:
+        text, is_error, driver, sleep = self._call_query(
+            ["ORA-00942: table or view does not exist"], "connect"
+        )
+        payload = json.loads(text)
+        self.assertTrue(is_error)
+        self.assertEqual(payload["code"], "ORA-00942")
+        self.assertFalse(payload["retryable"])
+        self.assertEqual(driver.connects, 1)
+        sleep.assert_not_called()
+
+    def test_two_transient_failures_are_reported_as_retryable(self) -> None:
+        text, is_error, driver, sleep = self._call_query(
+            ["ORA-03113: first blip", "DPY-6005: second blip"], "connect"
+        )
+        payload = json.loads(text)
+        self.assertTrue(is_error)
+        self.assertEqual(payload["code"], "DPY-6005")
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(driver.connects, 2)
+        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+
+    def test_search_uses_the_same_retry_policy(self) -> None:
+        driver = FailingDriver(["ORA-12541: no listener"], "connect")
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=self.CONFIG
+        ), mock.patch.object(oracle_query.time, "sleep") as sleep:
+            text, is_error = oracle_query.call_search_content("storage")
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.connects, 2)
+        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+
+
+class SelftestTests(unittest.TestCase):
+    """--selftest must fail safely when Oracle is not configured."""
+
+    def test_selftest_fails_cleanly_without_configuration(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
+            rc = oracle_query.selftest()
+        self.assertEqual(rc, 1)
+        self.assertIn("selftest failed", err.getvalue())
+        self.assertIn("not configured", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_selftest_succeeds_with_a_stub_driver(self) -> None:
+        driver = FailingDriver([], "connect")
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=RetryTests.CONFIG
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = oracle_query.selftest()
+        self.assertEqual(rc, 0)
+        self.assertIn("selftest: ok", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_selftest_rejects_an_unexpected_probe_result(self) -> None:
+        class OddCursor(FakeCursor):
+            def fetchone(self) -> tuple[int]:
+                return (2,)
+
+        class OddConnection(FakeConnection):
+            def cursor(self) -> OddCursor:
+                return OddCursor(self.driver)
+
+        driver = FailingDriver([], "connect")
+        driver.connect = lambda **kwargs: (  # type: ignore[method-assign]
+            setattr(driver, "connects", driver.connects + 1)
+            or OddConnection(driver)
+        )
+        err = io.StringIO()
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=RetryTests.CONFIG
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ):
+            rc = oracle_query.selftest()
+        self.assertEqual(rc, 1)
+        self.assertIn("unexpected result", err.getvalue())
+
+    def test_cli_selftest_exits_nonzero_without_configuration(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SERVER), "--selftest"],
+            env={},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("selftest failed", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class ClosedPipeTests(unittest.TestCase):
+    """A client that closes the pipe must not produce a traceback."""
+
+    class BrokenStdout:
+        def write(self, value: str) -> int:
+            raise BrokenPipeError()
+
+        def flush(self) -> None:
+            raise BrokenPipeError()
+
+        def fileno(self) -> int:
+            raise OSError("no fileno")
+
+    class ClosedStdin:
+        def readline(self) -> str:
+            raise BrokenPipeError()
+
+    def test_write_exits_quietly_on_a_broken_pipe(self) -> None:
+        with mock.patch.object(
+            oracle_query.sys, "stdout", self.BrokenStdout()
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                oracle_query._write({"jsonrpc": "2.0", "id": 1})
+        self.assertEqual(caught.exception.code, 0)
+
+    def test_main_returns_when_stdin_is_closed(self) -> None:
+        with mock.patch.object(
+            oracle_query.sys, "stdin", self.ClosedStdin()
+        ):
+            self.assertEqual(oracle_query.main(), 0)
 
 
 if __name__ == "__main__":

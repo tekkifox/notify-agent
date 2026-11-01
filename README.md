@@ -92,6 +92,18 @@ published content instead of inventing either. It calls a local MCP server,
 - `search_content(query, limit)` — semantic search over the published-content
   index (pages, projects and experience).
 
+`scripts/run-prompt.sh` runs an MCP readiness preflight before it starts
+OpenCode: it sends `initialize` and `tools/list` to the same server with the
+same environment, fails the run loudly if `query` and `search_content` do not
+appear, and then runs `python3 /app/mcp/oracle_query.py --selftest` so an
+unreachable database also fails the run before anything is sent. The handshake
+does not touch the database, and the preflight captures server output rather
+than printing it. `opencode.json` gives the server a 60-second startup timeout
+so a slow first registration does not turn into a missing tool. The prompt then
+requires the tool call before any message is composed, retries a registration
+failure once after `/bin/sleep 5`, and writes a tool failure to stdout instead
+of sending it to the notification channel.
+
 The server is Python 3 with `python-oracledb` in **thin mode**, so the image
 contains no Oracle client libraries and no JDK. Both tools are read-only, and
 the database user itself only has `SELECT` and one `EXECUTE`.
@@ -150,6 +162,17 @@ statement; `FETCH FIRST 101 ROWS ONLY` is appended when a query has no limit;
 results are hard-capped at 100 rows and 128 KiB; each call has a 15-second
 timeout. The session also runs `SET TRANSACTION READ ONLY` before the query, so
 a guard bypass still cannot write.
+
+A transient connection failure is retried once after a one-second pause. The
+retry set is deliberately narrow: `ORA-03113`, `ORA-03114`, `ORA-03135`,
+`ORA-12170`, `ORA-12537`, `ORA-12541`, `DPY-6005` and `DPY-4011`. SQL,
+permission and audience errors (`ORA-009xx`, `ORA-01031`, `ORA-00942`) are
+returned immediately. Every tool error is JSON with the message, the safe
+`code` (or `null`) and a `retryable` boolean, so the agent can tell a database
+blip from bad SQL from an empty result. `python3 /app/mcp/oracle_query.py
+--selftest` opens a connection and runs `SELECT 1 FROM dual`; it exits 0 on
+success or 1 with a short, secret-free reason. A closed stdout pipe ends the
+process quietly instead of printing a traceback into the cron log.
 
 Only the `notify` agent may use either tool. `opencode.json` puts a global
 `permissions` deny on `oracle_query` and `oracle_search_content`; the `notify`
@@ -407,7 +430,7 @@ Schedules are **trusted operator configuration**, not user input. The agent runs
 docker compose logs -f --tail=100 agent
 ```
 
-Supercronic logs each job start and exit to the container log, and OpenCode's final response goes to stdout. Delivery results and short failure reasons also appear there. Logs contain message text and model output; they do **not** contain the webhook URL or API keys. Treat logs as sensitive. Compose caps them at 3 × 10 MB.
+Supercronic logs each job start and exit to the container log, and OpenCode's final response goes to stdout. Delivery results and short failure reasons also appear there. A failed host-statistics query is reported on stdout only; it is never sent to the notification channel. The MCP readiness preflight fails the job before OpenCode starts and prints only the server path, never its output or environment. Logs contain message text and model output; they do **not** contain the webhook URL or API keys. Treat logs as sensitive. Compose caps them at 3 × 10 MB.
 
 A failed job exits non-zero and is visible in the log, but there is no automatic retry. If you need retries, add them at the schedule level (for example a second prompt) rather than hiding failures.
 
@@ -558,7 +581,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Host mounts | named `opencode-data` volume, the Oracle wallet bind-mounted read-only at `/wallet`, and the schedule file bind-mounted read-only at `/app/crontab` (`SCHEDULES_FILE`, default `./crontab`); no host `/etc`, `/home` or Docker socket |
 | Privileged mode | never used |
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet contents live on the host and are mounted `:ro` |
-| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...` and the MCP tools `oracle_query` and `oracle_search_content` are allowed |
+| Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query` and `oracle_search_content` are allowed |
 | Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
@@ -581,7 +604,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 
 - Reach the internet outbound.
 - Read its environment (including the webhook, provider credentials, and Oracle password).
-- Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`.
+- Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`, plus one `/bin/sleep 5` between a failed `oracle_query` call and its retry.
 - Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
 - Call `search_content` to read short chunks from the published-content index.
 - Write only to the named volume and tmpfs.
@@ -638,13 +661,14 @@ Verified while building this branch:
 - A local TLS stub received a Discord-shaped POST with exactly 2,000 characters and `allowed_mentions: {"parse":[]}`; a second stub received the Composio path and payload, and the API key did not appear in output.
 - The Composio stub asserted the `/api/v3.1` execute path, `COMPOSIO_ARGS` merged into `arguments` with the message field winning a collision, `connected_account_id` present only when set, and invalid `COMPOSIO_ARGS` rejected without echoing its contents.
 - `opencode debug agents` resolves `notify` as a primary agent; its effective permission list denies everything, allows `oracle_query` and `oracle_search_content` last (over the global denies), and allows only `shell` for `/app/scripts/notify.sh -m *` and `/app/scripts/notify.sh -t * -m *`. The `build` agent resolves both Oracle tools to `deny`.
-- The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 62 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors, plus `NOTIFY_CONTENT_DISABLED=1` refusing `search_content` with a clear tool error and behaving unchanged when unset.
+- The SQL-guard and input-handling suite in `tests/test_oracle_guard.py` passes without a database or the Oracle driver: 89 tests covering allowed `SELECT`/`WITH`, rejected `INSERT`/`UPDATE`/`DELETE`/`DROP`/`BEGIN`/`WITH ... DELETE`/`FOR UPDATE`/multiple statements/trailing junk/oversized SQL, the row cap, the response-size cap, PEM-only and `cwallet.sso` wallet acceptance, empty and `tnsnames.ora`-only wallet rejection, Java wallet files not being passed to the thin driver, and (with a fake driver) the hard cap, column names and `SET TRANSACTION READ ONLY`. They also assert that `oracledb.connect` receives `config_dir` with no `wallet_location` or `wallet_password`, that a wallet password in the environment cannot enable that prompt path, and that stdin is EOF for the driver while the JSON-RPC stream survives. They also cover the search limit default/ceiling/floor, query validation, chunk truncation at 500 characters, the search response cap, bind-only query text and limit, and sanitised errors, plus `NOTIFY_CONTENT_DISABLED=1` refusing `search_content` with a clear tool error and behaving unchanged when unset. With a stub driver they also cover one retry for each transient code on connect and execute, no retry for SQL/permission errors, the `code`/`retryable` error payload, `--selftest` success and a clean non-zero failure with no configuration (including the CLI exit path), and a broken stdout/stdin pipe ending quietly with no traceback.
 - The MCP stdio handshake in the image returns two tools, `query` and `search_content`, and its guard/input errors are tool errors rather than protocol failures. A `search_content` call with no configuration returns `Oracle connection is not configured` and never echoes a user, DSN, wallet path, password, or the query text.
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` pass: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, and the legacy and default-target paths both work.
-- The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs.
+- The instruction tests in `tests/run-prompt-scope.sh` pass against a fake `opencode`: a scoped target adds the delivery-scope line and the content block, an array scope is listed, an unscoped target keeps the old instruction byte-for-byte, no target keeps the bare instruction, `allow_content: false` without a host scope adds only the content block, `NOTIFY_CONTENT_DISABLED=1` is exported only for a false value, and malformed `host_scope` or `allow_content` fails before the agent runs. The same suite now drives the MCP preflight with stub servers: a server that omits `search_content`, a missing server and a server whose Oracle self-test fails all fail before `opencode` starts without echoing `ORACLE_PASSWORD` or `ORACLE_DSN`, and a healthy server leaves the instruction byte-for-byte unchanged.
+- The text-level contract tests in `tests/test_prompt_contract.py` assert that the prompt keeps the query-first run order, the "never send a tool-unavailable message" rule, the zero-rows-is-not-a-failure wording, the one-pause/one-retry rule, the content-disabled exception, and the existing one-message/no-mentions/host-scope/read-only-SQL rules. They also assert that `opencode.json` keeps the 60-second startup timeout, at least 10 steps, the exact `/bin/sleep 5` allowance, and the denied-then-allowed Oracle tool permissions. These are text assertions, not a live model run.
 - The environment inheritance assumption was checked in the image built from this branch (`notify-agent:target-scope`), not just in the unit tests. A temporary local MCP server was spawned by `opencode run --standalone` with `NOTIFY_CONTENT_DISABLED=1` in the parent environment; the child's `/probe/env.txt` contained `NOTIFY_CONTENT_DISABLED=1` and `PYTHONUNBUFFERED=1`, so OpenCode merges the parent environment into the configured MCP environment. Running the installed `/app/mcp/oracle_query.py` over stdio in the same image returned `{"error":"content search is disabled for this run"}` with `isError: true` when the variable was set, and `Oracle connection is not configured` without it.
 
 Not verified, because this repository contains no credentials:
