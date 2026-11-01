@@ -19,6 +19,8 @@ Design constraints, because this runs inside a 512 MB cron container:
 * Python 3 plus python-oracledb in thin mode. No Oracle client, no JDK.
 * One small file. The MCP stdio protocol is implemented directly (newline
   delimited JSON-RPC 2.0) so the only dependency is ``oracledb``.
+* A lazily created, two-session pool is reused for the life of the process.
+  It is closed when the server or the selftest exits.
 * Fail closed. The SQL guard runs before a connection is opened.
 * No secrets in logs, errors, or tool output. Connection details never leave
   the process.
@@ -42,10 +44,12 @@ mode it makes the driver ask for a PEM pass phrase on stdin.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -72,6 +76,7 @@ CONNECT_TIMEOUT_SECONDS = 10
 # A single connection blip should not fail a notification run. Only these
 # codes are retried; SQL, permission and audience errors are permanent and are
 # returned immediately so the agent does not hide them behind a retry.
+DEAD_SESSION_CODES = frozenset({"ORA-03113", "ORA-03114"})
 TRANSIENT_ERROR_CODES = frozenset(
     {
         "ORA-03113",
@@ -84,7 +89,34 @@ TRANSIENT_ERROR_CODES = frozenset(
         "DPY-4011",
     }
 )
-RETRY_DELAY_SECONDS = 1.0
+
+# One retry, with a short randomised pause so several cron containers waking
+# together do not hammer a database that has just come back. Permanent errors
+# are single-shot: retrying bad SQL only adds noise and delay.
+RETRY_ATTEMPTS = 2
+RETRY_DELAY_MIN_SECONDS = 0.2
+RETRY_DELAY_MAX_SECONDS = 0.6
+
+# The process is short-lived (one per opencode run) and runs at most a handful
+# of queries in a few seconds, so the pool is deliberately tiny and lazy:
+#
+# * min 0 means create_pool opens no session; the first query does.
+# * max 2 leaves room for one concurrent query without holding an extra ADB
+#   session for the whole run.
+# * TIMEDWAIT with a 2 s wait lets that concurrent query wait briefly for the
+#   other session instead of failing with "no connections available".
+# * ping_interval 30 s validates a session that sat idle between bursts.
+# * timeout 60 s retires idle sessions quickly, so a run leaves nothing behind.
+# * max_lifetime_session 30 min only matters if the MCP process outlives a
+#   normal run; it stops one session being held indefinitely.
+POOL_MIN_SIZE = 0
+POOL_MAX_SIZE = 2
+POOL_INCREMENT = 1
+POOL_WAIT_TIMEOUT_MS = 2_000
+POOL_PING_INTERVAL_SECONDS = 30
+POOL_IDLE_TIMEOUT_SECONDS = 60
+POOL_MAX_LIFETIME_SECONDS = 30 * 60
+
 ERROR_CODE_PATTERN = re.compile(r"(?:ORA-\d{5}|DPY-\d{4})")
 SELFTEST_SQL = "SELECT 1 FROM dual"
 
@@ -617,6 +649,18 @@ def is_retryable(exc: BaseException) -> bool:
     return error_code(exc) in TRANSIENT_ERROR_CODES
 
 
+def is_dead_session(exc: BaseException) -> bool:
+    """Return true when the session itself is gone and must be discarded."""
+
+    return error_code(exc) in DEAD_SESSION_CODES
+
+
+def _retry_delay() -> float:
+    """A short pause with jitter, so retries from parallel runs spread out."""
+
+    return random.uniform(RETRY_DELAY_MIN_SECONDS, RETRY_DELAY_MAX_SECONDS)
+
+
 def _safe_error(exc: BaseException) -> tuple[str, str | None, bool]:
     """Return (message, code, retryable) without leaking connection details."""
 
@@ -639,26 +683,118 @@ def _error_payload(
 
 
 def _with_retry(operation: Any) -> Any:
-    """Run one database operation, retrying a transient failure once.
+    """Run one database operation with at most two attempts.
 
     A permanent failure propagates immediately. A transient failure is retried
-    after a short pause; if the retry also fails, that exception propagates and
-    the caller reports it as retryable so the agent can distinguish a database
-    blip from bad SQL or a permission error.
+    once after a short jittered pause; if the retry also fails, that exception
+    propagates and the caller reports it as retryable so the agent can
+    distinguish a database blip from bad SQL or a permission error. Dead
+    sessions are discarded by :func:`_connection` before the retry, so the
+    second attempt always gets a fresh connection.
     """
 
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= RETRY_ATTEMPTS or not is_retryable(exc):
+                raise
+            time.sleep(_retry_delay())
+
+
+class _PoolState:
+    """The lazily created pool plus the wallet context it was built from."""
+
+    __slots__ = ("key", "pool", "wallet_stack")
+
+    def __init__(
+        self, key: tuple[str, str, str], pool: Any, wallet_stack: Any
+    ) -> None:
+        self.key = key
+        self.pool = pool
+        self.wallet_stack = wallet_stack
+
+
+_pool_state: _PoolState | None = None
+
+
+def _close_pool() -> None:
+    """Release the pool and any staged wallet, ignoring teardown errors."""
+
+    global _pool_state
+    state, _pool_state = _pool_state, None
+    if state is None:
+        return
     try:
-        return operation()
-    except Exception as exc:
-        if not is_retryable(exc):
-            raise
-        time.sleep(RETRY_DELAY_SECONDS)
-        return operation()
+        # force=True: an interrupted query may still hold a connection. The
+        # process is ending, so the session must not be left behind.
+        state.pool.close(force=True)
+    except Exception:
+        pass
+    try:
+        state.wallet_stack.close()
+    except Exception:
+        pass
+
+
+atexit.register(_close_pool)
+
+
+def _get_pool(config: _Config, oracledb: Any) -> Any:
+    """Return the process pool, creating it on first use.
+
+    The pool is keyed by the connection settings. A changed configuration (for
+    example in a test) closes the old pool before a new one is made. Nothing is
+    opened at import time and min=0 means a connection is created only when a
+    tool is actually called.
+    """
+
+    global _pool_state
+
+    key = (config.user, config.dsn, config.wallet)
+    if _pool_state is not None and _pool_state.key == key:
+        return _pool_state.pool
+
+    _close_pool()
+
+    # Keep the wallet context alive for as long as the pool: create_pool may
+    # not connect yet (min=0), and later acquires still need config_dir.
+    wallet_stack = contextlib.ExitStack()
+    try:
+        wallet_dir = wallet_stack.enter_context(
+            _wallet_for_connection(config.wallet)
+        )
+        pool = oracledb.create_pool(
+            user=config.user,
+            password=config.password,
+            dsn=config.dsn,
+            config_dir=wallet_dir,
+            min=POOL_MIN_SIZE,
+            max=POOL_MAX_SIZE,
+            increment=POOL_INCREMENT,
+            getmode=oracledb.POOL_GETMODE_TIMEDWAIT,
+            wait_timeout=POOL_WAIT_TIMEOUT_MS,
+            ping_interval=POOL_PING_INTERVAL_SECONDS,
+            timeout=POOL_IDLE_TIMEOUT_SECONDS,
+            max_lifetime_session=POOL_MAX_LIFETIME_SECONDS,
+            tcp_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        wallet_stack.close()
+        raise
+
+    _pool_state = _PoolState(key, pool, wallet_stack)
+    return pool
 
 
 @contextlib.contextmanager
 def _connection(config: _Config) -> Iterator[Any]:
-    """Open a read-only session and always close it, without leaking errors."""
+    """Acquire a read-only session from the pool and always give it back.
+
+    A normal end returns the connection to the pool. If the session died
+    (ORA-03113/ORA-03114) it is dropped instead, so the retry cannot pick up
+    the same broken socket.
+    """
 
     import oracledb
 
@@ -666,18 +802,12 @@ def _connection(config: _Config) -> Iterator[Any]:
 
     connection = None
     cursor = None
-    with _wallet_for_connection(config.wallet) as wallet_dir, _stdin_guarded():
+    dead = False
+    with _stdin_guarded():
+        pool = _get_pool(config, oracledb)
         try:
-            # config_dir resolves tnsnames.ora and the PEM wallet. Do not pass
-            # wallet_location: in thin mode it makes the driver prompt for a
-            # PEM pass phrase on stdin, which is the MCP JSON-RPC stream.
-            connection = oracledb.connect(
-                user=config.user,
-                password=config.password,
-                dsn=config.dsn,
-                config_dir=wallet_dir,
-                tcp_connect_timeout=CONNECT_TIMEOUT_SECONDS,
-            )
+            connection = pool.acquire()
+            # Preserve the old per-call timeout on every checkout.
             connection.call_timeout = CALL_TIMEOUT_MS
 
             cursor = connection.cursor()
@@ -685,6 +815,9 @@ def _connection(config: _Config) -> Iterator[Any]:
             # lexical guard were bypassed.
             cursor.execute("SET TRANSACTION READ ONLY")
             yield cursor
+        except Exception as exc:
+            dead = is_dead_session(exc)
+            raise
         finally:
             if cursor is not None:
                 try:
@@ -696,10 +829,21 @@ def _connection(config: _Config) -> Iterator[Any]:
                     connection.rollback()
                 except Exception:
                     pass
-                try:
-                    connection.close()
-                except Exception:
-                    pass
+                if dead:
+                    try:
+                        # Never return a dead session to the pool.
+                        pool.drop(connection)
+                    except Exception:
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        # For a pooled connection this returns it to the pool.
+                        connection.close()
+                    except Exception:
+                        pass
 
 
 def _query_once(config: _Config, statement: str) -> str:
@@ -845,6 +989,9 @@ def selftest() -> int:
         message, _code, _retryable = _safe_error(exc)
         print(f"selftest failed: {message}", file=sys.stderr)
         return 1
+    finally:
+        # The selftest process exits immediately; do not leave a session open.
+        _close_pool()
 
     print("selftest: ok")
     return 0
@@ -967,7 +1114,7 @@ def _handle(request: dict[str, Any]) -> None:
         _error(request_id, -32601, "method not found")
 
 
-def main() -> int:
+def _serve() -> int:
     while True:
         try:
             line = sys.stdin.readline()
@@ -994,6 +1141,15 @@ def main() -> int:
             if "id" in request:
                 _error(request.get("id"), -32603, "internal error")
     return 0
+
+
+def main() -> int:
+    """Serve JSON-RPC until stdin closes, then release the pool."""
+
+    try:
+        return _serve()
+    finally:
+        _close_pool()
 
 
 if __name__ == "__main__":

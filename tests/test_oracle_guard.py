@@ -31,6 +31,16 @@ oracle_query = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle_query)
 
 
+class PoolTestBase(unittest.TestCase):
+    """Start each test with no cached pool from an earlier test."""
+
+    def setUp(self) -> None:
+        oracle_query._close_pool()
+
+    def tearDown(self) -> None:
+        oracle_query._close_pool()
+
+
 class GuardTests(unittest.TestCase):
     def assert_rejected(self, sql: object) -> None:
         with self.assertRaises(oracle_query.SqlGuardError):
@@ -272,7 +282,7 @@ class McpProtocolTests(unittest.TestCase):
                 )
 
 
-class QueryExecutionTests(unittest.TestCase):
+class QueryExecutionTests(PoolTestBase):
     """Exercise the hard row cap and JSON shape with a fake driver."""
 
     def test_hard_cap_and_column_names(self) -> None:
@@ -308,15 +318,31 @@ class QueryExecutionTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
+        class FakePool:
+            def __init__(self) -> None:
+                self.connection = FakeConnection()
+                self.dropped = []
+                self.closed = False
+
+            def acquire(self) -> FakeConnection:
+                return self.connection
+
+            def drop(self, connection: FakeConnection) -> None:
+                self.dropped.append(connection)
+
+            def close(self, force: bool = False) -> None:
+                self.closed = True
+
         fake = types.ModuleType("oracledb")
         fake.defaults = types.SimpleNamespace(fetch_lobs=True)
-        connection = FakeConnection()
+        fake.POOL_GETMODE_TIMEDWAIT = object()
+        pool = FakePool()
 
-        def connect(**kwargs: object) -> FakeConnection:
-            fake.connect_kwargs = kwargs
-            return connection
+        def create_pool(**kwargs: object) -> FakePool:
+            fake.pool_kwargs = kwargs
+            return pool
 
-        fake.connect = connect
+        fake.create_pool = create_pool
 
         config = oracle_query._Config("user", "password", "dsn", "/wallet")
         with mock.patch.dict(sys.modules, {"oracledb": fake}), mock.patch.object(
@@ -329,6 +355,7 @@ class QueryExecutionTests(unittest.TestCase):
         self.assertEqual(payload["row_count"], oracle_query.MAX_ROWS)
         self.assertEqual(len(payload["rows"]), oracle_query.MAX_ROWS)
         self.assertTrue(payload["truncated"])
+        connection = pool.connection
         self.assertEqual(connection.call_timeout, oracle_query.CALL_TIMEOUT_MS)
         self.assertEqual(
             connection.cursor_instance.statements[0], "SET TRANSACTION READ ONLY"
@@ -338,14 +365,14 @@ class QueryExecutionTests(unittest.TestCase):
         )
         self.assertTrue(connection.rolled_back)
         self.assertTrue(connection.closed)
-        # The password is used for the connection but never returned.
-        self.assertEqual(fake.connect_kwargs["password"], "password")
+        # The password is used for the pool but never returned.
+        self.assertEqual(fake.pool_kwargs["password"], "password")
         self.assertNotIn("password", text)
         self.assertNotIn("dsn", text)
         self.assertNotIn("/wallet", text)
 
 
-class WalletConnectTests(unittest.TestCase):
+class WalletConnectTests(PoolTestBase):
     """The thin-mode connect must never ask for a wallet passphrase."""
 
     def _connect(self, wallet: str) -> tuple[dict[str, object], str]:
@@ -364,8 +391,11 @@ class WalletConnectTests(unittest.TestCase):
         class FakeConnection:
             call_timeout = None
 
+            def __init__(self) -> None:
+                self.cursor_instance = FakeCursor()
+
             def cursor(self) -> FakeCursor:
-                return FakeCursor()
+                return self.cursor_instance
 
             def rollback(self) -> None:
                 pass
@@ -373,18 +403,33 @@ class WalletConnectTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
+        class FakePool:
+            def __init__(self) -> None:
+                self.connection = FakeConnection()
+
+            def acquire(self) -> FakeConnection:
+                # A passphrase prompt would read fd 0. It must be EOF, never
+                # the JSON-RPC stream that is the server's stdin.
+                captured["stdin_read"] = os.read(0, 1)
+                return self.connection
+
+            def drop(self, connection: FakeConnection) -> None:
+                pass
+
+            def close(self, force: bool = False) -> None:
+                pass
+
         fake = types.ModuleType("oracledb")
         fake.defaults = types.SimpleNamespace(fetch_lobs=True)
+        fake.POOL_GETMODE_TIMEDWAIT = object()
         captured: dict[str, object] = {}
+        pool = FakePool()
 
-        def connect(**kwargs: object) -> FakeConnection:
+        def create_pool(**kwargs: object) -> FakePool:
             captured.update(kwargs)
-            # A passphrase prompt would read fd 0. It must be EOF, never the
-            # JSON-RPC stream that is the server's stdin.
-            captured["stdin_read"] = os.read(0, 1)
-            return FakeConnection()
+            return pool
 
-        fake.connect = connect
+        fake.create_pool = create_pool
 
         config = oracle_query._Config("user", "password", "dsn", wallet)
         with mock.patch.dict(sys.modules, {"oracledb": fake}), mock.patch.object(
@@ -515,7 +560,7 @@ class SearchInputTests(unittest.TestCase):
         self.assertIn("COSINE", oracle_query.SEARCH_SQL)
 
 
-class SearchExecutionTests(unittest.TestCase):
+class SearchExecutionTests(PoolTestBase):
     """Exercise search_content with a fake driver: binds, caps and errors."""
 
     COLUMNS = [
@@ -535,6 +580,8 @@ class SearchExecutionTests(unittest.TestCase):
         rows: list[tuple[object, ...]] | None = None,
         connect_error: BaseException | None = None,
     ) -> tuple[str, bool, object]:
+        # Each call uses its own stub driver, so start from a clean pool.
+        oracle_query._close_pool()
         if rows is None:
             rows = [
                 (
@@ -583,24 +630,39 @@ class SearchExecutionTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
+        class FakePool:
+            def __init__(self) -> None:
+                self.connection = FakeConnection()
+                self.dropped = []
+
+            def acquire(self) -> FakeConnection:
+                if connect_error is not None:
+                    raise connect_error
+                return self.connection
+
+            def drop(self, connection: FakeConnection) -> None:
+                self.dropped.append(connection)
+
+            def close(self, force: bool = False) -> None:
+                pass
+
         fake = types.ModuleType("oracledb")
         fake.defaults = types.SimpleNamespace(fetch_lobs=True)
-        connection = FakeConnection()
+        fake.POOL_GETMODE_TIMEDWAIT = object()
+        pool = FakePool()
 
-        def connect(**kwargs: object) -> FakeConnection:
-            if connect_error is not None:
-                raise connect_error
-            fake.connect_kwargs = kwargs
-            return connection
+        def create_pool(**kwargs: object) -> FakePool:
+            fake.pool_kwargs = kwargs
+            return pool
 
-        fake.connect = connect
+        fake.create_pool = create_pool
 
         config = oracle_query._Config("user", "password", "dsn", "/wallet")
         with mock.patch.dict(sys.modules, {"oracledb": fake}), mock.patch.object(
             oracle_query, "_config", return_value=config
         ):
             text, is_error = oracle_query.call_search_content(query, limit)
-        return text, is_error, connection
+        return text, is_error, pool.connection
 
     def test_query_and_limit_are_bind_variables(self) -> None:
         query = "storage'); DROP TABLE ROSSMONEY.CONTENT_EMBEDDINGS; --"
@@ -843,25 +905,32 @@ class ErrorClassificationTests(unittest.TestCase):
 
 
 class FailingDriver:
-    """A tiny oracledb stub that fails on connect or execute."""
+    """A tiny oracledb stub that fails on pool acquire or execute."""
 
     def __init__(self, failures: list[str], fail_on: str) -> None:
         self.failures = list(failures)
         self.fail_on = fail_on
         self.connects = 0
+        self.acquires = 0
         self.executes = 0
+        self.create_pool_calls = 0
+        self.pool_kwargs: dict[str, object] = {}
+        self.pool: FakePool | None = None
+        self.connection_class = FakeConnection
+        self.getmode = object()
 
     def module(self) -> types.ModuleType:
         fake = types.ModuleType("oracledb")
         fake.defaults = types.SimpleNamespace(fetch_lobs=True)
-        fake.connect = self.connect
+        fake.POOL_GETMODE_TIMEDWAIT = self.getmode
+        fake.create_pool = self.create_pool
         return fake
 
-    def connect(self, **kwargs: object) -> "FakeConnection":
-        self.connects += 1
-        if self.fail_on == "connect" and self.failures:
-            raise Exception(self.failures.pop(0))
-        return FakeConnection(self)
+    def create_pool(self, **kwargs: object) -> "FakePool":
+        self.create_pool_calls += 1
+        self.pool_kwargs = kwargs
+        self.pool = FakePool(self)
+        return self.pool
 
 
 class FakeCursor:
@@ -887,10 +956,44 @@ class FakeCursor:
         pass
 
 
-class FakeConnection:
+class FakePool:
+    """A pool that remembers what it handed out and what was dropped."""
+
     def __init__(self, driver: FailingDriver) -> None:
         self.driver = driver
+        self.created = 0
+        self.dropped: list[FakeConnection] = []
+        self.closed = False
+        self.available: list[FakeConnection] = []
+
+    def acquire(self) -> "FakeConnection":
+        self.driver.connects += 1
+        if self.driver.fail_on == "connect" and self.driver.failures:
+            raise Exception(self.driver.failures.pop(0))
+        self.driver.acquires += 1
+        if self.available:
+            return self.available.pop()
+        self.created += 1
+        return self.driver.connection_class(self.driver, self)
+
+    def release(self, connection: "FakeConnection") -> None:
+        self.available.append(connection)
+
+    def drop(self, connection: "FakeConnection") -> None:
+        connection.dropped = True
+        self.dropped.append(connection)
+
+    def close(self, force: bool = False) -> None:
+        self.closed = True
+
+
+class FakeConnection:
+    def __init__(self, driver: FailingDriver, pool: FakePool) -> None:
+        self.driver = driver
+        self.pool = pool
         self.call_timeout = None
+        self.closed = False
+        self.dropped = False
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self.driver)
@@ -899,10 +1002,11 @@ class FakeConnection:
         pass
 
     def close(self) -> None:
-        pass
+        self.closed = True
+        self.pool.release(self)
 
 
-class RetryTests(unittest.TestCase):
+class RetryTests(PoolTestBase):
     """A transient failure is retried once; a permanent one is not."""
 
     CONFIG = oracle_query._Config("user", "password", "dsn", "/wallet")
@@ -919,13 +1023,19 @@ class RetryTests(unittest.TestCase):
             text, is_error = oracle_query.call_query("SELECT 1 FROM dual")
         return text, is_error, driver, sleep
 
+    def assert_bounded_delay(self, sleep: mock.Mock) -> None:
+        sleep.assert_called_once()
+        delay = sleep.call_args.args[0]
+        self.assertGreaterEqual(delay, oracle_query.RETRY_DELAY_MIN_SECONDS)
+        self.assertLessEqual(delay, oracle_query.RETRY_DELAY_MAX_SECONDS)
+
     def test_transient_connect_failure_is_retried_once(self) -> None:
         text, is_error, driver, sleep = self._call_query(
             ["ORA-03113: end-of-file on communication channel"], "connect"
         )
         self.assertFalse(is_error, text)
         self.assertEqual(driver.connects, 2)
-        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+        self.assert_bounded_delay(sleep)
 
     def test_transient_execute_failure_is_retried_once(self) -> None:
         text, is_error, driver, sleep = self._call_query(
@@ -933,18 +1043,21 @@ class RetryTests(unittest.TestCase):
         )
         self.assertFalse(is_error, text)
         self.assertEqual(driver.connects, 2)
-        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+        self.assert_bounded_delay(sleep)
 
     def test_permanent_failure_is_not_retried(self) -> None:
-        text, is_error, driver, sleep = self._call_query(
-            ["ORA-00942: table or view does not exist"], "connect"
-        )
-        payload = json.loads(text)
-        self.assertTrue(is_error)
-        self.assertEqual(payload["code"], "ORA-00942")
-        self.assertFalse(payload["retryable"])
-        self.assertEqual(driver.connects, 1)
-        sleep.assert_not_called()
+        for code in ("ORA-00933", "ORA-00942", "ORA-01031"):
+            with self.subTest(code=code):
+                oracle_query._close_pool()
+                text, is_error, driver, sleep = self._call_query(
+                    [f"{code}: permanent"], "connect"
+                )
+                payload = json.loads(text)
+                self.assertTrue(is_error)
+                self.assertEqual(payload["code"], code)
+                self.assertFalse(payload["retryable"])
+                self.assertEqual(driver.connects, 1)
+                sleep.assert_not_called()
 
     def test_two_transient_failures_are_reported_as_retryable(self) -> None:
         text, is_error, driver, sleep = self._call_query(
@@ -954,8 +1067,8 @@ class RetryTests(unittest.TestCase):
         self.assertTrue(is_error)
         self.assertEqual(payload["code"], "DPY-6005")
         self.assertTrue(payload["retryable"])
-        self.assertEqual(driver.connects, 2)
-        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+        self.assertEqual(driver.connects, oracle_query.RETRY_ATTEMPTS)
+        self.assert_bounded_delay(sleep)
 
     def test_search_uses_the_same_retry_policy(self) -> None:
         driver = FailingDriver(["ORA-12541: no listener"], "connect")
@@ -967,10 +1080,147 @@ class RetryTests(unittest.TestCase):
             text, is_error = oracle_query.call_search_content("storage")
         self.assertFalse(is_error, text)
         self.assertEqual(driver.connects, 2)
-        sleep.assert_called_once_with(oracle_query.RETRY_DELAY_SECONDS)
+        self.assert_bounded_delay(sleep)
 
 
-class SelftestTests(unittest.TestCase):
+class PoolTests(PoolTestBase):
+    """Connection reuse, dead-session recovery and clean shutdown."""
+
+    CONFIG = RetryTests.CONFIG
+
+    def _run_query(
+        self, driver: FailingDriver
+    ) -> tuple[str, bool, mock.Mock]:
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=self.CONFIG
+        ), mock.patch.object(oracle_query.time, "sleep") as sleep:
+            text, is_error = oracle_query.call_query("SELECT 1 FROM dual")
+        return text, is_error, sleep
+
+    def test_pool_is_not_created_at_import_and_is_reused(self) -> None:
+        self.assertIsNone(oracle_query._pool_state)
+        driver = FailingDriver([], "connect")
+        text, is_error, _ = self._run_query(driver)
+        self.assertFalse(is_error, text)
+        text, is_error, _ = self._run_query(driver)
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.create_pool_calls, 1)
+        self.assertEqual(driver.pool.created, 1)
+        self.assertEqual(driver.acquires, 2)
+
+    def test_pool_settings_suit_a_short_run(self) -> None:
+        driver = FailingDriver([], "connect")
+        self._run_query(driver)
+        kwargs = driver.pool_kwargs
+        self.assertEqual(kwargs["min"], 0)
+        self.assertEqual(kwargs["max"], 2)
+        self.assertEqual(kwargs["increment"], 1)
+        self.assertEqual(kwargs["getmode"], driver.getmode)
+        self.assertEqual(kwargs["wait_timeout"], oracle_query.POOL_WAIT_TIMEOUT_MS)
+        self.assertEqual(
+            kwargs["ping_interval"], oracle_query.POOL_PING_INTERVAL_SECONDS
+        )
+        self.assertEqual(kwargs["timeout"], oracle_query.POOL_IDLE_TIMEOUT_SECONDS)
+        self.assertEqual(
+            kwargs["max_lifetime_session"],
+            oracle_query.POOL_MAX_LIFETIME_SECONDS,
+        )
+        self.assertEqual(
+            kwargs["tcp_connect_timeout"], oracle_query.CONNECT_TIMEOUT_SECONDS
+        )
+        self.assertNotIn("wallet_location", kwargs)
+
+    def test_dead_session_is_dropped_and_retried_on_a_fresh_connection(
+        self,
+    ) -> None:
+        driver = FailingDriver(["ORA-03114: not connected to ORACLE"], "execute")
+        text, is_error, sleep = self._run_query(driver)
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.connects, 2)
+        self.assertEqual(driver.pool.created, 2)
+        self.assertEqual(len(driver.pool.dropped), 1)
+        self.assertTrue(driver.pool.dropped[0].dropped)
+        sleep.assert_called_once()
+        # The retry ran on the newly created connection, not the dead one.
+        self.assertNotIn(driver.pool.dropped[0], driver.pool.available)
+
+    def test_dead_session_codes_are_the_transient_ones(self) -> None:
+        self.assertEqual(
+            oracle_query.DEAD_SESSION_CODES, frozenset({"ORA-03113", "ORA-03114"})
+        )
+        for code in oracle_query.DEAD_SESSION_CODES:
+            with self.subTest(code=code):
+                self.assertTrue(
+                    oracle_query.is_dead_session(Exception(f"{code}: gone"))
+                )
+                self.assertTrue(
+                    oracle_query.is_retryable(Exception(f"{code}: gone"))
+                )
+
+    def test_retry_delay_is_bounded_and_randomised(self) -> None:
+        driver = FailingDriver(
+            ["ORA-03113: first blip", "ORA-03113: second blip"], "connect"
+        )
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=self.CONFIG
+        ), mock.patch.object(
+            oracle_query.random, "uniform", return_value=0.37
+        ) as uniform, mock.patch.object(
+            oracle_query.time, "sleep"
+        ) as sleep:
+            text, is_error = oracle_query.call_query("SELECT 1 FROM dual")
+        payload = json.loads(text)
+        self.assertTrue(is_error)
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(driver.connects, oracle_query.RETRY_ATTEMPTS)
+        uniform.assert_called_once_with(
+            oracle_query.RETRY_DELAY_MIN_SECONDS,
+            oracle_query.RETRY_DELAY_MAX_SECONDS,
+        )
+        sleep.assert_called_once_with(0.37)
+
+    def test_permanent_failure_releases_the_connection_for_reuse(self) -> None:
+        driver = FailingDriver(
+            ["ORA-00942: table or view does not exist"], "execute"
+        )
+        text, is_error, sleep = self._run_query(driver)
+        self.assertTrue(is_error)
+        sleep.assert_not_called()
+        self.assertEqual(driver.pool.created, 1)
+        self.assertEqual(driver.pool.dropped, [])
+        # The session was returned to the pool, so the next query reuses it.
+        text, is_error, _ = self._run_query(driver)
+        self.assertFalse(is_error, text)
+        self.assertEqual(driver.pool.created, 1)
+
+    def test_selftest_closes_the_pool(self) -> None:
+        driver = FailingDriver([], "connect")
+        with mock.patch.dict(
+            sys.modules, {"oracledb": driver.module()}
+        ), mock.patch.object(
+            oracle_query, "_config", return_value=self.CONFIG
+        ), contextlib.redirect_stdout(io.StringIO()):
+            rc = oracle_query.selftest()
+        self.assertEqual(rc, 0)
+        self.assertIsNotNone(driver.pool)
+        self.assertTrue(driver.pool.closed)
+        self.assertIsNone(oracle_query._pool_state)
+
+    def test_server_exit_closes_the_pool(self) -> None:
+        driver = FailingDriver([], "connect")
+        self._run_query(driver)
+        with mock.patch.object(oracle_query.sys, "stdin", io.StringIO("")):
+            self.assertEqual(oracle_query.main(), 0)
+        self.assertIsNotNone(driver.pool)
+        self.assertTrue(driver.pool.closed)
+        self.assertIsNone(oracle_query._pool_state)
+
+
+class SelftestTests(PoolTestBase):
     """--selftest must fail safely when Oracle is not configured."""
 
     def test_selftest_fails_cleanly_without_configuration(self) -> None:
@@ -1010,10 +1260,7 @@ class SelftestTests(unittest.TestCase):
                 return OddCursor(self.driver)
 
         driver = FailingDriver([], "connect")
-        driver.connect = lambda **kwargs: (  # type: ignore[method-assign]
-            setattr(driver, "connects", driver.connects + 1)
-            or OddConnection(driver)
-        )
+        driver.connection_class = OddConnection
         err = io.StringIO()
         with mock.patch.dict(
             sys.modules, {"oracledb": driver.module()}
@@ -1025,6 +1272,7 @@ class SelftestTests(unittest.TestCase):
             rc = oracle_query.selftest()
         self.assertEqual(rc, 1)
         self.assertIn("unexpected result", err.getvalue())
+        self.assertTrue(driver.pool is None or driver.pool.closed)
 
     def test_cli_selftest_exits_nonzero_without_configuration(self) -> None:
         result = subprocess.run(
