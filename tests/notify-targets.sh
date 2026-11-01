@@ -338,7 +338,10 @@ for bad in \
     '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"http://bad.example.test","books":"runbooks"}}}' \
     '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":""}}}' \
     '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"not a book!"}}}' \
-    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"0"}}}'; do
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"0"}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"runbooks"}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"runbooks","token":"bad-token"}}}' \
+    '{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"runbooks","token":""}}}'; do
     bad_case=$((bad_case + 1))
     expect_fail "malformed bookstack case $bad_case fails without a request" \
         send NOTIFY_TARGETS="$bad"
@@ -355,6 +358,20 @@ elif contains "$out" "111111111111111111" || contains "$out" "bad.example.test";
     no "malformed bookstack: message leaked an id or value"
 else
     pass "malformed bookstack message names the target only"
+fi
+
+set +e
+out=$(send NOTIFY_TARGETS='{"general":{"channel_id":"111111111111111111","bookstack":{"url":"https://bookstack.example.test","books":"runbooks","token":"bad-token"}}}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "malformed bookstack token: expected failure"
+elif ! contains "$out" "general"; then
+    no "malformed bookstack token: message did not name the target"
+elif contains "$out" "111111111111111111" || contains "$out" "bad-token"; then
+    no "malformed bookstack token: message leaked an id or value"
+else
+    pass "malformed bookstack token message names the target only"
 fi
 
 # 4. -t is rejected when a webhook is configured.

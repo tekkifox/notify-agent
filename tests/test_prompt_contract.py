@@ -237,11 +237,22 @@ class OpenCodeConfigTests(unittest.TestCase):
         self.assertIn("export NOTIFY_BOOKSTACK_URL", RUN_PROMPT)
         self.assertIn("NOTIFY_BOOKSTACK_BOOKS=$target_bookstack_books", RUN_PROMPT)
         self.assertIn("export NOTIFY_BOOKSTACK_BOOKS", RUN_PROMPT)
+        self.assertIn("NOTIFY_BOOKSTACK_TOKEN_ID=$target_bookstack_token_id", RUN_PROMPT)
+        self.assertIn("export NOTIFY_BOOKSTACK_TOKEN_ID", RUN_PROMPT)
+        self.assertIn(
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET=$target_bookstack_token_secret",
+            RUN_PROMPT,
+        )
+        self.assertIn("export NOTIFY_BOOKSTACK_TOKEN_SECRET", RUN_PROMPT)
+        self.assertIn('BOOKSTACK_TOKEN_ID_${token_suffix}', RUN_PROMPT)
+        self.assertIn('BOOKSTACK_TOKEN_SECRET_${token_suffix}', RUN_PROMPT)
         bookstack = CONFIG["mcp"]["servers"]["bookstack"]
         for variable in (
             "NOTIFY_RUNBOOKS_ALLOWED",
             "NOTIFY_BOOKSTACK_URL",
             "NOTIFY_BOOKSTACK_BOOKS",
+            "NOTIFY_BOOKSTACK_TOKEN_ID",
+            "NOTIFY_BOOKSTACK_TOKEN_SECRET",
         ):
             self.assertEqual(
                 bookstack["environment"][variable],
@@ -249,6 +260,8 @@ class OpenCodeConfigTests(unittest.TestCase):
             )
         self.assertNotIn("BOOKSTACK_URL", bookstack["environment"])
         self.assertNotIn("BOOKSTACK_ALLOWED_BOOKS", bookstack["environment"])
+        self.assertNotIn("BOOKSTACK_TOKEN_ID", bookstack["environment"])
+        self.assertNotIn("BOOKSTACK_TOKEN_SECRET", bookstack["environment"])
 
 
 class PreflightScriptTests(unittest.TestCase):

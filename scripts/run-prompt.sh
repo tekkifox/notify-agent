@@ -144,6 +144,9 @@ target_content_disabled=0
 target_runbooks_allowed=0
 target_bookstack_url=
 target_bookstack_books=
+target_bookstack_token=
+target_bookstack_token_id=
+target_bookstack_token_secret=
 target_runbooks_enabled=0
 if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
     command -v jq >/dev/null 2>&1 || {
@@ -255,10 +258,14 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
             type == "string"
             and length > 8
             and test("^https://[^/?#@]+(/[^?#]*)?$");
+        def valid_token:
+            type == "string"
+            and test("^[A-Za-z0-9_]{1,64}$");
         def valid_bookstack:
             type == "object"
             and (.url | valid_url)
-            and (.books | valid_books);
+            and (.books | valid_books)
+            and (.token | valid_token);
         [ to_entries[]
           | select((.value | type) == "object")
           | select(.value | has("bookstack"))
@@ -270,7 +277,7 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         exit 1
     }
     if [ -n "$bad_bookstack_targets" ]; then
-        printf 'run-prompt: invalid bookstack for target(s) %s: expected an object with an https url and a comma-separated books list\n' "$bad_bookstack_targets" >&2
+        printf 'run-prompt: invalid bookstack for target(s) %s: expected an object with an https url, a comma-separated books list and a token suffix\n' "$bad_bookstack_targets" >&2
         exit 1
     fi
     target_bookstack_url=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
@@ -287,10 +294,25 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
         exit 1
     }
+    target_bookstack_token=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name].bookstack | type) == "object"
+        then .[$name].bookstack.token // empty else empty end
+    ' 2>/dev/null) || {
+        printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
+        exit 1
+    }
     if [ "$target_runbooks_allowed" -eq 1 ] \
         && [ -n "$target_bookstack_url" ] \
-        && [ -n "$target_bookstack_books" ]; then
-        target_runbooks_enabled=1
+        && [ -n "$target_bookstack_books" ] \
+        && [ -n "$target_bookstack_token" ]; then
+        # The suffix is validated above (letters, digits, underscore only), so
+        # it is safe to use as part of an environment variable name.
+        token_suffix=$(printf '%s' "$target_bookstack_token" | tr '[:lower:]' '[:upper:]')
+        target_bookstack_token_id=$(printenv "BOOKSTACK_TOKEN_ID_${token_suffix}" 2>/dev/null || true)
+        target_bookstack_token_secret=$(printenv "BOOKSTACK_TOKEN_SECRET_${token_suffix}" 2>/dev/null || true)
+        if [ -n "$target_bookstack_token_id" ] && [ -n "$target_bookstack_token_secret" ]; then
+            target_runbooks_enabled=1
+        fi
     fi
 fi
 
@@ -397,10 +419,10 @@ if [ "$target_content_disabled" -eq 1 ]; then
 fi
 
 # Runbooks are default-deny and per target: export the explicit grant and that
-# target's own BookStack URL and books only when both the grant and the
-# instance settings are present, and clear any inherited values otherwise.
-# bookstack.py refuses both tools unless it sees the grant and a complete
-# instance, and it requires an https URL.
+# target's own BookStack URL, books and resolved credential pair only when the
+# grant, the instance settings and the named credential are all present, and
+# clear any inherited values otherwise. bookstack.py refuses both tools unless
+# it sees the grant and a complete instance, and it requires an https URL.
 if [ "$target_runbooks_enabled" -eq 1 ]; then
     NOTIFY_RUNBOOKS_ALLOWED=1
     export NOTIFY_RUNBOOKS_ALLOWED
@@ -408,10 +430,16 @@ if [ "$target_runbooks_enabled" -eq 1 ]; then
     export NOTIFY_BOOKSTACK_URL
     NOTIFY_BOOKSTACK_BOOKS=$target_bookstack_books
     export NOTIFY_BOOKSTACK_BOOKS
+    NOTIFY_BOOKSTACK_TOKEN_ID=$target_bookstack_token_id
+    export NOTIFY_BOOKSTACK_TOKEN_ID
+    NOTIFY_BOOKSTACK_TOKEN_SECRET=$target_bookstack_token_secret
+    export NOTIFY_BOOKSTACK_TOKEN_SECRET
 else
     unset NOTIFY_RUNBOOKS_ALLOWED
     unset NOTIFY_BOOKSTACK_URL
     unset NOTIFY_BOOKSTACK_BOOKS
+    unset NOTIFY_BOOKSTACK_TOKEN_ID
+    unset NOTIFY_BOOKSTACK_TOKEN_SECRET
 fi
 
 # Export the effective host scope so ssh_probe.py refuses a host outside it

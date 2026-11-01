@@ -461,27 +461,40 @@ load-peak flag mean?" from a BookStack wiki. It calls a third local MCP server,
 OpenCode names an MCP tool `<server>_<tool>`, so the agent reaches these as
 `bookstack_search` and `bookstack_read`.
 
-### One instance per target, enforced in code
+### One instance and one credential per target
 
-Runbooks are per target, and each target has its own BookStack instance. A
-target entry may carry a `bookstack` object:
+Runbooks are per target, and each target has its own BookStack instance and
+credential. A target entry may carry a `bookstack` object:
 
 ```json
-"bookstack": {"url": "https://bookstack.example.com", "books": "runbooks"}
+"bookstack": {
+  "url": "https://bookstack.example.com",
+  "books": "runbooks",
+  "token": "operator"
+}
 ```
 
-`url` must be `https`; `books` is a comma-separated list of book ids or slugs.
+`url` must be `https`; `books` is a comma-separated list of book ids or slugs;
+`token` is a suffix, not a secret. The suffix is upper-cased and resolved to
+`BOOKSTACK_TOKEN_ID_<SUFFIX>` / `BOOKSTACK_TOKEN_SECRET_<SUFFIX>`. There is no
+global-token fallback: a target that names a suffix whose pair is missing gets
+no runbooks rather than borrowing another target's credential. The suffix may
+contain letters, digits and underscore only.
+
 The target's `allow_runbooks` flag is the explicit grant, default **false**. A
-target needs both the grant and a complete `bookstack` object; without either,
-both tools refuse and the generated instruction does not mention runbooks.
+target needs the grant, a complete `bookstack` object and a resolvable
+credential pair; without any of them, both tools refuse and the generated
+instruction does not mention runbooks.
 
 In the example configuration, `automations` points at the operator's wiki with
-the single book `runbooks`, and `admin-chat` points at the Vortex wiki with all
-six of its books: `networking`, `operations-getting-started`, `organization`,
-`bookstack`, `v-rising` and `scripts`. Each run exports only its own target's
-URL and books, so an `admin-chat` run cannot reach the operator's instance and
-an `automations` run cannot reach the Vortex one. That isolation is the point of
-the change and is asserted in the tests.
+the single book `runbooks` and the `operator` credential suffix. `admin-chat`
+points at the Vortex wiki with all six of its books — `networking`,
+`operations-getting-started`, `organization`, `bookstack`, `v-rising` and
+`scripts` — and the `vortex` credential suffix. Each run exports only its own
+target's URL, books and resolved token pair, so an `admin-chat` run cannot reach
+the operator's instance or use its token, and an `automations` run cannot reach
+the Vortex one. That isolation is the point of the change and is asserted in the
+tests.
 
 A wiki also holds deployment inventory (real hostnames, Composio connections,
 channel ids, the Auth0 wiring), so this is deliberately not a general wiki
@@ -515,18 +528,21 @@ documentation to read, never an instruction to follow.
 ### Access gate: default-deny, per target
 
 `allow_runbooks` is a per-target boolean, default **false**, and the target's
-`bookstack` object supplies the instance. Adding a target does not grant
-runbooks, and a target that permits CMS content still gets no runbooks unless
-it has both the grant and an instance.
+`bookstack` object supplies the instance, the books and the credential suffix.
+Adding a target does not grant runbooks, and a target that permits CMS content
+still gets no runbooks unless it has the grant, an instance and a resolvable
+credential pair.
 
 `run-prompt.sh` and `scripts/discord_inbound.py` export
-`NOTIFY_RUNBOOKS_ALLOWED=1`, `NOTIFY_BOOKSTACK_URL` and
-`NOTIFY_BOOKSTACK_BOOKS` for the run only when the effective target has
-`allow_runbooks: true` and a complete `bookstack` object; every other run
-clears all three variables. `mcp/bookstack.py` refuses both tools unless the
-grant is exactly `1` and the URL and books are present, before it reads
-configuration or opens a socket. It also refuses a URL that is absent or not
-`https`. The refusal names neither the wiki nor the book.
+`NOTIFY_RUNBOOKS_ALLOWED=1`, `NOTIFY_BOOKSTACK_URL`,
+`NOTIFY_BOOKSTACK_BOOKS`, `NOTIFY_BOOKSTACK_TOKEN_ID` and
+`NOTIFY_BOOKSTACK_TOKEN_SECRET` for the run only when the effective target has
+`allow_runbooks: true`, a complete `bookstack` object and a configured
+credential pair; every other run clears all five variables. `mcp/bookstack.py`
+refuses both tools unless the grant is exactly `1` and the URL, books and token
+pair are present, before it reads configuration or opens a socket. It also
+refuses a URL that is absent or not `https`. The refusal names neither the wiki,
+the book nor the credential.
 
 The CMS content gate is separate. `allow_content: false` still exports
 `NOTIFY_CONTENT_DISABLED=1` for `oracle_search_content`; it does not gate the
@@ -543,19 +559,25 @@ fallback to another source.
 
 ### BookStack environment
 
-The token and timeout are shared by the MCP server. The URL and books are
+The timeout is shared by the MCP server. The URL, books and credential pair are
 per run: `run-prompt.sh` and the inbound listener export them from the target's
 `bookstack` object, and `opencode.json` passes them through with `{env:...}`
 substitution, so no value is written into the config file.
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
-| `BOOKSTACK_TOKEN_ID` | yes | API token id. |
-| `BOOKSTACK_TOKEN_SECRET` | yes | API token secret. |
+| `BOOKSTACK_TOKEN_ID_<SUFFIX>` | yes | API token id for the suffix named in `bookstack.token`, upper-cased. |
+| `BOOKSTACK_TOKEN_SECRET_<SUFFIX>` | yes | API token secret for that suffix. |
 | `BOOKSTACK_TIMEOUT_SECONDS` | no | Per-request timeout, default 10; capped at 60. |
 | `NOTIFY_RUNBOOKS_ALLOWED` | per run | Exported as `1` only for a granted target; not an operator setting. |
 | `NOTIFY_BOOKSTACK_URL` | per run | That target's `bookstack.url`. The MCP requires `https`. |
 | `NOTIFY_BOOKSTACK_BOOKS` | per run | That target's `bookstack.books`; the per-book allowlist. |
+| `NOTIFY_BOOKSTACK_TOKEN_ID` | per run | The resolved `BOOKSTACK_TOKEN_ID_<SUFFIX>` for this run. |
+| `NOTIFY_BOOKSTACK_TOKEN_SECRET` | per run | The resolved `BOOKSTACK_TOKEN_SECRET_<SUFFIX>` for this run. |
+
+The suffix is not a secret: it is the upper-cased name used to look up the
+pair. There is no global-token fallback. A target whose named pair is missing
+gets no runbooks and no mention of them.
 
 An entry in `books` may be a slug or an id. If an entry does not exist on the
 instance, that search is skipped rather than failing the whole run; a search
@@ -567,13 +589,12 @@ nothing, because both tools refuse anyway. `python3 /app/mcp/bookstack.py
 --selftest` reports whether the configuration is present, without making a
 request and without printing the URL or token.
 
-Create the token for a **dedicated BookStack user** whose role can see only the
-books in the target's `books` list — for example a role with "Access System
-API" and content permission on those books alone. The allowlist is the second
-line of defence; that user's role is the first. A token belonging to an
-administrator would defeat both. The token is shared by the MCP server, so it
-must be valid for the instance selected by the run; per-instance tokens are not
-part of this change.
+Create the token for a **dedicated BookStack user** on each instance whose role
+can see only the books in that target's `books` list — for example a role with
+"Access System API" and content permission on those books alone. The allowlist
+is the second line of defence; that user's role is the first. A token belonging
+to an administrator would defeat both. Each target resolves only its own pair,
+so one target cannot borrow another's credential.
 
 Only the `notify` agent may use either tool. `opencode.json` puts a global
 `permissions` deny on `bookstack_search` and `bookstack_read`; the `notify`
@@ -832,7 +853,7 @@ keys are target names and whose values need a `channel_id`, may pin a
 `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` guards:
 
 ```sh
-NOTIFY_TARGETS='{"automations":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true,"bookstack":{"url":"https://bookstack.example.com","books":"runbooks"}},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":["host3.example.com"],"allow_content":false,"allow_runbooks":true,"bookstack":{"url":"https://vortex-bookstack.example.com","books":"networking,operations-getting-started,organization,bookstack,v-rising,scripts"}}}'
+NOTIFY_TARGETS='{"automations":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000","host_scope":["host1.example.com","host2.example.com","host3.example.com"],"allow_runbooks":true,"bookstack":{"url":"https://bookstack.example.com","books":"runbooks","token":"operator"}},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":["host3.example.com"],"allow_content":false,"allow_runbooks":true,"bookstack":{"url":"https://vortex-bookstack.example.com","books":"networking,operations-getting-started,organization,bookstack,v-rising,scripts","token":"vortex"}}}'
 NOTIFY_DEFAULT_TARGET=automations
 ```
 
@@ -883,13 +904,18 @@ Resolution works like this:
   site, CV, projects or pages. A malformed value fails before any request and
   names the offending targets, never their ids.
 - An optional `allow_runbooks` must be a JSON boolean and defaults to `false`.
-  An optional `bookstack` must be an object with an `https://` `url` and a
-  non-empty comma-separated `books` list. A target needs both the grant and the
-  instance; only then are `NOTIFY_RUNBOOKS_ALLOWED=1`,
-  `NOTIFY_BOOKSTACK_URL` and `NOTIFY_BOOKSTACK_BOOKS` exported and runbooks
-  mentioned in its instruction. Every other target clears all three, so
-  `mcp/bookstack.py` refuses both tools. A malformed value fails before any
-  request and names the offending targets, never their ids or values.
+  An optional `bookstack` must be an object with an `https://` `url`, a
+  non-empty comma-separated `books` list, and a `token` suffix of letters,
+  digits and underscore. The suffix resolves to the upper-cased
+  `BOOKSTACK_TOKEN_ID_<SUFFIX>` / `BOOKSTACK_TOKEN_SECRET_<SUFFIX>` pair. A
+  target needs the grant, the instance and a resolvable pair; only then are
+  `NOTIFY_RUNBOOKS_ALLOWED=1`, `NOTIFY_BOOKSTACK_URL`,
+  `NOTIFY_BOOKSTACK_BOOKS`, `NOTIFY_BOOKSTACK_TOKEN_ID` and
+  `NOTIFY_BOOKSTACK_TOKEN_SECRET` exported and runbooks mentioned in its
+  instruction. Every other target clears all five, so `mcp/bookstack.py`
+  refuses both tools. There is no global-token fallback. A malformed value
+  fails before any request and names the offending targets, never their ids or
+  values.
 - `run-prompt.sh` resolves the effective target's `host_scope` and adds a
   plain-words line to the instruction: the delivery scope for the run, and that
   nothing about any other host may appear in the message. It also filters
@@ -906,11 +932,12 @@ Resolution works like this:
   The MCP server is a child of the opencode process, so it inherits the value.
   A target without the flag, or with `true`, behaves exactly as before and the
   variable is not exported.
-- `allow_runbooks` plus the target's `bookstack` object is the hard guard for
-  the BookStack tools: only a target with both exports the grant, URL and books,
-  and `mcp/bookstack.py` refuses both tools for anything else before it reads
-  configuration. The URL must be `https`. The CMS content gate is separate and
-  still applies to `oracle_search_content`.
+- `allow_runbooks` plus the target's `bookstack` object and its named credential
+  pair is the hard guard for the BookStack tools: only a target with all of them
+  exports the grant, URL, books and resolved token pair, and `mcp/bookstack.py`
+  refuses both tools for anything else before it reads configuration. The URL
+  must be `https`, and there is no global-token fallback. The CMS content gate
+  is separate and still applies to `oracle_search_content`.
 - An unknown name fails non-zero before any request and lists the configured
   target names, never their ids.
 - A malformed `NOTIFY_TARGETS` (not an object, or an entry with no `channel_id`)
@@ -1262,7 +1289,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read` are allowed |
 | Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
 | SSH access | key-authenticated, read-only probe; two host boundaries (global allowlist and run scope) are applied before any socket; policy refusals name the host and never connect; no remote command runs |
-| Runbook access | read-only BookStack API, one dedicated token; per-target instances: a target needs `allow_runbooks: true` and a `bookstack` object (`https` url plus books), and only that target's URL/books are exported for the run; `admin-chat` points at the Vortex instance with all six of its books, `automations` at the operator's instance with `runbooks`, and neither can reach the other's instance; a target without a grant or an instance refuses both tools before any request; exactly the books in that target's list can be searched or read, and per-book search means another book is never even fetched; a missing slug is skipped, not fatal; a forbidden page and a missing page share one refusal; redirects refused; token never in a URL, log or error; `allow_content: false` still gates the operator's CMS, not the target's own runbooks |
+| Runbook access | read-only BookStack API, one dedicated token per instance; per-target instances: a target needs `allow_runbooks: true`, a `bookstack` object (`https` url, books and a token suffix), and a configured `BOOKSTACK_TOKEN_ID_<SUFFIX>` / `BOOKSTACK_TOKEN_SECRET_<SUFFIX>` pair; only that target's URL, books and resolved pair are exported for the run; `admin-chat` points at the Vortex instance with all six of its books and the `vortex` credential, `automations` at the operator's instance with `runbooks` and the `operator` credential, and neither can reach the other's instance or borrow its token; a target without a grant, an instance or a resolvable pair refuses both tools before any request; exactly the books in that target's list can be searched or read, and per-book search means another book is never even fetched; a missing slug is skipped, not fatal; a forbidden page and a missing page share one refusal; redirects refused; token never in a URL, log or error; `allow_content: false` still gates the operator's CMS, not the target's own runbooks |
 | Delivery guard | `notify.sh` refuses a scoped target's message when it names a host outside that target's `host_scope`, before any request |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
 | Logs | `json-file`, 10 MB × 3 |
@@ -1319,7 +1346,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - **Inbound message injection.** An allowlisted human's reply becomes an instruction to an agent with database access. The allowlist is the boundary: a non-allowlisted author, a bot, a webhook, a different channel, a duplicate, an over-long message or a mentions-only message never reaches the agent. An allowlisted human can still phrase a request that produces a bad answer or a wide read, exactly as they could by editing a schedule. The agent remains read-only and can still only send through `notify.sh`. The listener never passes the raw Discord payload: it strips mentions, caps length, and wraps the text in a fixed instruction. If the allowlist is too broad, the exposure is too broad.
 - **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
 - **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
-- **Runbook retrieval.** Runbook text leaves the host for the model provider when the agent answers a procedure question, just as host statistics do. The exposure is limited to the books in the target's `bookstack.books` list by code, and to whatever the token's BookStack role can see by permissions. A token for a broad role would defeat the allowlist, so use a dedicated user that can see only the books in that target's list. Each run is bound to one instance, so an `admin-chat` run cannot read the operator's wiki and an `automations` run cannot read the Vortex one. The token itself is shared by the MCP server; per-instance tokens are a follow-up. Runbook text is untrusted data: it can be wrong, stale, or contain injected instructions, and the prompt tells the model not to follow it. A target with no grant or no instance cannot reach a wiki at all.
+- **Runbook retrieval.** Runbook text leaves the host for the model provider when the agent answers a procedure question, just as host statistics do. The exposure is limited to the books in the target's `bookstack.books` list by code, and to whatever that target's token's BookStack role can see by permissions. A token for a broad role would defeat the allowlist, so use a dedicated user on each instance that can see only the books in that target's list. Each run is bound to one instance and its own named credential pair, so an `admin-chat` run cannot read the operator's wiki or use its token, and an `automations` run cannot read the Vortex one. There is no global-token fallback. Runbook text is untrusted data: it can be wrong, stale, or contain injected instructions, and the prompt tells the model not to follow it. A target with no grant, no instance or no resolvable pair cannot reach a wiki at all.
 - **Malicious or compromised model provider.** The provider sees the prompt and the composed message. It can influence message content but not the container's shell surface.
 - **Container compromise.** An attacker who compromises the OpenCode process gets the webhook, provider token, and outbound internet. There is no egress allowlist, so data can be exfiltrated. They still need a container or kernel escape to reach the host.
 - **Docker-host compromise.** Anyone with access to the Docker daemon can read the volume and change the container. Docker is not a security boundary against a hostile host.
@@ -1363,14 +1390,14 @@ Verified while building this branch:
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **338 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **341 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
-- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL and books; `admin-chat` exports the Vortex URL and its six books while `automations` exports the operator URL and `runbooks`, and neither carries the other's URL; a grant without an instance and an instance without a grant export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; malformed values fail before the agent runs. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
+- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
 - `python3 -m py_compile` passes on `mcp/bookstack.py`, `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_bookstack.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh` and `tests/run-prompt-scope.sh`.
 - `opencode.json` statically registers three MCP servers (`oracle`, `ssh` and `bookstack`), gives all three the same 60-second startup/execution budget, keeps the global denies on `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read`, and allows all five for `notify`.
-- `tests/test_bookstack.py` makes real HTTP requests to loopback stubs (with a test-only opener that maps a fake `https://` host to each stub) and asserts what each stub received: search asks only the resolved book on the selected instance, a result whose `book.id` is outside the allowlist is dropped and never contributes to `count`, a page with `book_id: 99` is refused in both id and slug form without fetching its content, and a forbidden page, a missing page and an unknown slug return the identical `page is not available` message with no book or page name. It also covers default-deny: with `NOTIFY_RUNBOOKS_ALLOWED` missing, empty or any value other than `1`, both tools refuse with zero requests, even with a complete BookStack configuration; a grant without a URL or books refuses; a URL that is absent or not `https` fails configuration; the token appearing only in the `Authorization` header (never in a URL parameter) and never in output on a 401 or 500 whose body echoes it; redirect refusal; the allowlist/URL/timeout configuration errors; the startup exit path naming the variable without echoing the value; a startup without the grant serving without configuration; and a server that accepts a connection and never answers failing inside `BOOKSTACK_TIMEOUT_SECONDS`. The isolation tests run an `admin-chat` (Vortex) environment against a Vortex stub and an `automations` (operator) environment against an operator stub: each contacts only its own stub, the other stub receives zero requests, and the exported URLs differ. The allowlist tests also prove that a slug which does not exist on the instance is skipped, that a search with no resolvable book returns an empty result, and that a read is then refused, rather than failing the run.
-- `python3 /app/mcp/bookstack.py --selftest` is exercised in the suite: with configuration it prints names only (no URL, token or book slug), and with a grant but missing tokens it exits `1` naming `BOOKSTACK_TOKEN_ID`. No live BookStack instance was contacted at any point.
+- `tests/test_bookstack.py` makes real HTTP requests to loopback stubs (with a test-only opener that maps a fake `https://` host to each stub) and asserts what each stub received: search asks only the resolved book on the selected instance, a result whose `book.id` is outside the allowlist is dropped and never contributes to `count`, a page with `book_id: 99` is refused in both id and slug form without fetching its content, and a forbidden page, a missing page and an unknown slug return the identical `page is not available` message with no book or page name. It also covers default-deny: with `NOTIFY_RUNBOOKS_ALLOWED` missing, empty or any value other than `1`, both tools refuse with zero requests, even with a complete BookStack configuration; a grant without a URL, books or token pair refuses; a URL that is absent or not `https` fails configuration; there is no fallback to a global `BOOKSTACK_TOKEN_*` pair; the token appearing only in the `Authorization` header (never in a URL parameter) and never in output on a 401 or 500 whose body echoes it; redirect refusal; the allowlist/URL/timeout configuration errors; the startup exit path naming the variable without echoing the value; a startup without the grant serving without configuration; and a server that accepts a connection and never answers failing inside `BOOKSTACK_TIMEOUT_SECONDS`. The isolation tests run an `admin-chat` (Vortex) environment against a Vortex stub and an `automations` (operator) environment against an operator stub: each contacts only its own stub, the other stub receives zero requests, and the exported URLs and token pairs differ; each stub authenticates with its own credential. The allowlist tests also prove that a slug which does not exist on the instance is skipped, that a search with no resolvable book returns an empty result, and that a read is then refused, rather than failing the run.
+- `python3 /app/mcp/bookstack.py --selftest` is exercised in the suite: with configuration it prints names only (no URL, token or book slug), and with a malformed token it exits `1` naming `NOTIFY_BOOKSTACK_TOKEN_SECRET`. No live BookStack instance was contacted at any point.
 
 Not verified here (no credentials, no live hosts, no Docker daemon use):
 
@@ -1388,7 +1415,7 @@ Inbound listener checks on this branch:
 
 - `python3 -m py_compile scripts/discord_inbound.py tests/test_discord_inbound.py` passes.
 - `python3 -m unittest discover -s tests -p 'test_*.py' -v` passes: the existing SQL-guard suite plus the inbound suite. No network, Discord channel, Composio account, database or model is used.
-- The inbound suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the time-based fallback when history is unreadable; backwards pagination to the cursor; the `DISCORDBOT_LIST_MESSAGES` tool request shape (`connected_account_id`, `user_id`, `channel_id`, `limit`, `before`, `x-api-key`) against a stub; success, empty, HTTP error, API failure, malformed payload, missing id, invalid JSON and redirect-refusal cases; and the exact `opencode run --standalone --agent notify --model ... -- <instruction>` argv with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false, and `NOTIFY_RUNBOOKS_ALLOWED`/`NOTIFY_BOOKSTACK_URL`/`NOTIFY_BOOKSTACK_BOOKS` set only when the target has both `allow_runbooks: true` and a `bookstack` object. It also asserts that an `admin-chat` run exports only the Vortex URL and its six books, and an `automations` run exports only the operator URL and `runbooks`; a grant without an instance and an instance without a grant export nothing.
+- The inbound suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the time-based fallback when history is unreadable; backwards pagination to the cursor; the `DISCORDBOT_LIST_MESSAGES` tool request shape (`connected_account_id`, `user_id`, `channel_id`, `limit`, `before`, `x-api-key`) against a stub; success, empty, HTTP error, API failure, malformed payload, missing id, invalid JSON and redirect-refusal cases; and the exact `opencode run --standalone --agent notify --model ... -- <instruction>` argv with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false, and `NOTIFY_RUNBOOKS_ALLOWED`/`NOTIFY_BOOKSTACK_URL`/`NOTIFY_BOOKSTACK_BOOKS`/`NOTIFY_BOOKSTACK_TOKEN_ID`/`NOTIFY_BOOKSTACK_TOKEN_SECRET` set only when the target has `allow_runbooks: true`, a `bookstack` object and a configured credential pair. It also asserts that an `admin-chat` run exports only the Vortex URL, its six books and the `vortex` pair, and an `automations` run exports only the operator URL, `runbooks` and the `operator` pair; a grant without an instance, an instance without a grant, and an unconfigured suffix export nothing.
 - The multi-source suite covers: two sources with their own accounts, channels and reply modes; per-source state file names; per-source allowlists overriding the global list; a source with neither list refusing to start and naming itself; duplicate source names and unsafe names refused; target channel/account mismatches refused; sources plus a webhook refused; independent baselines and cursors; per-source dedupe for the same message id; and both reply paths (named target instruction, and bot environment pinned to the source's `DISCORDBOT_CREATE_MESSAGE` account and channel with webhook/default-target removed).
 - The refusal path is exercised at the real process boundary: with `subprocess.Popen` patched, a message from a disallowed author produces no `Popen` call, no enqueue, and this log line (message id hashed, body absent):
   `refused source=default reason=author_not_allowed msg=d1a35b8e`
