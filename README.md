@@ -70,6 +70,8 @@ docker compose run --rm agent opencode auth login "OpenCode Console" --method de
 
 Use the integration name that matches the provider in `OPENCODE_MODEL` (the example is OpenCode's own integration). Approve the code in the browser. The credential is written to the `opencode-data` volume at `/home/agent/.local/share/opencode`, so it survives container recreation and redeploys. It does not survive `docker compose down -v`.
 
+The preferred model is `OPENCODE_MODEL` (Beam Free); the optional `OPENCODE_MODEL_FALLBACK` (DeepSeek Flash 4.1) is used only when the preferred model cannot serve the request, such as Beam Free's "Free usage limit reached" or a model-not-found/unavailable error. The fallback fires at most once, never after a message was already sent, and never on an ordinary failure. A fallback run is visible in the transcript and the container summary shows the model that did the work.
+
 An API key remains available as a second method:
 
 ```sh

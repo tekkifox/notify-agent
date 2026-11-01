@@ -227,6 +227,7 @@ class Config:
     opencode_bin: str
     delivery: str
     webhook_mode: bool
+    opencode_model_fallback: str | None
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -684,6 +685,13 @@ def load_config(environ: Mapping[str, str]) -> Config:
     if any(character.isspace() for character in model):
         raise ConfigError("OPENCODE_MODEL must not contain whitespace")
 
+    fallback_raw = (env.get("OPENCODE_MODEL_FALLBACK") or "").strip()
+    if fallback_raw and any(character.isspace() for character in fallback_raw):
+        raise ConfigError(
+            "OPENCODE_MODEL_FALLBACK must not contain whitespace"
+        )
+    opencode_model_fallback = fallback_raw or None
+
     opencode_bin = _which_opencode(env)
 
     state_raw = (env.get("NOTIFY_INBOUND_STATE_FILE") or DEFAULT_STATE_FILE).strip()
@@ -751,6 +759,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         opencode_bin=opencode_bin,
         delivery=delivery,
         webhook_mode=webhook_mode,
+        opencode_model_fallback=opencode_model_fallback,
     )
 
 
@@ -1399,8 +1408,11 @@ def _run_agent_once(
     instruction: str,
     stop_event: threading.Event | None,
     summary_text: str | None = None,
+    model: str | None = None,
 ) -> tuple[bool, bool]:
     """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
+
+    effective_model = model if model is not None else config.opencode_model
 
     command = [config.opencode_bin, "run"]
     if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
@@ -1413,7 +1425,7 @@ def _run_agent_once(
             "--agent",
             "notify",
             "--model",
-            config.opencode_model,
+            effective_model,
             "--",
             instruction,
         ]
@@ -1444,7 +1456,7 @@ def _run_agent_once(
     log_fd, budget = agent_capture.record_start(
         log_path,
         f"inbound:{chosen.name}",
-        config.opencode_model,
+        effective_model,
         instruction,
         max_bytes=AGENT_LOG_MAX_BYTES,
     )
@@ -1478,7 +1490,7 @@ def _run_agent_once(
         LOG.error("agent could not start: %s", type(error).__name__)
         agent_capture.print_summary(
             f"inbound:{chosen.name}",
-            config.opencode_model,
+            effective_model,
             "start-failed",
             0.0,
             False,
@@ -1519,7 +1531,7 @@ def _run_agent_once(
         )
         agent_capture.print_summary(
             f"inbound:{chosen.name}",
-            config.opencode_model,
+            effective_model,
             exit_code,
             elapsed,
             sent,
@@ -1592,10 +1604,102 @@ def run_agent(
 
     chosen = _resolve_source(config, source)
     log_path = agent_log_path(config)
+    preferred = config.opencode_model
+    fallback = config.opencode_model_fallback
 
+    def _log_size() -> int:
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _read_slice(start: int) -> str:
+        try:
+            with log_path.open("rb") as handle:
+                handle.seek(start)
+                data = handle.read()
+        except OSError:
+            return ""
+        return data.decode("utf-8", "replace")
+
+    def _model_unavailable(text: str) -> bool:
+        low = text.lower()
+        if "free usage limit reached" in low:
+            return True
+        needles = (
+            "model not found",
+            "model unavailable",
+            "model is unavailable",
+            "unknown model",
+            "no such model",
+            "does not exist",
+        )
+        return any(needle in low for needle in needles)
+
+    def _failure_reason(text: str) -> str:
+        for line in text.splitlines():
+            low = line.lower()
+            if (
+                "free usage limit" in low
+                or "not found" in low
+                or "unavailable" in low
+                or "unknown model" in low
+                or "does not exist" in low
+            ):
+                stripped = line.strip()
+                if stripped:
+                    return stripped
+        return "model unavailable"
+
+    before = _log_size()
     clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event, summary_text=summary_text
+        config, chosen, instruction, stop_event,
+        summary_text=summary_text, model=preferred,
     )
+    after_text = _read_slice(before)
+    if not clean_exit and not sent and fallback and _model_unavailable(after_text):
+        reason = _failure_reason(after_text)
+        # Make the fallback visible in the transcript.
+        try:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"fallback: preferred model {preferred} failed "
+                    f"({reason}); retrying with {fallback}\\n"
+                )
+        except OSError:
+            pass
+        LOG.warning(
+            "agent model unavailable: source=%s preferred=%s fallback=%s; "
+            "retrying once",
+            chosen.name,
+            preferred,
+            fallback,
+        )
+        if stop_event is not None and stop_event.is_set():
+            LOG.info("agent retry skipped: shutdown requested")
+            return False
+        before2 = _log_size()
+        clean_exit2, sent2 = _run_agent_once(
+            config, chosen, instruction, stop_event,
+            summary_text=summary_text, model=fallback,
+        )
+        if not clean_exit2:
+            LOG.warning(
+                "agent fallback failed: source=%s log=%s; not retrying again",
+                chosen.name,
+                log_path,
+            )
+            return False
+        if not sent2:
+            LOG.error(
+                "agent fallback finished without sending: source=%s log=%s; "
+                "not retrying again",
+                chosen.name,
+                log_path,
+            )
+            return False
+        return True
+
     if not clean_exit:
         return False
     if sent:
@@ -1611,7 +1715,8 @@ def run_agent(
         return False
 
     clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event, summary_text=summary_text
+        config, chosen, instruction, stop_event,
+        summary_text=summary_text, model=preferred,
     )
     if not clean_exit:
         LOG.warning(
