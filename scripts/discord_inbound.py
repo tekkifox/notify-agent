@@ -1799,8 +1799,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _install_signal_handlers(stop_event)
     worker = InstructionWorker(
         run=lambda item: run_agent(
-            config, item, stop_event,
-            summary_text=_operator_message_from_instruction(item),
+            config, item[1], stop_event, source=item[0],
+            summary_text=_operator_message_from_instruction(item[1]),
         ),
         maxsize=config.queue_size,
         stop_event=stop_event,
