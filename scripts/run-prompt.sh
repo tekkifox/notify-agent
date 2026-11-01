@@ -253,6 +253,24 @@ if [ -z "${OPENCODE_MODEL:-}" ]; then
     exit 1
 fi
 
+# Validate whitespace the same way the inbound listener does. The fallback is
+# optional; an unset value keeps today's single-attempt behaviour.
+case "$OPENCODE_MODEL" in
+    *[[:space:]]*)
+        printf 'run-prompt: OPENCODE_MODEL must not contain whitespace\n' >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "${OPENCODE_MODEL_FALLBACK:-}" ]; then
+    case "$OPENCODE_MODEL_FALLBACK" in
+        *[[:space:]]*)
+            printf 'run-prompt: OPENCODE_MODEL_FALLBACK must not contain whitespace\n' >&2
+            exit 1
+            ;;
+    esac
+fi
+
 if [ -n "$target" ]; then
     prompt="${instruction}
 
@@ -304,20 +322,7 @@ preflight_mcp "$mcp_server"
 # explicitly allowed by opencode.json is denied.
 #
 # Provider-level logs are opt-in for a run someone is actively debugging.
-set -- opencode run
-if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
-    set -- "$@" --print-logs --log-level debug
-fi
-set -- "$@" \
-    --standalone \
-    --agent notify \
-    --model "$OPENCODE_MODEL" \
-    -- "$prompt"
-
-# Capture the complete run to the same transcript the inbound listener uses.
-# Both derive the directory from XDG_DATA_HOME, so there is one location. If
-# neither XDG_DATA_HOME nor HOME is usable, keep today's inherited output
-# rather than failing a schedule.
+# Determine the transcript location first so both attempts share it.
 debug_log=
 if [ -n "${XDG_DATA_HOME:-}" ]; then
     debug_dir=$XDG_DATA_HOME/opencode
@@ -334,22 +339,118 @@ if [ -n "$debug_dir" ]; then
     fi
 fi
 
-if [ -n "$debug_log" ]; then
-    send_marker=
-    if send_marker=$(mktemp "${TMPDIR:-/tmp}/notify-send.XXXXXX" 2>/dev/null); then
-        rm -f "$send_marker"
-        export NOTIFY_SEND_MARKER="$send_marker"
-    else
-        send_marker=
-        printf 'run-prompt: warning: could not create a send marker; the transcript will report sent=unknown\n' >&2
+# Helper: run one attempt with the given model. Echoes the exit code on stdout
+# of the function via return status. Captured combined output goes to the file
+# named by $attempt_output (set by caller) so the caller can inspect it.
+run_attempt() {
+    attempt_model=$1
+    attempt_output=$2
+
+    set -- opencode run
+    if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
+        set -- "$@" --print-logs --log-level debug
     fi
-    set -- python3 "$script_dir/agent_capture.py" \
-        --log "$debug_log" \
-        --origin "schedule" \
-        --model "$OPENCODE_MODEL" \
-        --instruction "$prompt" \
-        --marker "${send_marker:-}" \
-        -- "$@"
+    set -- "$@" \
+        --standalone \
+        --agent notify \
+        --model "$attempt_model" \
+        -- "$prompt"
+
+    if [ -n "$debug_log" ]; then
+        attempt_marker=
+        if attempt_marker=$(mktemp "${TMPDIR:-/tmp}/notify-send.XXXXXX" 2>/dev/null); then
+            rm -f "$attempt_marker"
+        else
+            attempt_marker=
+        fi
+        if [ -n "$attempt_marker" ]; then
+            export NOTIFY_SEND_MARKER="$attempt_marker"
+        else
+            unset NOTIFY_SEND_MARKER
+        fi
+        before_size=0
+        if [ -f "$debug_log" ]; then
+            before_size=$(wc -c < "$debug_log" | tr -d ' ')
+        fi
+        # run through agent_capture, capturing its exit code
+        python3 "$script_dir/agent_capture.py" \
+            --log "$debug_log" \
+            --origin "schedule" \
+            --model "$attempt_model" \
+            --instruction "$prompt" \
+            --marker "${attempt_marker:-}" \
+            -- "$@"
+        rc=$?
+        # extract this attempt's slice of the transcript for inspection
+        if [ -f "$debug_log" ]; then
+            tail -c +$((before_size + 1)) "$debug_log" > "$attempt_output" 2>/dev/null || true
+        fi
+        if [ -n "$attempt_marker" ]; then
+            if [ -e "$attempt_marker" ]; then
+                : > "$attempt_output.sent"
+            else
+                rm -f "$attempt_output.sent"
+            fi
+            rm -f "$attempt_marker"
+        else
+            rm -f "$attempt_output.sent"
+        fi
+        return $rc
+    fi
+
+    # No transcript: run directly, capturing output for inspection.
+    "$@" >"$attempt_output" 2>&1
+    rc=$?
+    if [ -n "${NOTIFY_SEND_MARKER:-}" ] && [ -e "${NOTIFY_SEND_MARKER}" ]; then
+        : > "$attempt_output.sent"
+    else
+        rm -f "$attempt_output.sent"
+    fi
+    return $rc
+}
+
+model_unavailable() {
+    # $1: output file
+    if grep -Eiq 'free usage limit reached' "$1" 2>/dev/null; then
+        return 0
+    fi
+    if grep -Eiq 'model not found|model unavailable|model is unavailable|unknown model|no such model|does not exist' "$1" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+send_marker_present() {
+    [ -f "$1.sent" ]
+}
+
+fallback="${OPENCODE_MODEL_FALLBACK:-}"
+
+attempt_output=$(mktemp "${TMPDIR:-/tmp}/notify-attempt.XXXXXX" 2>/dev/null) || attempt_output=/tmp/notify-attempt.$$
+: > "$attempt_output"
+
+# First attempt on the preferred model.
+run_attempt "$OPENCODE_MODEL" "$attempt_output"
+rc=$?
+
+sent=0
+if send_marker_present "$attempt_output"; then
+    sent=1
 fi
 
-exec "$@"
+if [ "$rc" -ne 0 ] && [ "$sent" -eq 0 ] && [ -n "$fallback" ] && model_unavailable "$attempt_output"; then
+    # Extract a short reason line for the transcript.
+    reason=$(grep -Eim1 'free usage limit reached|model not found|model unavailable|model is unavailable|unknown model|no such model|does not exist' "$attempt_output" 2>/dev/null | head -n1 | tr -d '\r')
+    [ -n "$reason" ] || reason="model unavailable"
+    if [ -n "$debug_log" ]; then
+        printf 'fallback: preferred model %s unavailable (%s); retrying with %s\n' \
+            "$OPENCODE_MODEL" "$reason" "$fallback" >> "$debug_log"
+    fi
+    printf 'run-prompt: preferred model unavailable; retrying with %s\n' "$fallback" >&2
+
+    run_attempt "$fallback" "$attempt_output"
+    rc=$?
+fi
+
+rm -f "$attempt_output" "$attempt_output.sent"
+exit $rc
