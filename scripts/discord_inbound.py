@@ -2,40 +2,58 @@
 """Inbound Discord replies for the notify agent.
 
 The bot is normally output-only: ``scripts/notify.sh`` posts a message and
-nothing reads the channel.  This listener closes that loop.  It polls one
-admin-chat channel through Composio's proxy endpoint, applies a default-deny
-authorisation model, and for each accepted message runs the existing
-``notify`` OpenCode agent non-interactively.  The agent answers with
+nothing reads the channel.  This listener closes that loop.  It polls one or
+more configured Discord channels through Composio tool execution, applies a
+default-deny authorisation model, and for each accepted message runs the
+existing ``notify`` OpenCode agent non-interactively.  The agent answers with
 ``scripts/notify.sh``, so the answer comes back to the same channel.
 
-Why Composio's proxy and not ``DISCORD_NEW_MESSAGE_TRIGGER``
--------------------------------------------------------------
+Why Composio tool execution and not the proxy or a trigger
+----------------------------------------------------------
 
-The deployment already has a Composio Discord connected account and
-``COMPOSIO_API_KEY``; using it adds no credential.  Composio's trigger is
-delivered by webhook or a realtime Pusher subscription.  This container
-publishes no inbound port, and the trigger API does not expose a documented
-"poll my trigger events" REST method.  The proxy endpoint
-(``POST /api/v3.1/tools/execute/proxy``) does let us make an authenticated
-Discord ``GET /channels/{id}/messages`` call with the same connected account.
-It returns messages newest-first, so the listener walks backwards with the
-``before`` parameter until it reaches its saved cursor, then handles the new
-messages oldest-first.  That is a plain, bounded, idempotent poll with no new
-dependency (``urllib`` is enough).
+The deployment already has a Composio Discord Bot connected account and
+``COMPOSIO_API_KEY``; using it adds no credential.  Composio's proxy endpoint
+(``/api/v3.1/tools/execute/proxy``) works for the ``discord`` user toolkit but
+is **not supported for ``discordbot``** -- it returns
+``Proxy execute is not supported for toolkit "discordbot"``.  The bot toolkit
+must be executed as a tool instead:
+``POST /api/v3.1/tools/execute/DISCORDBOT_LIST_MESSAGES`` with
+``channel_id``, ``limit`` and, when paging, ``before``.  Composio's trigger is
+delivered by webhook or a realtime Pusher subscription; this container
+publishes no inbound port, and the trigger API has no documented "poll my
+trigger events" REST method.  Tool execution is a plain, bounded, idempotent
+poll with no new dependency (``urllib`` is enough).
+
+Discord returns messages newest-first, so the listener walks backwards with
+``before`` until it reaches its saved cursor, then handles the new messages
+oldest-first.
+
+Sources
+-------
+
+``NOTIFY_INBOUND_SOURCES`` is an optional JSON array.  Each entry has a
+``name``, its own ``connected_account_id`` and ``channel_id``, and optionally
+``allowed_authors`` and a reply ``target``.  Every source has its own cursor
+and dedupe file, so one server can never advance another's cursor or suppress
+its messages.  When ``NOTIFY_INBOUND_SOURCES`` is absent, the single-channel
+variables behave exactly as before.
 
 Default-deny rules
 ------------------
 
-* ``NOTIFY_INBOUND_ALLOWED_AUTHORS`` is required.  An empty or missing
-  allowlist makes the listener refuse to start.
-* Only ``NOTIFY_INBOUND_CHANNEL_ID`` is read, and every returned message must
-  carry that same ``channel_id``.
+* ``NOTIFY_INBOUND_ALLOWED_AUTHORS`` is required in single-channel mode.  A
+  source without its own ``allowed_authors`` inherits it, and a source with
+  neither refuses to start.  An empty or missing allowlist never means "allow
+  everyone".
+* Only the configured channel of each source is read, and every returned
+  message must carry that same ``channel_id``.
 * Bot and webhook messages are ignored, including the notification bot's own
   messages.  Only user messages and replies (types 0 and 19) are considered.
 * Message IDs are recorded in a small state file before an instruction is
-  queued, so a restart or an overlapping poll cannot replay it.  The saved
-  cursor also acts as the first-poll baseline: pre-existing messages,
-  including old notifications, are never actioned.
+  queued, so a restart or an overlapping poll cannot replay it.  Each source
+  has its own state file.  The saved cursor also acts as the first-poll
+  baseline: pre-existing messages, including old notifications, are never
+  actioned.
 * Instructions are capped after mention removal; over-long messages are
   refused rather than truncated.
 * One worker thread runs the agent.  A bounded queue absorbs bursts; messages
@@ -70,7 +88,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 LOG = logging.getLogger("discord-inbound")
 
-COMPOSIO_PROXY_PATH = "/api/v3.1/tools/execute/proxy"
+COMPOSIO_EXECUTE_PATH = "/api/v3.1/tools/execute"
+READ_MESSAGES_TOOL = "DISCORDBOT_LIST_MESSAGES"
+REPLY_TOOL = "DISCORDBOT_CREATE_MESSAGE"
 DEFAULT_API_BASE = "https://backend.composio.dev"
 DEFAULT_POLL_SECONDS = 30.0
 MIN_POLL_SECONDS = 5.0
@@ -87,8 +107,9 @@ SEEN_ID_LIMIT = 500
 MESSAGE_PAGE_LIMIT = 100
 MAX_PAGES_PER_POLL = 20
 HTTP_TIMEOUT_SECONDS = 30
-MAX_PROXY_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_TOOL_RESPONSE_BYTES = 2 * 1024 * 1024
 DISCORD_EPOCH_MS = 1_420_070_400_000
+SOURCE_NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")
 
 # Discord message types that can carry a human instruction.  Type 19 is a
 # reply, which is exactly how the captain answers a notification.
@@ -156,14 +177,32 @@ class InboundTarget:
 
 
 @dataclasses.dataclass(frozen=True)
+class InboundSource:
+    """One polled channel with its own account, allowlist and state."""
+
+    name: str
+    channel_id: str
+    connected_account_id: str
+    allowed_authors: frozenset[str]
+    target: InboundTarget | None
+    reply_mode: str  # "target" | "bot" | "legacy" | "webhook"
+    state_file: Path
+    max_instruction_chars: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     api_base: str
     api_key: str = dataclasses.field(repr=False)
+    sources: tuple[InboundSource, ...]
+    # Aliases for the first source, kept so single-channel callers and the
+    # existing tests keep their shape.  Multi-source code uses ``sources``.
     channel_id: str
     allowed_authors: frozenset[str]
     connected_account_id: str
     user_id: str
     target: InboundTarget | None
+    reply_mode: str
     poll_seconds: float
     max_instruction_chars: int
     queue_size: int
@@ -278,42 +317,34 @@ def _format_host_scope(scope: object) -> str:
     return ", ".join(formatted)
 
 
-def _load_target(
+def _load_target_by_name(
     env: Mapping[str, str],
+    name: str,
     channel_id: str,
-) -> InboundTarget | None:
-    """Resolve the named target used for the reply, if one is configured."""
+    *,
+    expected_account: str = "",
+    label: str = "NOTIFY_INBOUND_TARGET",
+) -> InboundTarget:
+    """Resolve one named target and tie it to the inbound channel."""
 
     if (env.get("DISCORD_WEBHOOK_URL") or "").strip():
         # notify.sh rejects -t (and even NOTIFY_DEFAULT_TARGET) when a webhook
         # is set, so a named target here could only fail at reply time.
-        for name in ("NOTIFY_INBOUND_TARGET", "NOTIFY_DEFAULT_TARGET"):
-            if (env.get(name) or "").strip():
-                raise ConfigError(
-                    f"{name} cannot be used with DISCORD_WEBHOOK_URL; "
-                    "a webhook has no named targets"
-                )
-        return None
+        raise ConfigError(
+            f"{label} {name!r} cannot be used with DISCORD_WEBHOOK_URL; "
+            "a webhook has no named targets"
+        )
 
-    name = (env.get("NOTIFY_INBOUND_TARGET") or "").strip()
-    if not name:
-        name = (env.get("NOTIFY_DEFAULT_TARGET") or "").strip()
-    if not name:
-        # Legacy Composio delivery is still allowed, but it cannot be tied to
-        # the inbound channel by this listener.  The operator's existing
-        # COMPOSIO_ARGS/COMPOSIO_CONNECTED_ACCOUNT_ID configuration applies.
-        return None
     if not TARGET_NAME_RE.match(name):
         raise ConfigError(
-            "NOTIFY_INBOUND_TARGET may contain only letters, digits, dot, "
-            "underscore and hyphen"
+            f"{label} may contain only letters, digits, dot, underscore and "
+            "hyphen"
         )
 
     raw_targets = (env.get("NOTIFY_TARGETS") or "").strip()
     if not raw_targets:
         raise ConfigError(
-            f"NOTIFY_INBOUND_TARGET names target {name!r}, but NOTIFY_TARGETS "
-            "is not set"
+            f"{label} names target {name!r}, but NOTIFY_TARGETS is not set"
         )
     try:
         targets = json.loads(raw_targets)
@@ -324,7 +355,7 @@ def _load_target(
     entry = targets.get(name)
     if not isinstance(entry, dict):
         raise ConfigError(
-            f"NOTIFY_INBOUND_TARGET {name!r} is not defined in NOTIFY_TARGETS"
+            f"{label} {name!r} is not defined in NOTIFY_TARGETS"
         )
 
     target_channel = entry.get("channel_id")
@@ -334,9 +365,8 @@ def _load_target(
         raise ConfigError(f"target {name!r} needs a numeric channel_id")
     if int(target_channel.strip()) != int(channel_id):
         raise ConfigError(
-            f"target {name!r} channel_id does not match "
-            "NOTIFY_INBOUND_CHANNEL_ID; refusing to send replies to a "
-            "different channel"
+            f"target {name!r} channel_id does not match the inbound channel; "
+            "refusing to send replies to a different channel"
         )
 
     target_account = entry.get("connected_account_id", "")
@@ -351,6 +381,16 @@ def _load_target(
         raise ConfigError(
             f"target {name!r} connected_account_id contains invalid characters"
         )
+    if expected_account and target_account and target_account != expected_account:
+        raise ConfigError(
+            f"target {name!r} connected_account_id does not match the "
+            "inbound source's connected_account_id; the same bot must read "
+            "and send"
+        )
+    if not target_account:
+        # The read connection is authoritative: fill it in so notify.sh
+        # cannot fall back to an unrelated COMPOSIO_CONNECTED_ACCOUNT_ID.
+        target_account = expected_account
 
     host_scope = ""
     if "host_scope" in entry:
@@ -371,6 +411,20 @@ def _load_target(
         host_scope=host_scope,
         allow_content=allow_content,
     )
+
+
+def _load_target(
+    env: Mapping[str, str],
+    channel_id: str,
+) -> InboundTarget | None:
+    """Resolve the named target used for the single-channel reply, if any."""
+
+    name = (env.get("NOTIFY_INBOUND_TARGET") or "").strip()
+    if not name:
+        name = (env.get("NOTIFY_DEFAULT_TARGET") or "").strip()
+    if not name:
+        return None
+    return _load_target_by_name(env, name, channel_id, label="NOTIFY_INBOUND_TARGET")
 
 
 def _resolve_read_account(
@@ -406,6 +460,182 @@ def _which_opencode(env: Mapping[str, str]) -> str:
     return found
 
 
+def _source_state_path(base: Path, name: str) -> Path:
+    """Return the per-source state file derived from the configured path."""
+
+    return base.with_name(f"{base.stem}.{name}{base.suffix}")
+
+
+def _load_sources(
+    env: Mapping[str, str],
+    *,
+    webhook_mode: bool,
+    global_authors: frozenset[str],
+    max_chars: int,
+    state_path: Path,
+) -> tuple[tuple[InboundSource, ...], str]:
+    """Resolve the configured inbound sources and their reply modes."""
+
+    raw_sources = (env.get("NOTIFY_INBOUND_SOURCES") or "").strip()
+    if not raw_sources:
+        if not global_authors:
+            raise ConfigError(
+                "NOTIFY_INBOUND_ALLOWED_AUTHORS is required; an empty "
+                "allowlist would accept every author"
+            )
+        channel_id = _required(env, "NOTIFY_INBOUND_CHANNEL_ID")
+        if not SNOWFLAKE_RE.match(channel_id):
+            raise ConfigError(
+                "NOTIFY_INBOUND_CHANNEL_ID must be a numeric Discord id"
+            )
+
+        target = _load_target(env, channel_id)
+        account = _resolve_read_account(env, target)
+        if not webhook_mode and not (env.get("COMPOSIO_TOOL") or "").strip():
+            raise ConfigError(
+                "no delivery configured: set DISCORD_WEBHOOK_URL, or "
+                "COMPOSIO_TOOL for the Composio path"
+            )
+        if target is not None:
+            reply_mode = "target"
+            delivery = "composio-target"
+        elif webhook_mode:
+            reply_mode = "webhook"
+            delivery = "discord-webhook"
+        else:
+            reply_mode = "legacy"
+            delivery = "composio"
+
+        source = InboundSource(
+            name="default",
+            channel_id=channel_id,
+            connected_account_id=account,
+            allowed_authors=global_authors,
+            target=target,
+            reply_mode=reply_mode,
+            state_file=state_path,
+            max_instruction_chars=max_chars,
+        )
+        return (source,), delivery
+
+    if webhook_mode:
+        raise ConfigError(
+            "NOTIFY_INBOUND_SOURCES cannot be combined with "
+            "DISCORD_WEBHOOK_URL; each source replies through its own target "
+            "or through the bot"
+        )
+
+    try:
+        entries = json.loads(raw_sources)
+    except json.JSONDecodeError:
+        raise ConfigError("NOTIFY_INBOUND_SOURCES must be a JSON array") from None
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("NOTIFY_INBOUND_SOURCES must be a non-empty JSON array")
+
+    sources: list[InboundSource] = []
+    names: set[str] = set()
+    for index, entry in enumerate(entries, start=1):
+        label = f"NOTIFY_INBOUND_SOURCES entry {index}"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{label} must be an object")
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not SOURCE_NAME_RE.match(name.strip()):
+            raise ConfigError(
+                f"{label} needs a name of 1-64 letters, digits, dot, "
+                "underscore or hyphen"
+            )
+        name = name.strip()
+        if name in names:
+            raise ConfigError(f"{label} repeats source name {name!r}")
+        names.add(name)
+
+        account = entry.get("connected_account_id")
+        if not isinstance(account, str) or not ACCOUNT_ID_RE.match(
+            account.strip()
+        ):
+            raise ConfigError(
+                f"{label} ({name!r}) needs a connected_account_id"
+            )
+        account = account.strip()
+
+        channel_id = entry.get("channel_id")
+        if not isinstance(channel_id, str) or not SNOWFLAKE_RE.match(
+            channel_id.strip()
+        ):
+            raise ConfigError(f"{label} ({name!r}) needs a numeric channel_id")
+        channel_id = channel_id.strip()
+
+        if "allowed_authors" in entry:
+            raw_authors = entry["allowed_authors"]
+            if not isinstance(raw_authors, str):
+                raise ConfigError(
+                    f"{label} ({name!r}) allowed_authors must be a "
+                    "comma-separated string of Discord user ids"
+                )
+            try:
+                authors = parse_allowlist(raw_authors)
+            except ConfigError as error:
+                raise ConfigError(f"{label} ({name!r}): {error}") from None
+        else:
+            authors = global_authors
+        if not authors:
+            raise ConfigError(
+                f"{label} ({name!r}) has no allowed_authors and "
+                "NOTIFY_INBOUND_ALLOWED_AUTHORS is empty"
+            )
+
+        target_name = entry.get("target")
+        if target_name is None:
+            target = None
+            reply_mode = "bot"
+        else:
+            if not isinstance(target_name, str) or not target_name.strip():
+                raise ConfigError(
+                    f"{label} ({name!r}) target must be a non-empty string"
+                )
+            target = _load_target_by_name(
+                env,
+                target_name.strip(),
+                channel_id,
+                expected_account=account,
+                label=f"{label} ({name!r}) target",
+            )
+            reply_mode = "target"
+
+        sources.append(
+            InboundSource(
+                name=name,
+                channel_id=channel_id,
+                connected_account_id=account,
+                allowed_authors=authors,
+                target=target,
+                reply_mode=reply_mode,
+                state_file=_source_state_path(state_path, name),
+                max_instruction_chars=max_chars,
+            )
+        )
+
+    if any(source.reply_mode == "target" for source in sources) and not (
+        env.get("COMPOSIO_TOOL") or ""
+    ).strip():
+        raise ConfigError(
+            "a source names a target, but COMPOSIO_TOOL is not set; notify.sh "
+            "needs the tool slug for the target reply path (for example "
+            "DISCORDBOT_CREATE_MESSAGE)"
+        )
+
+    if len(sources) == 1:
+        delivery = (
+            "composio-target"
+            if sources[0].reply_mode == "target"
+            else "composio-bot"
+        )
+    else:
+        delivery = "multi-source"
+    return tuple(sources), delivery
+
+
 def load_config(environ: Mapping[str, str]) -> Config:
     """Validate environment configuration and return a frozen Config.
 
@@ -422,30 +652,16 @@ def load_config(environ: Mapping[str, str]) -> Config:
         raise ConfigError("COMPOSIO_API_BASE must be an https:// URL")
     api_base = api_base.rstrip("/")
 
-    channel_id = _required(env, "NOTIFY_INBOUND_CHANNEL_ID")
-    if not SNOWFLAKE_RE.match(channel_id):
-        raise ConfigError("NOTIFY_INBOUND_CHANNEL_ID must be a numeric Discord id")
-
-    allowed_authors = parse_allowlist(env.get("NOTIFY_INBOUND_ALLOWED_AUTHORS", ""))
-
     webhook_mode = bool((env.get("DISCORD_WEBHOOK_URL") or "").strip())
     if webhook_mode:
         if not (env.get("DISCORD_WEBHOOK_URL") or "").strip().startswith("https://"):
             raise ConfigError("DISCORD_WEBHOOK_URL must be an https:// URL")
-        delivery = "discord-webhook"
+
+    raw_global_authors = (env.get("NOTIFY_INBOUND_ALLOWED_AUTHORS") or "").strip()
+    if raw_global_authors:
+        global_authors = parse_allowlist(raw_global_authors)
     else:
-        if not (env.get("COMPOSIO_TOOL") or "").strip():
-            raise ConfigError(
-                "no delivery configured: set DISCORD_WEBHOOK_URL, or "
-                "COMPOSIO_TOOL for the Composio path"
-            )
-        delivery = "composio"
-
-    target = _load_target(env, channel_id)
-    if target is not None:
-        delivery = "composio-target"
-
-    connected_account_id = _resolve_read_account(env, target)
+        global_authors = frozenset()
 
     user_id = (env.get("COMPOSIO_USER_ID") or "").strip()
 
@@ -492,14 +708,25 @@ def load_config(environ: Mapping[str, str]) -> Config:
         MAX_RUN_TIMEOUT_SECONDS,
     )
 
+    sources, delivery = _load_sources(
+        env,
+        webhook_mode=webhook_mode,
+        global_authors=global_authors,
+        max_chars=max_chars,
+        state_path=state_path,
+    )
+    first = sources[0]
+
     return Config(
         api_base=api_base,
         api_key=api_key,
-        channel_id=channel_id,
-        allowed_authors=allowed_authors,
-        connected_account_id=connected_account_id,
+        sources=sources,
+        channel_id=first.channel_id,
+        allowed_authors=first.allowed_authors,
+        connected_account_id=first.connected_account_id,
         user_id=user_id,
-        target=target,
+        target=first.target,
+        reply_mode=first.reply_mode,
         poll_seconds=poll_seconds,
         max_instruction_chars=max_chars,
         queue_size=queue_size,
@@ -811,69 +1038,77 @@ class SeenStore:
 
 
 # ---------------------------------------------------------------------------
-# Composio proxy polling
+# Composio tool execution polling
 # ---------------------------------------------------------------------------
 
 
-def _proxy_request(
+def _execute_tool(
     config: Config,
-    endpoint: str,
-    parameters: Sequence[Mapping[str, str]],
+    tool: str,
+    arguments: Mapping[str, Any],
+    connected_account_id: str,
 ) -> object:
-    body: dict[str, Any] = {
-        "endpoint": endpoint,
-        "method": "GET",
-        "parameters": list(parameters),
-    }
-    if config.connected_account_id:
-        body["connected_account_id"] = config.connected_account_id
+    """Execute one Composio tool and return its ``data`` field.
+
+    The bot toolkit does not support the proxy endpoint, so reads go through
+    normal tool execution.  Only the HTTP status and a fixed failure token are
+    reported: a response body can echo arguments, message content or ids.
+    """
+
+    body: dict[str, Any] = {"arguments": dict(arguments)}
+    if connected_account_id:
+        body["connected_account_id"] = connected_account_id
     if config.user_id:
         body["user_id"] = config.user_id
 
     encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
-        f"{config.api_base}{COMPOSIO_PROXY_PATH}",
+        f"{config.api_base}{COMPOSIO_EXECUTE_PATH}/{tool}",
         data=encoded,
         method="POST",
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
             "x-api-key": config.api_key,
-            "User-Agent": "notify-agent-discord-inbound/1",
+            "User-Agent": "notify-agent-discord-inbound/2",
         },
     )
 
     try:
         with _open_request(request) as response:
-            raw = response.read(MAX_PROXY_RESPONSE_BYTES + 1)
+            raw = response.read(MAX_TOOL_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         # Never read or log the response body: it can echo request data.
-        raise FetchError(f"proxy returned HTTP {error.code}") from None
+        raise FetchError(f"tool execution returned HTTP {error.code}") from None
     except urllib.error.URLError as error:
         reason = error.reason
         if isinstance(reason, str) and reason:
-            raise FetchError(f"proxy request failed: {reason}") from None
-        raise FetchError("proxy request failed") from None
+            raise FetchError(f"tool request failed: {reason}") from None
+        raise FetchError("tool request failed") from None
     except (TimeoutError, OSError):
-        raise FetchError("proxy request failed or timed out") from None
+        raise FetchError("tool request failed or timed out") from None
 
-    if len(raw) > MAX_PROXY_RESPONSE_BYTES:
-        raise FetchError("proxy response was too large")
+    if len(raw) > MAX_TOOL_RESPONSE_BYTES:
+        raise FetchError("tool response was too large")
 
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise FetchError("proxy response was not valid JSON") from None
+        raise FetchError("tool response was not valid JSON") from None
     if not isinstance(payload, dict):
-        raise FetchError("proxy response had an unexpected shape")
+        raise FetchError("tool response had an unexpected shape")
 
-    status = payload.get("status")
-    if status != 200:
-        if isinstance(status, int) and not isinstance(status, bool):
-            raise FetchError(f"proxy returned HTTP {status}")
-        raise FetchError("proxy response had no valid status")
-
+    if payload.get("successful") is not True:
+        raise FetchError("tool execution was not successful")
+    if "data" not in payload:
+        raise FetchError("tool response had no data")
     return payload.get("data")
+
+
+def _resolve_source(
+    config: Config, source: InboundSource | None
+) -> InboundSource:
+    return source if source is not None else config.sources[0]
 
 
 def fetch_messages(
@@ -881,52 +1116,43 @@ def fetch_messages(
     *,
     before: str | None = None,
     limit: int = MESSAGE_PAGE_LIMIT,
+    source: InboundSource | None = None,
 ) -> list[dict[str, Any]]:
-    parameters: list[dict[str, str]] = [
-        {"name": "limit", "value": str(limit), "type": "query"}
-    ]
+    chosen = _resolve_source(config, source)
+    arguments: dict[str, Any] = {
+        "channel_id": chosen.channel_id,
+        "limit": limit,
+    }
     if before:
-        parameters.append({"name": "before", "value": before, "type": "query"})
-    data = _proxy_request(
+        arguments["before"] = before
+    data = _execute_tool(
         config,
-        f"/channels/{config.channel_id}/messages",
-        parameters,
+        READ_MESSAGES_TOOL,
+        arguments,
+        chosen.connected_account_id,
     )
-    if not isinstance(data, list):
-        raise FetchError("proxy response did not contain a message list")
+    if not isinstance(data, dict):
+        raise FetchError("tool response did not contain a message list")
+    raw_messages = data.get("messages")
+    if not isinstance(raw_messages, list):
+        raise FetchError("tool response did not contain a message list")
 
     messages: list[dict[str, Any]] = []
-    for item in data:
+    for item in raw_messages:
         if not isinstance(item, dict):
-            raise FetchError("proxy response contained a malformed message")
+            raise FetchError("tool response contained a malformed message")
         message_id = item.get("id")
         if not isinstance(message_id, str) or not SNOWFLAKE_RE.match(message_id):
-            raise FetchError("proxy response contained a message without an id")
+            raise FetchError("tool response contained a message without an id")
         messages.append(item)
     return messages
 
 
-def fetch_channel_last_message_id(config: Config) -> str:
-    """Return the channel's newest message id, even without Read History.
-
-    ``last_message_id`` is visible with View Channel alone.  It gives the
-    baseline a server-side position when Discord returns an empty message list
-    because the bot lacks Read Message History, so a later permission grant
-    cannot make old history look new.
-    """
-
-    data = _proxy_request(config, f"/channels/{config.channel_id}", [])
-    if not isinstance(data, dict):
-        raise FetchError("proxy response did not contain a channel object")
-    last = data.get("last_message_id")
-    if last is None:
-        return ""
-    if not isinstance(last, str) or not SNOWFLAKE_RE.match(last):
-        raise FetchError("proxy response contained an invalid channel object")
-    return last
-
-
-def fetch_new_messages(config: Config, store: SeenStore) -> list[dict[str, Any]]:
+def fetch_new_messages(
+    config: Config,
+    store: SeenStore,
+    source: InboundSource | None = None,
+) -> list[dict[str, Any]]:
     """Return new messages oldest-first, or establish the first-poll baseline.
 
     Discord returns messages newest-first.  ``after`` would return the newest
@@ -936,32 +1162,35 @@ def fetch_new_messages(config: Config, store: SeenStore) -> list[dict[str, Any]]
     long outage; when it is hit the gap is logged and the cursor moves on.
     """
 
+    chosen = _resolve_source(config, source)
+
     if not store.initialized:
         # A single newest message is enough: the baseline is "ignore anything
         # that already exists", including the bot's own past notifications.
-        page = fetch_messages(config, limit=1)
+        page = (
+            fetch_messages(config, limit=1)
+            if source is None
+            else fetch_messages(config, limit=1, source=source)
+        )
         ids = [item["id"] for item in page]
         if ids:
             cursor = max(ids, key=int)
         else:
-            # No visible message can mean an empty channel or a bot without
-            # Read Message History.  last_message_id is visible with View
-            # Channel alone, so it is the better server-side baseline.  A
-            # synthetic now-snowflake is the fallback for a truly empty
-            # channel; both prevent a later permission grant from making old
-            # history look new.
-            cursor = fetch_channel_last_message_id(config)
-            if cursor:
-                LOG.warning(
-                    "channel has messages but none are readable; using its "
-                    "last_message_id as the baseline. Grant Read Message "
-                    "History to read replies."
-                )
-            else:
-                cursor = snowflake_at(time.time())
+            # An empty list can mean an empty channel or a bot without Read
+            # Message History.  A synthetic now-snowflake is a safe baseline
+            # either way: every pre-existing message is older, so a later
+            # permission grant cannot make old history look new.
+            cursor = snowflake_at(time.time())
+            LOG.warning(
+                "source=%s returned no readable messages; using a time-based "
+                "baseline. Grant View Channel and Read Message History if the "
+                "channel is not empty.",
+                chosen.name,
+            )
         store.initialize(ids, cursor)
         LOG.info(
-            "baseline established: ignored=%d cursor=%s",
+            "baseline established: source=%s ignored=%d cursor=%s",
+            chosen.name,
             len(ids),
             short_id(cursor),
         )
@@ -977,7 +1206,17 @@ def fetch_new_messages(config: Config, store: SeenStore) -> list[dict[str, Any]]
         if pages >= MAX_PAGES_PER_POLL:
             truncated = True
             break
-        page = fetch_messages(config, before=before, limit=MESSAGE_PAGE_LIMIT)
+        if source is None:
+            page = fetch_messages(
+                config, before=before, limit=MESSAGE_PAGE_LIMIT
+            )
+        else:
+            page = fetch_messages(
+                config,
+                before=before,
+                limit=MESSAGE_PAGE_LIMIT,
+                source=source,
+            )
         pages += 1
         if not page:
             break
@@ -999,8 +1238,9 @@ def fetch_new_messages(config: Config, store: SeenStore) -> list[dict[str, Any]]
 
     if truncated and by_id:
         LOG.warning(
-            "backlog truncated at %d pages; messages older than the oldest "
-            "returned page are skipped",
+            "source=%s backlog truncated at %d pages; messages older than the "
+            "oldest returned page are skipped",
+            chosen.name,
             MAX_PAGES_PER_POLL,
         )
 
@@ -1012,7 +1252,10 @@ def fetch_new_messages(config: Config, store: SeenStore) -> list[dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
-def build_instruction(config: Config, operator_message: str) -> str:
+def build_instruction(
+    source: Config | InboundSource,
+    operator_message: str,
+) -> str:
     lines = [
         "You are answering an inbound reply from the operator in the admin chat.",
         "",
@@ -1026,20 +1269,21 @@ def build_instruction(config: Config, operator_message: str) -> str:
         operator_message,
         "",
     ]
-    if config.target is not None:
+    target = source.target
+    if target is not None:
         lines.append(
             "Send exactly one reply with:\n"
-            f'/app/scripts/notify.sh -t {config.target.name} -m "<message>"'
+            f'/app/scripts/notify.sh -t {target.name} -m "<message>"'
         )
-        if config.target.host_scope:
+        if target.host_scope:
             lines.append(
                 "\nThe delivery scope for this run is "
-                f"{config.target.host_scope}. Nothing about any other host may "
+                f"{target.host_scope}. Nothing about any other host may "
                 "appear in the reply: report only on the scoped host, and if "
                 "there is no data for it, say that plainly instead of using "
                 "another host's numbers."
             )
-        if not config.target.allow_content:
+        if not target.allow_content:
             lines.append(
                 "\nContent search is disabled for this run: do not use the "
                 "content search tool, and do not include anything about the "
@@ -1079,13 +1323,21 @@ def run_agent(
     config: Config,
     instruction: str,
     stop_event: threading.Event | None = None,
+    source: InboundSource | None = None,
 ) -> bool:
     """Run the notify agent once, non-interactively.
 
     stdout and stderr are discarded: the agent already sends its answer to
     Discord, and discarding keeps model output (which could contain a mistake)
     out of the listener's logs.  Only the exit status and duration are logged.
+
+    A source without a named target replies through the bot: notify.sh is
+    pinned to that source's channel and connected account for this run, so the
+    answer cannot go to another server.  The environment is rebuilt for every
+    run; the worker is single-threaded, so these values never race.
     """
+
+    chosen = _resolve_source(config, source)
 
     command = [
         config.opencode_bin,
@@ -1101,8 +1353,21 @@ def run_agent(
 
     environment = os.environ.copy()
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
-    if config.target is not None and not config.target.allow_content:
+    if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
+    if chosen.reply_mode == "bot":
+        # notify.sh treats DISCORD_WEBHOOK_URL and NOTIFY_DEFAULT_TARGET as
+        # stronger than COMPOSIO_ARGS.  Remove both so this run can only reach
+        # the source's own channel through the source's own bot connection.
+        environment.pop("DISCORD_WEBHOOK_URL", None)
+        environment.pop("NOTIFY_DEFAULT_TARGET", None)
+        environment["COMPOSIO_TOOL"] = REPLY_TOOL
+        environment["COMPOSIO_CONNECTED_ACCOUNT_ID"] = (
+            chosen.connected_account_id
+        )
+        environment["COMPOSIO_ARGS"] = json.dumps(
+            {"channel_id": chosen.channel_id}, separators=(",", ":")
+        )
 
     started = time.monotonic()
     try:
@@ -1155,12 +1420,12 @@ class InstructionWorker:
 
     def __init__(
         self,
-        run: Callable[[str], object],
+        run: Callable[[Any], object],
         maxsize: int,
         stop_event: threading.Event,
     ) -> None:
         self._run = run
-        self._queue: queue.Queue[str] = queue.Queue(maxsize=maxsize)
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
         self._stop = stop_event
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -1175,9 +1440,9 @@ class InstructionWorker:
         )
         self._thread.start()
 
-    def offer(self, instruction: str) -> bool:
+    def offer(self, item: Any) -> bool:
         try:
-            self._queue.put_nowait(instruction)
+            self._queue.put_nowait(item)
             return True
         except queue.Full:
             return False
@@ -1185,14 +1450,14 @@ class InstructionWorker:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                instruction = self._queue.get(timeout=0.5)
+                item = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
                 with self._lock:
                     self._active += 1
                     self._max_active = max(self._max_active, self._active)
-                self._run(instruction)
+                self._run(item)
             except Exception as error:
                 with self._lock:
                     self._failed += 1
@@ -1220,8 +1485,12 @@ class InstructionWorker:
             }
 
 
+def _source_name(source: Config | InboundSource) -> str:
+    return source.name if isinstance(source, InboundSource) else "default"
+
+
 def ingest_messages(
-    config: Config,
+    source: Config | InboundSource,
     messages: Iterable[object],
     store: SeenStore,
     enqueue: Callable[[str], bool],
@@ -1229,31 +1498,40 @@ def ingest_messages(
     """Filter, record and enqueue a poll's messages.
 
     ``enqueue`` is the only route to an agent run.  Tests inject a stub; the
-    listener passes ``InstructionWorker.offer``.
+    listener passes a closure over ``InstructionWorker.offer``.
     """
 
+    name = _source_name(source)
     decisions: list[Decision] = []
     for message in messages:
-        decision = evaluate_message(config, message, store.is_seen)
+        decision = evaluate_message(source, message, store.is_seen)
         decisions.append(decision)
         token = short_id(decision.message_id)
 
         if not decision.accepted:
-            LOG.warning("refused reason=%s msg=%s", decision.reason, token)
+            LOG.warning(
+                "refused source=%s reason=%s msg=%s",
+                name,
+                decision.reason,
+                token,
+            )
             if decision.message_id:
                 store.record(decision.message_id)
             continue
 
         LOG.info(
-            "accepted msg=%s chars=%d",
+            "accepted source=%s msg=%s chars=%d",
+            name,
             token,
             len(decision.text),
         )
         # Record before queuing: at-most-once, never replay after a restart.
         store.record(decision.message_id)
-        instruction = build_instruction(config, decision.text)
+        instruction = build_instruction(source, decision.text)
         if not enqueue(instruction):
-            LOG.warning("dropped reason=queue_full msg=%s", token)
+            LOG.warning(
+                "dropped source=%s reason=queue_full msg=%s", name, token
+            )
     return decisions
 
 
@@ -1293,56 +1571,78 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOG.error("configuration error: %s", error)
         return 2
 
-    try:
-        store = SeenStore(config.state_file)
-    except StateError as error:
-        LOG.error("state error: %s", error)
-        return 3
+    stores: dict[str, SeenStore] = {}
+    for source in config.sources:
+        try:
+            stores[source.name] = SeenStore(source.state_file)
+        except StateError as error:
+            LOG.error("state error: source=%s: %s", source.name, error)
+            return 3
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
     worker = InstructionWorker(
-        run=lambda instruction: run_agent(config, instruction, stop_event),
+        run=lambda item: run_agent(
+            config, item[1], stop_event, source=item[0]
+        ),
         maxsize=config.queue_size,
         stop_event=stop_event,
     )
     worker.start()
 
-    if config.target is not None:
-        target_name = config.target.name
-    elif config.webhook_mode:
-        target_name = "none"
-    else:
-        target_name = "legacy"
     LOG.info(
-        "starting: delivery=%s target=%s poll=%.0fs queue=%d "
-        "max_instruction_chars=%d authors=%d",
+        "starting: sources=%d delivery=%s poll=%.0fs queue=%d "
+        "max_instruction_chars=%d",
+        len(config.sources),
         config.delivery,
-        target_name,
         config.poll_seconds,
         config.queue_size,
         config.max_instruction_chars,
-        len(config.allowed_authors),
     )
-    if config.target is None and not config.webhook_mode:
-        LOG.warning(
-            "no NOTIFY_INBOUND_TARGET or NOTIFY_DEFAULT_TARGET is set; replies "
-            "use the legacy Composio delivery configuration and this listener "
-            "cannot verify that it is the inbound channel"
+    for source in config.sources:
+        reply = source.target.name if source.target is not None else source.reply_mode
+        LOG.info(
+            "source=%s reply=%s authors=%d",
+            source.name,
+            reply,
+            len(source.allowed_authors),
         )
+        if source.reply_mode == "legacy":
+            LOG.warning(
+                "source=%s has no NOTIFY_INBOUND_TARGET or "
+                "NOTIFY_DEFAULT_TARGET; replies use the legacy Composio "
+                "delivery configuration and this listener cannot verify that "
+                "it is the inbound channel",
+                source.name,
+            )
 
     exit_code = 0
     try:
         while not stop_event.is_set():
-            try:
-                messages = fetch_new_messages(config, store)
-                if messages:
-                    ingest_messages(config, messages, store, worker.offer)
-            except FetchError as error:
-                LOG.warning("poll failed: %s", error)
-            except StateError as error:
-                LOG.error("state error: %s", error)
-                exit_code = 3
+            for source in config.sources:
+                store = stores[source.name]
+                try:
+                    messages = fetch_new_messages(config, store, source)
+                    if messages:
+                        ingest_messages(
+                            source,
+                            messages,
+                            store,
+                            lambda text, chosen=source: worker.offer(
+                                (chosen, text)
+                            ),
+                        )
+                except FetchError as error:
+                    LOG.warning(
+                        "poll failed source=%s: %s", source.name, error
+                    )
+                except StateError as error:
+                    LOG.error(
+                        "state error source=%s: %s", source.name, error
+                    )
+                    exit_code = 3
+                    break
+            if exit_code:
                 break
             stop_event.wait(config.poll_seconds)
     finally:

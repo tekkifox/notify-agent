@@ -219,6 +219,393 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("/app/scripts/notify.sh -t", discord_inbound.build_instruction(config, "hi"))
 
 
+CHANNEL2 = "1314326014318481459"
+VORTEX_ACCOUNT = "ca_vortex_test"
+AUTOMATIONS_ACCOUNT = "ca_automations_test"
+
+
+def sources_env(
+    tmpdir: str,
+    *,
+    sources: list[dict[str, object]] | None = None,
+    global_authors: str | None = None,
+    targets: dict[str, object] | None = None,
+) -> dict[str, str]:
+    env = base_env(tmpdir)
+    env.pop("NOTIFY_INBOUND_CHANNEL_ID", None)
+    env.pop("NOTIFY_INBOUND_TARGET", None)
+    env.pop("NOTIFY_TARGETS", None)
+    if global_authors is not None:
+        env["NOTIFY_INBOUND_ALLOWED_AUTHORS"] = global_authors
+    if targets is not None:
+        env["NOTIFY_TARGETS"] = json.dumps(targets)
+    if sources is not None:
+        env["NOTIFY_INBOUND_SOURCES"] = json.dumps(sources)
+    return env
+
+
+def default_sources() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "vortex",
+            "connected_account_id": VORTEX_ACCOUNT,
+            "channel_id": CHANNEL,
+            "allowed_authors": ALLOWED,
+            "target": "admin-chat",
+        },
+        {
+            "name": "automations",
+            "connected_account_id": AUTOMATIONS_ACCOUNT,
+            "channel_id": CHANNEL2,
+        },
+    ]
+
+
+def default_targets() -> dict[str, object]:
+    return {
+        "admin-chat": {
+            "channel_id": CHANNEL,
+            "connected_account_id": VORTEX_ACCOUNT,
+        }
+    }
+
+
+class SourceConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.env = sources_env(
+            self.temp.name,
+            sources=default_sources(),
+            targets=default_targets(),
+        )
+
+    def load(self, **changes: str | None) -> discord_inbound.Config:
+        env = dict(self.env)
+        for key, value in changes.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return discord_inbound.load_config(env)
+
+    def test_two_sources_have_own_accounts_channels_and_reply_modes(self) -> None:
+        config = self.load()
+        self.assertEqual([source.name for source in config.sources], [
+            "vortex",
+            "automations",
+        ])
+        vortex, automations = config.sources
+        self.assertEqual(vortex.connected_account_id, VORTEX_ACCOUNT)
+        self.assertEqual(vortex.channel_id, CHANNEL)
+        self.assertEqual(vortex.reply_mode, "target")
+        self.assertEqual(vortex.target.name, "admin-chat")
+        self.assertEqual(automations.connected_account_id, AUTOMATIONS_ACCOUNT)
+        self.assertEqual(automations.channel_id, CHANNEL2)
+        self.assertEqual(automations.reply_mode, "bot")
+        self.assertIsNone(automations.target)
+        self.assertEqual(config.delivery, "multi-source")
+
+    def test_state_files_are_per_source(self) -> None:
+        config = self.load()
+        vortex, automations = config.sources
+        self.assertNotEqual(vortex.state_file, automations.state_file)
+        self.assertIn(".vortex.", vortex.state_file.name)
+        self.assertIn(".automations.", automations.state_file.name)
+
+    def test_per_source_allowlist_overrides_the_global_one(self) -> None:
+        config = self.load()
+        vortex, automations = config.sources
+        vortex_message = raw_message(
+            channel_id=CHANNEL, author={"id": OTHER_ALLOWED, "bot": False}
+        )
+        automations_message = raw_message(
+            channel_id=CHANNEL2, author={"id": OTHER_ALLOWED, "bot": False}
+        )
+        self.assertEqual(
+            discord_inbound.evaluate_message(
+                vortex, vortex_message, lambda _message_id: False
+            ).reason,
+            "author_not_allowed",
+        )
+        self.assertTrue(
+            discord_inbound.evaluate_message(
+                automations, automations_message, lambda _message_id: False
+            ).accepted
+        )
+
+    def test_source_without_authors_and_empty_global_refuses(self) -> None:
+        with self.assertRaises(discord_inbound.ConfigError) as caught:
+            self.load(NOTIFY_INBOUND_ALLOWED_AUTHORS="")
+        self.assertIn("automations", str(caught.exception))
+
+    def test_source_with_own_authors_works_without_a_global_list(self) -> None:
+        sources = [
+            {
+                "name": "vortex",
+                "connected_account_id": VORTEX_ACCOUNT,
+                "channel_id": CHANNEL,
+                "allowed_authors": ALLOWED,
+                "target": "admin-chat",
+            }
+        ]
+        env = sources_env(
+            self.temp.name,
+            sources=sources,
+            global_authors="",
+            targets=default_targets(),
+        )
+        config = discord_inbound.load_config(env)
+        self.assertEqual(config.sources[0].allowed_authors, {ALLOWED})
+
+    def test_target_account_must_match_the_source(self) -> None:
+        targets = default_targets()
+        targets["admin-chat"]["connected_account_id"] = AUTOMATIONS_ACCOUNT
+        with self.assertRaises(discord_inbound.ConfigError):
+            self.load(NOTIFY_TARGETS=json.dumps(targets))
+
+    def test_target_channel_must_match_the_source(self) -> None:
+        sources = default_sources()
+        sources[0]["target"] = "automations-target"
+        targets = default_targets()
+        targets["automations-target"] = {
+            "channel_id": CHANNEL2,
+            "connected_account_id": VORTEX_ACCOUNT,
+        }
+        with self.assertRaises(discord_inbound.ConfigError):
+            self.load(
+                NOTIFY_INBOUND_SOURCES=json.dumps(sources),
+                NOTIFY_TARGETS=json.dumps(targets),
+            )
+
+    def test_sources_cannot_combine_with_a_webhook(self) -> None:
+        with self.assertRaises(discord_inbound.ConfigError):
+            self.load(DISCORD_WEBHOOK_URL="https://example.invalid/hook")
+
+    def test_source_names_must_be_unique_and_safe(self) -> None:
+        for bad in ("", "../escape", "has space", "."):
+            sources = default_sources()
+            sources[1]["name"] = bad
+            with self.subTest(name=bad):
+                with self.assertRaises(discord_inbound.ConfigError):
+                    self.load(NOTIFY_INBOUND_SOURCES=json.dumps(sources))
+
+        sources = default_sources()
+        sources[1]["name"] = sources[0]["name"]
+        with self.assertRaises(discord_inbound.ConfigError):
+            self.load(NOTIFY_INBOUND_SOURCES=json.dumps(sources))
+
+
+class MultiSourceFetchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = discord_inbound.load_config(
+            sources_env(
+                self.temp.name,
+                sources=default_sources(),
+                targets=default_targets(),
+            )
+        )
+        self.vortex, self.automations = self.config.sources
+        self.vortex_store = discord_inbound.SeenStore(self.vortex.state_file)
+        self.automations_store = discord_inbound.SeenStore(
+            self.automations.state_file
+        )
+
+    def test_each_source_reads_its_own_channel_and_account(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_execute(config, tool, arguments, account):
+            calls.append((arguments["channel_id"], account))
+            return {"messages": []}
+
+        with mock.patch.object(discord_inbound, "_execute_tool", fake_execute):
+            with self.assertLogs("discord-inbound", level="WARNING"):
+                discord_inbound.fetch_new_messages(
+                    self.config, self.vortex_store, self.vortex
+                )
+            with self.assertLogs("discord-inbound", level="WARNING"):
+                discord_inbound.fetch_new_messages(
+                    self.config, self.automations_store, self.automations
+                )
+        self.assertEqual(
+            calls,
+            [
+                (CHANNEL, VORTEX_ACCOUNT),
+                (CHANNEL2, AUTOMATIONS_ACCOUNT),
+            ],
+        )
+
+    def test_sources_have_independent_cursors(self) -> None:
+        pages = {
+            CHANNEL: [
+                raw_message(id="900000000000001001", channel_id=CHANNEL)
+            ],
+            CHANNEL2: [
+                raw_message(id="900000000000002001", channel_id=CHANNEL2)
+            ],
+        }
+
+        def fake_execute(config, tool, arguments, account):
+            return {"messages": pages[arguments["channel_id"]]}
+
+        with mock.patch.object(discord_inbound, "_execute_tool", fake_execute):
+            discord_inbound.fetch_new_messages(
+                self.config, self.vortex_store, self.vortex
+            )
+            discord_inbound.fetch_new_messages(
+                self.config, self.automations_store, self.automations
+            )
+        self.assertEqual(self.vortex_store.cursor, "900000000000001001")
+        self.assertEqual(self.automations_store.cursor, "900000000000002001")
+
+        pages[CHANNEL] = [
+            raw_message(id="900000000000001003", channel_id=CHANNEL),
+            raw_message(id="900000000000001002", channel_id=CHANNEL),
+            raw_message(id="900000000000001001", channel_id=CHANNEL),
+        ]
+        pages[CHANNEL2] = [
+            raw_message(id="900000000000002002", channel_id=CHANNEL2),
+            raw_message(id="900000000000002001", channel_id=CHANNEL2),
+        ]
+        with mock.patch.object(discord_inbound, "_execute_tool", fake_execute):
+            vortex_messages = discord_inbound.fetch_new_messages(
+                self.config, self.vortex_store, self.vortex
+            )
+            automations_messages = discord_inbound.fetch_new_messages(
+                self.config, self.automations_store, self.automations
+            )
+
+        self.assertEqual(
+            [message["id"] for message in vortex_messages],
+            ["900000000000001002", "900000000000001003"],
+        )
+        self.assertEqual(
+            [message["id"] for message in automations_messages],
+            ["900000000000002002"],
+        )
+
+        enqueued: list[str] = []
+        discord_inbound.ingest_messages(
+            self.vortex,
+            vortex_messages,
+            self.vortex_store,
+            lambda text: enqueued.append(text) or True,
+        )
+        self.assertEqual(self.vortex_store.cursor, "900000000000001003")
+        self.assertEqual(self.automations_store.cursor, "900000000000002001")
+
+    def test_dedupe_is_per_source(self) -> None:
+        message_id = "900000000000003001"
+        vortex_message = raw_message(id=message_id, channel_id=CHANNEL)
+        automations_message = raw_message(id=message_id, channel_id=CHANNEL2)
+
+        first = discord_inbound.ingest_messages(
+            self.vortex, [vortex_message], self.vortex_store, lambda _text: True
+        )
+        second = discord_inbound.ingest_messages(
+            self.automations,
+            [automations_message],
+            self.automations_store,
+            lambda _text: True,
+        )
+        self.assertTrue(first[0].accepted)
+        self.assertTrue(second[0].accepted)
+        self.assertTrue(self.vortex_store.is_seen(message_id))
+        self.assertTrue(self.automations_store.is_seen(message_id))
+
+        repeat = discord_inbound.ingest_messages(
+            self.vortex, [vortex_message], self.vortex_store, lambda _text: True
+        )
+        self.assertEqual([decision.reason for decision in repeat], ["duplicate"])
+
+
+class ReplyRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = discord_inbound.load_config(
+            sources_env(
+                self.temp.name,
+                sources=default_sources(),
+                targets=default_targets(),
+            )
+        )
+        self.vortex, self.automations = self.config.sources
+
+    def test_target_source_tells_the_agent_to_use_notify_sh_target(self) -> None:
+        instruction = discord_inbound.build_instruction(self.vortex, "hi")
+        self.assertIn("/app/scripts/notify.sh -t admin-chat", instruction)
+
+    def test_bot_source_tells_the_agent_to_use_plain_notify_sh(self) -> None:
+        instruction = discord_inbound.build_instruction(self.automations, "hi")
+        self.assertIn('/app/scripts/notify.sh -m "<message>"', instruction)
+        self.assertNotIn("/app/scripts/notify.sh -t", instruction)
+
+    def test_bot_reply_environment_is_pinned_to_the_source(self) -> None:
+        base = {
+            "COMPOSIO_TOOL": "SOME_OTHER_TOOL",
+            "COMPOSIO_ARGS": '{"channel_id":"999999999999999999"}',
+            "COMPOSIO_CONNECTED_ACCOUNT_ID": "ca_wrong",
+            "DISCORD_WEBHOOK_URL": "https://example.invalid/hook",
+            "NOTIFY_DEFAULT_TARGET": "admin-chat",
+            "NOTIFY_CONTENT_DISABLED": "1",
+        }
+        with mock.patch.dict(os.environ, base, clear=False):
+            with mock.patch.object(
+                discord_inbound.subprocess,
+                "Popen",
+                return_value=FakeProcess(0),
+            ) as popen:
+                self.assertTrue(
+                    discord_inbound.run_agent(
+                        self.config, "instruction", source=self.automations
+                    )
+                )
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            environment["COMPOSIO_TOOL"],
+            discord_inbound.REPLY_TOOL,
+        )
+        self.assertEqual(
+            environment["COMPOSIO_CONNECTED_ACCOUNT_ID"],
+            AUTOMATIONS_ACCOUNT,
+        )
+        self.assertEqual(
+            json.loads(environment["COMPOSIO_ARGS"]),
+            {"channel_id": CHANNEL2},
+        )
+        self.assertNotIn("DISCORD_WEBHOOK_URL", environment)
+        self.assertNotIn("NOTIFY_DEFAULT_TARGET", environment)
+        self.assertNotIn("NOTIFY_CONTENT_DISABLED", environment)
+
+    def test_target_reply_keeps_the_normal_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMPOSIO_TOOL": "DISCORDBOT_CREATE_MESSAGE",
+                "COMPOSIO_ARGS": '{"channel_id":"999999999999999999"}',
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                discord_inbound.subprocess,
+                "Popen",
+                return_value=FakeProcess(0),
+            ) as popen:
+                discord_inbound.run_agent(
+                    self.config, "instruction", source=self.vortex
+                )
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            environment["COMPOSIO_TOOL"], "DISCORDBOT_CREATE_MESSAGE"
+        )
+        self.assertEqual(
+            environment["COMPOSIO_ARGS"], '{"channel_id":"999999999999999999"}'
+        )
+
+
 class MainTests(unittest.TestCase):
     def test_empty_allowlist_makes_the_listener_exit_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,34 +798,25 @@ class FetchTests(unittest.TestCase):
 
     def test_empty_channel_baseline_uses_a_time_based_cursor(self) -> None:
         with mock.patch.object(discord_inbound, "fetch_messages", return_value=[]):
-            with mock.patch.object(
-                discord_inbound, "fetch_channel_last_message_id", return_value=""
-            ):
-                result = discord_inbound.fetch_new_messages(self.config, self.store)
+            result = discord_inbound.fetch_new_messages(self.config, self.store)
         self.assertEqual(result, [])
         self.assertTrue(self.store.initialized)
         self.assertRegex(self.store.cursor, r"^[0-9]+$")
         self.assertNotEqual(self.store.cursor, "0")
 
-    def test_missing_permission_baseline_uses_last_message_id(self) -> None:
-        # Discord returns [] when the bot lacks Read Message History.  The
-        # channel's last_message_id is still visible, so it is the baseline and
-        # old history does not become new if the permission is granted later.
+    def test_unreadable_history_baseline_does_not_action_old_messages(self) -> None:
+        # An empty result can mean the bot lacks Read Message History.  The
+        # time-based baseline is still newer than all existing messages, so a
+        # later permission grant cannot make old history look new.
         with self.assertLogs("discord-inbound", level="WARNING") as logs:
             with mock.patch.object(
                 discord_inbound, "fetch_messages", return_value=[]
             ):
-                with mock.patch.object(
-                    discord_inbound,
-                    "fetch_channel_last_message_id",
-                    return_value="900000000000000100",
-                ):
-                    result = discord_inbound.fetch_new_messages(
-                        self.config, self.store
-                    )
+                result = discord_inbound.fetch_new_messages(
+                    self.config, self.store
+                )
         self.assertEqual(result, [])
-        self.assertEqual(self.store.cursor, "900000000000000100")
-        self.assertIn("Grant Read Message History", "\n".join(logs.output))
+        self.assertIn("time-based baseline", "\n".join(logs.output))
 
         with mock.patch.object(
             discord_inbound,
@@ -523,36 +901,155 @@ class FakeResponse:
         return self.raw[:size]
 
 
-class ProxyTests(unittest.TestCase):
+class ToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = discord_inbound.load_config(base_env(self.temp.name))
 
-    def test_proxy_request_shape(self) -> None:
+    def fetch(self, payload: object, **kwargs: object):
         with mock.patch.object(
             discord_inbound,
             "_open_request",
-            return_value=FakeResponse(
-                {"status": 200, "data": [{"id": "900000000000000001"}]}
-            ),
+            return_value=FakeResponse(payload),
         ) as opener:
-            messages = discord_inbound.fetch_messages(self.config, limit=1)
+            messages = discord_inbound.fetch_messages(self.config, **kwargs)
+        return messages, opener
+
+    def test_request_shape(self) -> None:
+        messages, opener = self.fetch(
+            {
+                "successful": True,
+                "data": {"messages": [{"id": "900000000000000001"}]},
+            },
+            limit=1,
+        )
         self.assertEqual(messages, [{"id": "900000000000000001"}])
         request = opener.call_args.args[0]
         self.assertEqual(
             request.full_url,
-            "https://backend.composio.dev/api/v3.1/tools/execute/proxy",
+            "https://backend.composio.dev/api/v3.1/tools/execute/"
+            "DISCORDBOT_LIST_MESSAGES",
         )
         self.assertEqual(request.get_header("X-api-key"), self.config.api_key)
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["endpoint"], f"/channels/{CHANNEL}/messages")
-        self.assertEqual(body["method"], "GET")
         self.assertEqual(body["connected_account_id"], ACCOUNT)
         self.assertEqual(body["user_id"], "default")
         self.assertEqual(
-            body["parameters"], [{"name": "limit", "value": "1", "type": "query"}]
+            body["arguments"],
+            {"channel_id": CHANNEL, "limit": 1},
         )
+        self.assertNotIn("endpoint", body)
+        self.assertNotIn("method", body)
+
+    def test_before_is_sent_for_backward_paging(self) -> None:
+        _, opener = self.fetch(
+            {"successful": True, "data": {"messages": []}},
+            before="900000000000000100",
+            limit=2,
+        )
+        body = json.loads(opener.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(
+            body["arguments"],
+            {
+                "channel_id": CHANNEL,
+                "limit": 2,
+                "before": "900000000000000100",
+            },
+        )
+
+    def test_empty_message_list_is_success(self) -> None:
+        messages, _ = self.fetch({"successful": True, "data": {"messages": []}})
+        self.assertEqual(messages, [])
+
+    def test_http_error_is_redacted(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://backend.composio.dev/x",
+            403,
+            "forbidden",
+            {},
+            None,
+        )
+        with mock.patch.object(
+            discord_inbound, "_open_request", side_effect=error
+        ):
+            with self.assertRaises(discord_inbound.FetchError) as caught:
+                discord_inbound.fetch_messages(self.config, limit=1)
+        self.assertEqual(
+            str(caught.exception), "tool execution returned HTTP 403"
+        )
+
+    def test_api_failure_is_an_error_without_echoing_the_body(self) -> None:
+        with mock.patch.object(
+            discord_inbound,
+            "_open_request",
+            return_value=FakeResponse(
+                {
+                    "successful": False,
+                    "error": "SECRET ERROR THAT MUST NOT BE LOGGED",
+                }
+            ),
+        ):
+            with self.assertRaises(discord_inbound.FetchError) as caught:
+                discord_inbound.fetch_messages(self.config, limit=1)
+        self.assertEqual(
+            str(caught.exception), "tool execution was not successful"
+        )
+        self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_missing_success_flag_is_an_error(self) -> None:
+        with mock.patch.object(
+            discord_inbound,
+            "_open_request",
+            return_value=FakeResponse({"data": {"messages": []}}),
+        ):
+            with self.assertRaises(discord_inbound.FetchError):
+                discord_inbound.fetch_messages(self.config, limit=1)
+
+    def test_invalid_json_is_an_error(self) -> None:
+        with mock.patch.object(
+            discord_inbound,
+            "_open_request",
+            return_value=FakeResponse(None, raw=b"not json"),
+        ):
+            with self.assertRaises(discord_inbound.FetchError):
+                discord_inbound.fetch_messages(self.config, limit=1)
+
+    def test_missing_data_is_an_error(self) -> None:
+        with mock.patch.object(
+            discord_inbound,
+            "_open_request",
+            return_value=FakeResponse({"successful": True}),
+        ):
+            with self.assertRaises(discord_inbound.FetchError):
+                discord_inbound.fetch_messages(self.config, limit=1)
+
+    def test_malformed_payload_shapes_are_errors(self) -> None:
+        for payload in (
+            {"successful": True, "data": []},
+            {"successful": True, "data": {}},
+            {"successful": True, "data": {"messages": {}}},
+            {"successful": True, "data": {"messages": ["not-a-dict"]}},
+        ):
+            with self.subTest(payload=payload):
+                with mock.patch.object(
+                    discord_inbound,
+                    "_open_request",
+                    return_value=FakeResponse(payload),
+                ):
+                    with self.assertRaises(discord_inbound.FetchError):
+                        discord_inbound.fetch_messages(self.config, limit=1)
+
+    def test_rejects_a_message_without_an_id(self) -> None:
+        with mock.patch.object(
+            discord_inbound,
+            "_open_request",
+            return_value=FakeResponse(
+                {"successful": True, "data": {"messages": [{}]}}
+            ),
+        ):
+            with self.assertRaises(discord_inbound.FetchError):
+                discord_inbound.fetch_messages(self.config, limit=1)
 
     def test_redirects_are_refused(self) -> None:
         handler = discord_inbound._NoRedirect()
@@ -566,75 +1063,6 @@ class ProxyTests(unittest.TestCase):
                 "https://example.invalid/elsewhere",
             )
         )
-
-    def test_proxy_http_error_is_redacted(self) -> None:
-        error = urllib.error.HTTPError(
-            "https://backend.composio.dev/x",
-            403,
-            "forbidden",
-            {},
-            None,
-        )
-        with mock.patch.object(
-            discord_inbound, "_open_request", side_effect=error
-        ):
-            with self.assertRaises(discord_inbound.FetchError) as caught:
-                discord_inbound.fetch_messages(self.config, limit=1)
-        self.assertEqual(str(caught.exception), "proxy returned HTTP 403")
-
-    def test_proxy_non_200_body_status_is_an_error(self) -> None:
-        with mock.patch.object(
-            discord_inbound,
-            "_open_request",
-            return_value=FakeResponse({"status": 429, "data": []}),
-        ):
-            with self.assertRaises(discord_inbound.FetchError) as caught:
-                discord_inbound.fetch_messages(self.config, limit=1)
-        self.assertEqual(str(caught.exception), "proxy returned HTTP 429")
-
-    def test_proxy_invalid_json_is_an_error(self) -> None:
-        with mock.patch.object(
-            discord_inbound,
-            "_open_request",
-            return_value=FakeResponse(None, raw=b"not json"),
-        ):
-            with self.assertRaises(discord_inbound.FetchError):
-                discord_inbound.fetch_messages(self.config, limit=1)
-
-    def test_proxy_rejects_a_message_without_an_id(self) -> None:
-        with mock.patch.object(
-            discord_inbound,
-            "_open_request",
-            return_value=FakeResponse({"status": 200, "data": [{}]}),
-        ):
-            with self.assertRaises(discord_inbound.FetchError):
-                discord_inbound.fetch_messages(self.config, limit=1)
-
-    def test_channel_last_message_id(self) -> None:
-        with mock.patch.object(
-            discord_inbound,
-            "_open_request",
-            return_value=FakeResponse(
-                {"status": 200, "data": {"last_message_id": "900000000000000001"}}
-            ),
-        ) as opener:
-            last = discord_inbound.fetch_channel_last_message_id(self.config)
-        self.assertEqual(last, "900000000000000001")
-        body = json.loads(opener.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["endpoint"], f"/channels/{CHANNEL}")
-        self.assertEqual(body["parameters"], [])
-
-    def test_channel_with_no_last_message_id(self) -> None:
-        with mock.patch.object(
-            discord_inbound,
-            "_open_request",
-            return_value=FakeResponse(
-                {"status": 200, "data": {"last_message_id": None}}
-            ),
-        ):
-            self.assertEqual(
-                discord_inbound.fetch_channel_last_message_id(self.config), ""
-            )
 
 
 class FakeProcess:

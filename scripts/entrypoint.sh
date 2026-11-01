@@ -58,9 +58,14 @@ start_cron() {
     log "started supercronic (pid $CRON_PID)"
 }
 
+inbound_enabled() {
+    [ -n "${NOTIFY_INBOUND_CHANNEL_ID:-}" ] \
+        || [ -n "${NOTIFY_INBOUND_SOURCES:-}" ]
+}
+
 start_listener() {
-    if [ -z "${NOTIFY_INBOUND_CHANNEL_ID:-}" ]; then
-        log "inbound disabled: NOTIFY_INBOUND_CHANNEL_ID is not set"
+    if ! inbound_enabled; then
+        log "inbound disabled: neither NOTIFY_INBOUND_CHANNEL_ID nor NOTIFY_INBOUND_SOURCES is set"
         LISTENER_PID=
         return 0
     fi
@@ -123,7 +128,7 @@ if [ "$#" -eq 0 ]; then
             fi
         fi
 
-        if [ -n "${NOTIFY_INBOUND_CHANNEL_ID:-}" ] && [ -z "$LISTENER_PID" ]; then
+        if inbound_enabled && [ -z "$LISTENER_PID" ]; then
             start_listener
         elif [ -n "$LISTENER_PID" ] && ! kill -0 "$LISTENER_PID" 2>/dev/null; then
             wait "$LISTENER_PID" 2>/dev/null || true
