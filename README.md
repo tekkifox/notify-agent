@@ -120,7 +120,7 @@ The database side is read-only. For host statistics, query the view
 
 | Column | Meaning |
 | --- | --- |
-| `host_label` | Host name, for example `photos.rossmoney.me`. |
+| `host_label` | Host name, for example `host2.example.com`. |
 | `sampled_at` | The time column (`TIMESTAMP WITH TIME ZONE`). |
 | `cpu_percent` | CPU usage percentage. |
 | `memory_percent` | Memory usage percentage. |
@@ -366,10 +366,10 @@ a scheduled run. Hosts that would start after the deadline are returned as
 Before any connection is attempted, the tool applies two checks:
 
 1. **Global allowlist.** The host must be covered by `SSH_ALLOWED_HOSTS`
-   (default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk`). An entry
-   covers itself and its subdomains, so `vortexservers.co.uk` covers
-   `vortex1.vortexservers.co.uk`, but not `notvortexservers.co.uk` or
-   `vortexservers.co.uk.example`.
+   (default `host1.example.com,host2.example.com,host3.example.com`). An entry
+   covers itself and its subdomains, so `example.com` covers
+   `vortex1.example.com`, but not `notexample.com` or
+   `example.com.example`.
 2. **Run scope.** `run-prompt.sh` exports the selected target's `host_scope` as
    `NOTIFY_HOST_SCOPE`; the tool refuses a host outside it. The optional
    `scope` argument can narrow that list, never widen it. A run scoped to
@@ -395,12 +395,12 @@ subprocess is involved.
 | --- | --- | --- |
 | `SSH_USER` | yes | Unprivileged account used for the key-authenticated probe |
 | `SSH_KEY_PATH` | yes | In-container path of the private key; compose sets `/ssh/id_ed25519` |
-| `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk` |
+| `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `host1.example.com,host2.example.com,host3.example.com` |
 | `SSH_TIMEOUT_SECONDS` | no | Per-host timeout, default 5; capped at 30 |
 | `SSH_TOTAL_TIMEOUT_SECONDS` | no | Whole-call deadline, default 20; capped at 60 |
 | `SSH_PORT` | no | SSH port for every host, default 22 |
 | `SSH_KEY_HOST_FILE` | compose only | Host path bind-mounted read-only at `/ssh/id_ed25519`; set in `.env` or the shell, not `stack.env` |
-| `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `rossmoney.me,photos.rossmoney.me,vortexservers.co.uk` |
+| `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `host1.example.com,host2.example.com,host3.example.com` |
 
 Mount the key read-only, exactly like the Oracle wallet:
 
@@ -421,9 +421,9 @@ check happened. Never commit the key or bake it into the image.
 The rule is about where a host may be discussed, not which host may be probed:
 
 - `admin-chat` is the Vortex server's channel. Its `host_scope` is
-  `["vortexservers.co.uk"]`, so only Vortex hosts may appear there.
+  `["host3.example.com"]`, so only Vortex hosts may appear there.
 - `automations` is TekkiFox's Automations. Its `host_scope` includes
-  `rossmoney.me`, `photos.rossmoney.me` and `vortexservers.co.uk`.
+  `host1.example.com`, `host2.example.com` and `host3.example.com`.
 - A rossmoney hostname, or a figure attributable to one, must never reach
   `admin-chat`.
 
@@ -452,9 +452,9 @@ host line. A rendered example (produced by `mcp/host_report.py`):
 ```text
 **Host report** — 2026-10-31 09:00 UTC
 3/3 hosts reported, 0 stale, 1 flagged
-- [!] rossmoney.me: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
-- photos.rossmoney.me: 46 samples, last-seen 3m ago; CPU 22.8% avg / 28.0% peak; mem 30.6% avg; load 0.23 avg / 0.28 peak; disk 80.3%; SSH auth_refused (authentication refused)
-- vortexservers.co.uk: 49 samples, last-seen 3m ago; CPU 17.9% avg / 25.2% peak; mem 75.7% avg; load 3.57 avg / 5.04 peak; disk 71.2%; SSH ok (61 ms)
+- [!] host1.example.com: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
+- host2.example.com: 46 samples, last-seen 3m ago; CPU 22.8% avg / 28.0% peak; mem 30.6% avg; load 0.23 avg / 0.28 peak; disk 80.3%; SSH auth_refused (authentication refused)
+- host3.example.com: 49 samples, last-seen 3m ago; CPU 17.9% avg / 25.2% peak; mem 75.7% avg; load 3.57 avg / 5.04 peak; disk 71.2%; SSH ok (61 ms)
 ```
 
 Per host, the order is: sample count, last-seen age, CPU average and peak,
@@ -685,7 +685,7 @@ keys are target names and whose values need a `channel_id`, may pin a
 `host_scope` and `allow_content` guards:
 
 ```sh
-NOTIFY_TARGETS='{"automations":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000","host_scope":["rossmoney.me","photos.rossmoney.me","vortexservers.co.uk"]},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":["vortexservers.co.uk"],"allow_content":false}}'
+NOTIFY_TARGETS='{"automations":{"channel_id":"000000000000000000","connected_account_id":"00000000-0000-0000-0000-000000000000","host_scope":["host1.example.com","host2.example.com","host3.example.com"]},"admin-chat":{"channel_id":"111111111111111111","connected_account_id":"11111111-1111-1111-1111-111111111111","host_scope":["host3.example.com"],"allow_content":false}}'
 NOTIFY_DEFAULT_TARGET=automations
 ```
 
@@ -697,7 +697,7 @@ about. Entries cover themselves and their subdomains. `allow_content` is a
 boolean, default `true`; when it is `false` the target may not use the
 content-search tool at all. `automations` is TekkiFox's Automations and may
 report rossmoney and Vortex hosts; `admin-chat` is the Vortex server's admin
-channel and is scoped to `vortexservers.co.uk` only, with `allow_content:
+channel and is scoped to `host3.example.com` only, with `allow_content:
 false`. That keeps the operator's other infrastructure and CMS content out of
 the game-hosting server. A new channel on the same server gets the same
 protection by giving its target the same guard values, without changing code.
@@ -870,20 +870,20 @@ variables when the bot serves more than one server. Each entry needs a unique
 `allowed_authors` and a reply `target`:
 
 ```sh
-NOTIFY_TARGETS='{"admin-chat":{"channel_id":"1314326014318481458","connected_account_id":"ca_Z316jN0W0SEe","host_scope":"vortexservers.co.uk","allow_content":false}}'
+NOTIFY_TARGETS='{"admin-chat":{"channel_id":"000000000000000000","connected_account_id":"ca_EXAMPLECONNECTION","host_scope":"host3.example.com","allow_content":false}}'
 
 NOTIFY_INBOUND_SOURCES='[
-  {"name":"vortex-admin","connected_account_id":"ca_Z316jN0W0SEe","channel_id":"1314326014318481458","allowed_authors":"222222222222222222","target":"admin-chat"},
-  {"name":"automations-general","connected_account_id":"ca_3ZxpTC7jn_S6","channel_id":"1549913741280157818","allowed_authors":"222222222222222222"}
+  {"name":"vortex-admin","connected_account_id":"ca_EXAMPLECONNECTION","channel_id":"000000000000000000","allowed_authors":"222222222222222222","target":"admin-chat"},
+  {"name":"automations-general","connected_account_id":"ca_EXAMPLECONNECTION","channel_id":"000000000000000000","allowed_authors":"222222222222222222"}
 ]'
 ```
 
-The ids above are the documented examples: `ca_Z316jN0W0SEe` is the Vortex
-Game Servers bot connection and `1314326014318481458` is its `#admin-chat`;
-`ca_3ZxpTC7jn_S6` is the TekkiFox's Automations bot connection and
-`1549913741280157818` is its `#general`. The other three Automations channels
-are added the same way, by channel id: `#sonarr` `1549913893470609510`,
-`#seerr` `1556727935266988052`, `#radarr` `1556728270660177940`. Give each its
+The ids above are the documented examples: `ca_EXAMPLECONNECTION` is the Vortex
+Game Servers bot connection and `000000000000000000` is its `#admin-chat`;
+`ca_EXAMPLECONNECTION` is the TekkiFox's Automations bot connection and
+`000000000000000000` is its `#general`. The other three Automations channels
+are added the same way, by channel id: `#sonarr` `000000000000000000`,
+`#seerr` `000000000000000000`, `#radarr` `000000000000000000`. Give each its
 own source name, for example `automations-sonarr`.
 
 Every source has an independent cursor and dedupe file derived from
@@ -1189,7 +1189,7 @@ Verified while building this branch:
 - OpenCode names an MCP tool `<server>_<tool>`, so the server's `query` and `search_content` tools resolve to `oracle_query` and `oracle_search_content`. `opencode debug agents` shows both names denied globally and allowed for `notify`, with `codemode: false` exposing them directly under the V2 `mcp.servers` shape.
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
-- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `rossmoney.me` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
+- The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope` and `allow_content` values fail by target name only, `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
 - The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **242 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py` and `tests/test_host_report.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.

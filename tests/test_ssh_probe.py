@@ -36,9 +36,9 @@ SETTINGS = ssh_probe.Settings(
     total_timeout=20.0,
     port=22,
     allowed_hosts=(
-        "rossmoney.me",
-        "photos.rossmoney.me",
-        "vortexservers.co.uk",
+        "host1.example.com",
+        "host2.example.com",
+        "host3.example.com",
     ),
 )
 
@@ -62,19 +62,19 @@ class PolicyTests(unittest.TestCase):
     def test_allowlisted_host_ok(self) -> None:
         connector = Connector()
         payload = ssh_probe.probe(
-            ["rossmoney.me"], SETTINGS, connector=connector
+            ["host1.example.com"], SETTINGS, connector=connector
         )
         self.assertTrue(payload["configured"])
         self.assertEqual(payload["results"][0]["status"], "ok")
         self.assertEqual(payload["results"][0]["latency_ms"], 12)
-        self.assertEqual(connector.calls, [("rossmoney.me", 5.0)])
+        self.assertEqual(connector.calls, [("host1.example.com", 5.0)])
 
     def test_vortex_host_is_probed_when_in_scope(self) -> None:
         connector = Connector()
         payload = ssh_probe.probe(
-            ["vortexservers.co.uk"],
+            ["host3.example.com"],
             SETTINGS,
-            scope=["vortexservers.co.uk"],
+            scope=["host3.example.com"],
             connector=connector,
         )
         self.assertEqual(payload["results"][0]["status"], "ok")
@@ -83,9 +83,9 @@ class PolicyTests(unittest.TestCase):
     def test_rossmoney_is_refused_in_a_vortex_scope_without_connecting(self) -> None:
         connector = Connector()
         payload = ssh_probe.probe(
-            ["rossmoney.me", "photos.rossmoney.me"],
+            ["host1.example.com", "host2.example.com"],
             SETTINGS,
-            scope=["vortexservers.co.uk"],
+            scope=["host3.example.com"],
             connector=connector,
         )
         self.assertEqual(connector.calls, [])
@@ -111,17 +111,17 @@ class PolicyTests(unittest.TestCase):
     def test_scope_covers_subdomains_but_not_lookalikes(self) -> None:
         self.assertTrue(
             ssh_probe._covered(
-                "vortex1.vortexservers.co.uk", ("vortexservers.co.uk",)
+                "vortex1.example.com", ("example.com",)
             )
         )
         self.assertFalse(
             ssh_probe._covered(
-                "notvortexservers.co.uk", ("vortexservers.co.uk",)
+                "notexample.com", ("example.com",)
             )
         )
         self.assertFalse(
             ssh_probe._covered(
-                "vortexservers.co.uk.example", ("vortexservers.co.uk",)
+                "example.com.example", ("example.com",)
             )
         )
 
@@ -141,10 +141,10 @@ class FailureTests(unittest.TestCase):
         ):
             with self.subTest(status=status):
                 connector = Connector(
-                    {"rossmoney.me": ssh_probe.Outcome(status, None, message)}
+                    {"host1.example.com": ssh_probe.Outcome(status, None, message)}
                 )
                 payload = ssh_probe.probe(
-                    ["rossmoney.me"], SETTINGS, connector=connector
+                    ["host1.example.com"], SETTINGS, connector=connector
                 )
                 result = payload["results"][0]
                 self.assertEqual(result["status"], status)
@@ -154,14 +154,14 @@ class FailureTests(unittest.TestCase):
     def test_one_failing_host_does_not_poison_the_others(self) -> None:
         connector = Connector(
             {
-                "rossmoney.me": ssh_probe.Outcome(
+                "host1.example.com": ssh_probe.Outcome(
                     "auth_refused", None, "authentication refused"
                 ),
-                "photos.rossmoney.me": ssh_probe.Outcome("ok", 30, "connected"),
+                "host2.example.com": ssh_probe.Outcome("ok", 30, "connected"),
             }
         )
         payload = ssh_probe.probe(
-            ["rossmoney.me", "photos.rossmoney.me"],
+            ["host1.example.com", "host2.example.com"],
             SETTINGS,
             connector=connector,
         )
@@ -207,7 +207,7 @@ class FailureTests(unittest.TestCase):
             return ssh_probe.Outcome("ok", 6000, "connected")
 
         payload = ssh_probe.probe(
-            ["a.rossmoney.me", "b.rossmoney.me", "c.rossmoney.me"],
+            ["a.host1.example.com", "b.host1.example.com", "c.host1.example.com"],
             settings,
             connector=connector,
             now=now,
@@ -221,7 +221,7 @@ class FailureTests(unittest.TestCase):
 
     def test_secrets_never_appear_in_output(self) -> None:
         payload = ssh_probe.probe(
-            ["rossmoney.me"], SETTINGS, connector=Connector()
+            ["host1.example.com"], SETTINGS, connector=Connector()
         )
         text = json.dumps(payload)
         self.assertNotIn("agent", text)
@@ -232,7 +232,7 @@ class FailureTests(unittest.TestCase):
 class ConfigurationTests(unittest.TestCase):
     def test_not_configured_is_explicit_and_not_an_error(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            payload = ssh_probe.probe(["rossmoney.me"], connector=Connector())
+            payload = ssh_probe.probe(["host1.example.com"], connector=Connector())
         self.assertFalse(payload["configured"])
         self.assertIn("SSH is not configured", payload["message"])
         self.assertEqual(payload["results"][0]["status"], "not_configured")
@@ -251,9 +251,9 @@ class ConfigurationTests(unittest.TestCase):
                 "SSH_USER": "agent",
                 "SSH_KEY_PATH": key.name,
                 "SSH_ALLOWED_HOSTS": (
-                    "rossmoney.me,photos.rossmoney.me,vortexservers.co.uk"
+                    "host1.example.com,host2.example.com,host3.example.com"
                 ),
-                "NOTIFY_HOST_SCOPE": '["vortexservers.co.uk"]',
+                "NOTIFY_HOST_SCOPE": '["host3.example.com"]',
             }
             connector = Connector()
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
@@ -261,8 +261,8 @@ class ConfigurationTests(unittest.TestCase):
             ):
                 text, is_error = ssh_probe.call_probe(
                     {
-                        "hosts": ["rossmoney.me", "vortexservers.co.uk"],
-                        "scope": ["rossmoney.me", "vortexservers.co.uk"],
+                        "hosts": ["host1.example.com", "host3.example.com"],
+                        "scope": ["host1.example.com", "host3.example.com"],
                     }
                 )
         self.assertFalse(is_error)
@@ -271,7 +271,7 @@ class ConfigurationTests(unittest.TestCase):
             [result["status"] for result in payload["results"]],
             ["out_of_scope", "ok"],
         )
-        self.assertEqual(connector.calls, [("vortexservers.co.uk", 5.0)])
+        self.assertEqual(connector.calls, [("host3.example.com", 5.0)])
 
     def test_selftest_reports_configuration_without_connecting(self) -> None:
         with tempfile.NamedTemporaryFile() as key:
@@ -280,7 +280,7 @@ class ConfigurationTests(unittest.TestCase):
                 "SSH_KEY_PATH": key.name,
                 "SSH_TIMEOUT_SECONDS": "5",
                 "SSH_TOTAL_TIMEOUT_SECONDS": "20",
-                "SSH_ALLOWED_HOSTS": "rossmoney.me,vortexservers.co.uk",
+                "SSH_ALLOWED_HOSTS": "host1.example.com,host3.example.com",
             }
             boom = mock.Mock(side_effect=AssertionError("must not connect"))
             stdout = io.StringIO()

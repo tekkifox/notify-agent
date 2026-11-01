@@ -60,12 +60,12 @@ def row(
 class ShapeTests(unittest.TestCase):
     def test_line_order_matches_the_old_report(self) -> None:
         text = host_report.build_report(
-            [row("rossmoney.me")],
+            [row("host1.example.com")],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertIn(
-            "- rossmoney.me: 10 samples, last-seen 4m ago; "
+            "- host1.example.com: 10 samples, last-seen 4m ago; "
             "CPU 20.0% avg / 40.0% peak; mem 30.0% avg; "
             "load 1.00 avg / 2.00 peak; disk 50.0%",
             text,
@@ -73,9 +73,9 @@ class ShapeTests(unittest.TestCase):
 
     def test_header_and_summary(self) -> None:
         text = host_report.build_report(
-            [row("rossmoney.me"), row("photos.rossmoney.me", age=30)],
+            [row("host1.example.com"), row("host2.example.com", age=30)],
             now=NOW,
-            known_hosts=("rossmoney.me", "photos.rossmoney.me", "silent.example"),
+            known_hosts=("host1.example.com", "host2.example.com", "silent.example"),
         )
         self.assertTrue(
             text.startswith("**Host report** \u2014 2026-10-31 09:00 UTC\n")
@@ -96,10 +96,10 @@ class ShapeTests(unittest.TestCase):
         rows = host_report.rows_from_oracle(
             {
                 "columns": ["HOST_LABEL", "SAMPLE_COUNT", "LAST_SEEN"],
-                "rows": [["rossmoney.me", 3, at(5)]],
+                "rows": [["host1.example.com", 3, at(5)]],
             }
         )
-        self.assertEqual(rows[0]["host_label"], "rossmoney.me")
+        self.assertEqual(rows[0]["host_label"], "host1.example.com")
         self.assertEqual(rows[0]["sample_count"], 3)
 
 
@@ -109,10 +109,10 @@ class OrderingTests(unittest.TestCase):
             [
                 row("zulu.example"),
                 row("alpha.example"),
-                row("photos.rossmoney.me"),
+                row("host2.example.com"),
             ],
             now=NOW,
-            known_hosts=("rossmoney.me", "photos.rossmoney.me"),
+            known_hosts=("host1.example.com", "host2.example.com"),
         )
         order = [
             line.split(":")[0].removeprefix("- ").removeprefix("[!] ")
@@ -122,8 +122,8 @@ class OrderingTests(unittest.TestCase):
         self.assertEqual(
             order,
             [
-                "rossmoney.me",
-                "photos.rossmoney.me",
+                "host1.example.com",
+                "host2.example.com",
                 "alpha.example",
                 "zulu.example",
             ],
@@ -133,18 +133,18 @@ class OrderingTests(unittest.TestCase):
 class StaleTests(unittest.TestCase):
     def test_exactly_twenty_minutes_is_still_fresh(self) -> None:
         text = host_report.build_report(
-            [row("rossmoney.me", age=20)],
+            [row("host1.example.com", age=20)],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertNotIn("STALE", text)
         self.assertIn("0 stale", text)
 
     def test_older_than_twenty_minutes_is_stale(self) -> None:
         text = host_report.build_report(
-            [row("rossmoney.me", age=21)],
+            [row("host1.example.com", age=21)],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertIn("STALE: no sample in the last 20m", text)
         self.assertIn("1 stale", text)
@@ -153,9 +153,9 @@ class StaleTests(unittest.TestCase):
 class ThresholdTests(unittest.TestCase):
     def assert_flagged(self, **values) -> str:
         text = host_report.build_report(
-            [row("rossmoney.me", **values)],
+            [row("host1.example.com", **values)],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         return text
 
@@ -179,7 +179,7 @@ class ThresholdTests(unittest.TestCase):
         text = self.assert_flagged(
             cpu_peak=91.0, memory_avg=92.0, load_peak=9.0, disk=93.0
         )
-        self.assertIn("- [!] rossmoney.me:", text)
+        self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
             "(CPU peak 91.0% >= 90%; memory 92.0% >= 90%; "
             "load peak 9.00 >= 8; disk 93.0% >= 90%)",
@@ -213,27 +213,27 @@ class TruncationTests(unittest.TestCase):
 class DigestTests(unittest.TestCase):
     def test_ssh_success_is_folded_into_the_host_line(self) -> None:
         text = host_report.build_digest(
-            [row("rossmoney.me")],
+            [row("host1.example.com")],
             ssh_results=[
-                {"host": "rossmoney.me", "status": "ok", "latency_ms": 42}
+                {"host": "host1.example.com", "status": "ok", "latency_ms": 42}
             ],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertIn("disk 50.0%; SSH ok (42 ms)", text)
 
     def test_ssh_failures_keep_their_class_and_reason(self) -> None:
         text = host_report.build_digest(
-            [row("rossmoney.me")],
+            [row("host1.example.com")],
             ssh_results=[
                 {
-                    "host": "rossmoney.me",
+                    "host": "host1.example.com",
                     "status": "auth_refused",
                     "message": "authentication refused",
                 }
             ],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertIn(
             "SSH auth_refused (authentication refused)", text
@@ -241,26 +241,26 @@ class DigestTests(unittest.TestCase):
 
     def test_refused_statuses_are_never_rendered(self) -> None:
         text = host_report.build_digest(
-            [row("rossmoney.me")],
+            [row("host1.example.com")],
             ssh_results=[
                 {
-                    "host": "photos.rossmoney.me",
+                    "host": "host2.example.com",
                     "status": "out_of_scope",
                     "message": "host is outside this run's delivery scope",
                 }
             ],
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
-        self.assertNotIn("photos.rossmoney.me", text)
+        self.assertNotIn("host2.example.com", text)
         self.assertNotIn("out_of_scope", text)
 
     def test_not_configured_is_said_once_without_implying_health(self) -> None:
         text = host_report.build_digest(
-            [row("rossmoney.me")],
+            [row("host1.example.com")],
             ssh_configured=False,
             now=NOW,
-            known_hosts=("rossmoney.me",),
+            known_hosts=("host1.example.com",),
         )
         self.assertEqual(
             text.count("SSH not configured; no SSH health was checked."), 1

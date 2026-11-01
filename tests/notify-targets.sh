@@ -256,10 +256,10 @@ fi
 bad_case=0
 for bad in \
     '{"general":{"channel_id":"111111111111111111","host_scope":123}}' \
-    '{"general":{"channel_id":"111111111111111111","host_scope":["vortexservers.co.uk",7]}}' \
+    '{"general":{"channel_id":"111111111111111111","host_scope":["host3.example.com",7]}}' \
     '{"general":{"channel_id":"111111111111111111","host_scope":[]}}' \
     '{"general":{"channel_id":"111111111111111111","host_scope":""}}' \
-    '{"general":{"channel_id":"111111111111111111","host_scope":{"host":"vortexservers.co.uk"}}}'; do
+    '{"general":{"channel_id":"111111111111111111","host_scope":{"host":"host3.example.com"}}}'; do
     bad_case=$((bad_case + 1))
     expect_fail "malformed host_scope case $bad_case fails without a request" \
         send NOTIFY_TARGETS="$bad"
@@ -419,8 +419,8 @@ fi
 # 9. Delivery-boundary guard: a rossmoney host in an admin-chat report is
 #    refused before the delivery call, and the same report succeeds on the
 #    automations target.
-scoped_targets='{"admin-chat":{"channel_id":"222222222222222222","host_scope":["vortexservers.co.uk"]},"automations":{"channel_id":"555555555555555555","host_scope":["rossmoney.me","photos.rossmoney.me","vortexservers.co.uk"]},"other":{"channel_id":"666666666666666666"}}'
-leak_report='Host report: rossmoney.me is healthy; CPU 20.0% avg / 40.0% peak.'
+scoped_targets='{"admin-chat":{"channel_id":"222222222222222222","host_scope":["host3.example.com"]},"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com","host3.example.com"]},"other":{"channel_id":"666666666666666666"}}'
+leak_report='Host report: host1.example.com is healthy; CPU 20.0% avg / 40.0% peak.'
 
 before=$(count_requests)
 set +e
@@ -434,7 +434,7 @@ elif [ "$after" -ne "$before" ]; then
     no "host-scope leak: admin-chat made a delivery request despite the refusal"
 elif ! contains "$out" "outside its host_scope"; then
     no "host-scope leak: refusal did not name the scope problem"
-elif ! contains "$out" "rossmoney.me"; then
+elif ! contains "$out" "host1.example.com"; then
     no "host-scope leak: refusal did not name the offending host"
 else
     pass "admin-chat refuses a rossmoney report before delivery"
@@ -454,7 +454,7 @@ else
     body=$(body_of "$((after - 1))")
     if [ "$(printf '%s' "$body" | jq -r '.arguments.channel_id')" != "555555555555555555" ]; then
         no "host-scope leak: automations delivered to the wrong channel"
-    elif ! contains "$(printf '%s' "$body" | jq -r '.arguments.content')" "rossmoney.me"; then
+    elif ! contains "$(printf '%s' "$body" | jq -r '.arguments.content')" "host1.example.com"; then
         no "host-scope leak: automations message lost the host"
     else
         pass "the same rossmoney report is delivered to automations"
@@ -464,7 +464,7 @@ fi
 # 10. A vortex host is valid on admin-chat.
 before=$(count_requests)
 set +e
-out=$(send_message admin-chat "Host report: vortexservers.co.uk is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+out=$(send_message admin-chat "Host report: host3.example.com is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
 rc=$?
 set -e
 after=$(count_requests)
@@ -498,24 +498,24 @@ done
 # 12. Subdomains are covered by a scope entry, in both directions.
 before=$(count_requests)
 set +e
-out=$(send_message admin-chat "Host report: photos.rossmoney.me is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+out=$(send_message admin-chat "Host report: host2.example.com is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
 rc=$?
 set -e
 after=$(count_requests)
 if [ "$rc" -eq 0 ] || [ "$after" -ne "$before" ]; then
-    no "host-scope subdomain: admin-chat accepted photos.rossmoney.me"
+    no "host-scope subdomain: admin-chat accepted host2.example.com"
 else
     pass "a rossmoney subdomain is refused on admin-chat"
 fi
 
 before=$(count_requests)
 set +e
-out=$(send_message automations "Host report: photos.rossmoney.me is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
+out=$(send_message automations "Host report: host2.example.com is healthy." NOTIFY_TARGETS="$scoped_targets" 2>&1)
 rc=$?
 set -e
 after=$(count_requests)
 if [ "$rc" -ne 0 ] || [ "$after" -ne $((before + 1)) ]; then
-    no "host-scope subdomain: automations rejected photos.rossmoney.me: $out"
+    no "host-scope subdomain: automations rejected host2.example.com: $out"
 else
     pass "a configured rossmoney subdomain is accepted on automations"
 fi
@@ -525,7 +525,7 @@ before=$(count_requests)
 set +e
 # The backticks are literal message text, not a command substitution.
 # shellcheck disable=SC2016
-out=$(send_message admin-chat 'See `https://rossmoney.me/status` for details.' NOTIFY_TARGETS="$scoped_targets" 2>&1)
+out=$(send_message admin-chat 'See `https://host1.example.com/status` for details.' NOTIFY_TARGETS="$scoped_targets" 2>&1)
 rc=$?
 set -e
 after=$(count_requests)

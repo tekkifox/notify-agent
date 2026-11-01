@@ -216,7 +216,7 @@ fi
 # sent no samples. Mirror that here: HOST_REPORT_HOSTS is the ordered known-host
 # list, filtered to the target's delivery scope when there is one. The agent
 # cannot read the environment, so the list is carried into the instruction.
-host_report_hosts_raw=${HOST_REPORT_HOSTS:-rossmoney.me,photos.rossmoney.me,vortexservers.co.uk}
+host_report_hosts_raw=${HOST_REPORT_HOSTS:-host1.example.com,host2.example.com,host3.example.com}
 known_hosts_rendered=
 if command -v jq >/dev/null 2>&1; then
     known_hosts_list=$(printf '%s' "$host_report_hosts_raw" | jq -Rr --argjson scope "$target_host_scope_json" '

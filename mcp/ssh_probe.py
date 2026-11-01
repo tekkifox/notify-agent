@@ -13,7 +13,7 @@ Two independent host boundaries are enforced here, before any socket is
 opened:
 
 * the global ``SSH_ALLOWED_HOSTS`` allowlist (default
-  ``rossmoney.me,photos.rossmoney.me,vortexservers.co.uk``); and
+  ``host1.example.com,host2.example.com,host3.example.com``); and
 * the delivery scope for the run, passed in ``NOTIFY_HOST_SCOPE`` by
   ``scripts/run-prompt.sh`` from the selected target's ``host_scope``. The
   optional ``scope`` argument may narrow that list, never widen it.
@@ -77,9 +77,9 @@ PROTOCOL_VERSIONS = (
 # The old host report's default list, mirrored here so SSH checks cover the
 # same machines. Entries cover themselves and their subdomains.
 DEFAULT_ALLOWED_HOSTS = (
-    "rossmoney.me",
-    "photos.rossmoney.me",
-    "vortexservers.co.uk",
+    "host1.example.com",
+    "host2.example.com",
+    "host3.example.com",
 )
 
 # Set by run-prompt.sh for a target with a host_scope. JSON array, or a
@@ -350,9 +350,9 @@ def _canonical(host: str) -> str:
 def _covered(host: str, entries: Sequence[str]) -> bool:
     """True when an allowlist/scope entry covers the host.
 
-    An entry matches itself and its subdomains, so ``vortexservers.co.uk``
-    covers ``vortex1.vortexservers.co.uk`` but not
-    ``notvortexservers.co.uk`` or ``vortexservers.co.uk.example``.
+    An entry matches itself and its subdomains, so ``example.com``
+    covers ``vortex1.example.com`` but not
+    ``notexample.com`` or ``example.com.example``.
     """
 
     return any(

@@ -140,7 +140,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 PY
 
-targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"vortexservers.co.uk","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false}}'
+targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222","host_scope":"host3.example.com","allow_content":false},"multi":{"channel_id":"333333333333333333","host_scope":["a.example","b.example"]},"content-off":{"channel_id":"444444444444444444","allow_content":false}}'
 
 failures=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -174,7 +174,7 @@ Compose a status message.
 The target for this run is `general`. Send with:
 /app/scripts/notify.sh -t general -m "<message>"
 
-The known hosts for this run are `rossmoney.me`, `photos.rossmoney.me`, `vortexservers.co.uk`. Include one line for each, in this order, even if it has no samples. Do not add a known host outside the permitted hosts.
+The known hosts for this run are `host1.example.com`, `host2.example.com`, `host3.example.com`. Include one line for each, in this order, even if it has no samples. Do not add a known host outside the permitted hosts.
 EOF
 )
 
@@ -189,7 +189,7 @@ if [ "$rc" -ne 0 ]; then
     no "scoped target: run-prompt.sh failed: $(cat "$tmp/scoped.stderr")"
 else
     prompt=$(cat "$tmp/scoped")
-    if ! contains "$prompt" "The delivery scope for this run is \`vortexservers.co.uk\`."; then
+    if ! contains "$prompt" "The delivery scope for this run is \`host3.example.com\`."; then
         no "scoped target: instruction did not state the scope"
     elif ! contains "$prompt" "Nothing about any other host may appear in the message"; then
         no "scoped target: instruction did not state the host boundary"
@@ -203,7 +203,7 @@ else
         no "scoped target: instruction lost the target command"
     elif [ "$(cat "$tmp/scoped.env")" != "1" ]; then
         no "scoped target: NOTIFY_CONTENT_DISABLED was not exported"
-    elif [ "$(cat "$tmp/scoped.scope")" != '["vortexservers.co.uk"]' ]; then
+    elif [ "$(cat "$tmp/scoped.scope")" != '["host3.example.com"]' ]; then
         no "scoped target: NOTIFY_HOST_SCOPE was not exported as JSON"
     else
         pass "scoped target carries the delivery scope and content block"

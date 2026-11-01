@@ -54,9 +54,9 @@ DISK_PERCENT = 90.0
 #: Mirrors the old ``HOST_REPORT_HOSTS`` default. Override in the prompt
 #: instruction / environment; this is only the fallback.
 KNOWN_HOSTS: tuple[str, ...] = (
-    "rossmoney.me",
-    "photos.rossmoney.me",
-    "vortexservers.co.uk",
+    "host1.example.com",
+    "host2.example.com",
+    "host3.example.com",
 )
 
 TRUNCATION_NOTICE = "\u2026 truncated: {count} host line(s) not shown"
