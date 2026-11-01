@@ -34,6 +34,9 @@ Named targets (Composio only):
   NOTIFY_TARGETS           JSON object: name -> {channel_id, connected_account_id,
                            host_scope, allow_content}
                            host_scope and allow_content are optional target guards.
+                           A host_scope is enforced here: if the message names a
+                           host outside the permitted list (or its subdomains),
+                           notify.sh exits non-zero and sends nothing.
   NOTIFY_DEFAULT_TARGET    target name used when -t is omitted
   The name must exist in NOTIFY_TARGETS; unknown names fail without sending.
   A target cannot be combined with DISCORD_WEBHOOK_URL.
@@ -197,7 +200,49 @@ if [ -n "$target_name" ]; then
     target_connected_account_id=$(printf '%s' "$targets_json" \
         | jq -r --arg name "$target_name" '.[$name].connected_account_id // ""') \
         || fail "could not resolve target \"${target_name}\""
+    target_host_scope_json=$(printf '%s' "$targets_json" \
+        | jq -c --arg name "$target_name" '
+            if has($name) then
+                (.[$name].host_scope // [] | if type == "string" then [.] else . end)
+            else [] end
+        ') \
+        || fail "could not resolve host_scope for target \"${target_name}\""
+else
+    target_host_scope_json='[]'
 fi
+
+# Delivery-boundary guard. This is the last line of defence for a scoped
+# target: even if the model ignores the prompt or a prompt injection writes a
+# host it should not, the message never leaves the container. A host-like
+# token is any dotted name with a letters-only suffix. It is accepted when it
+# equals a host_scope entry or is a subdomain of one; anything else refuses the
+# send. This intentionally catches more than the operator's own hostnames:
+# a scoped message that mentions github.com is refused too, because the safe
+# failure is to send nothing. It does not catch bare labels, IP addresses,
+# spaced or obfuscated names, or a figure with no hostname; the prompt is the
+# layer that handles those, and the README says so.
+enforce_host_scope() {
+    [ -n "$target_name" ] || return 0
+    [ -n "$target_host_scope_json" ] || return 0
+    [ "$target_host_scope_json" != "[]" ] || return 0
+
+    leaked=$(printf '%s' "$message" | jq -Rrs --argjson scope "$target_host_scope_json" '
+        def norm: ascii_downcase | gsub("\\.+$"; "");
+        def covered($h; $list):
+            any($list[]; . as $e | ($h == $e) or ($h | endswith("." + $e)));
+        ($scope | map(norm)) as $allowed
+        | [ scan("[A-Za-z0-9][A-Za-z0-9._-]*\\.[A-Za-z]{2,}") ]
+        | map(norm)
+        | map(select(covered(.; $allowed) | not))
+        | unique
+        | join(", ")
+    ') || fail "could not check the message against the delivery scope"
+    if [ -n "$leaked" ]; then
+        fail "message for target \"${target_name}\" names host(s) outside its host_scope: ${leaked}"
+    fi
+}
+
+enforce_host_scope
 
 send_discord() {
     webhook_url=${DISCORD_WEBHOOK_URL:-}

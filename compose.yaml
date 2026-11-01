@@ -41,6 +41,9 @@ services:
       # In-container path of the read-only Oracle wallet mount below. The MCP
       # server reads it from this variable; no wallet material is in the image.
       ORACLE_WALLET_DIR: /wallet
+      # In-container path of the read-only SSH key mount below. The SSH MCP
+      # server reads it from this variable; no key material is in the image.
+      SSH_KEY_PATH: /ssh/id_ed25519
 
     # Root filesystem is immutable. Only the named volume and these tmpfs
     # mounts are writable. OpenCode needs home/cache/state/tmp paths.
@@ -67,6 +70,13 @@ services:
       # absolute host path. The container path must stay /wallet, matching
       # ORACLE_WALLET_DIR.
       - ${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}:/wallet:ro
+      # SSH private key for the read-only health probe, mounted read-only.
+      # Set SSH_KEY_HOST_FILE to the host file (default ./ssh/id_ed25519,
+      # gitignored). The container path must stay /ssh/id_ed25519, matching
+      # SSH_KEY_PATH. If the host file is missing, Docker may create an empty
+      # directory; ssh_probe then reports SSH as not configured instead of
+      # pretending a check happened.
+      - ${SSH_KEY_HOST_FILE:-./ssh/id_ed25519}:/ssh/id_ed25519:ro
       - ${SCHEDULES_FILE:-./crontab}:/app/crontab:ro
 
     # No ports: outbound only. No Docker socket, no host /etc or /home,

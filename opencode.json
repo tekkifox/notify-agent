@@ -13,6 +13,11 @@
       "action": "oracle_search_content",
       "resource": "*",
       "effect": "deny"
+    },
+    {
+      "action": "ssh_probe",
+      "resource": "*",
+      "effect": "deny"
     }
   ],
   "mcp": {
@@ -33,12 +38,32 @@
           "PYTHONPATH": "/opt/mcp-python",
           "PYTHONUNBUFFERED": "1"
         }
+      },
+      "ssh": {
+        "type": "local",
+        "command": ["python3", "/app/mcp/ssh_probe.py"],
+        "codemode": false,
+        "timeout": {
+          "startup": 60000,
+          "execution": 60000
+        },
+        "environment": {
+          "SSH_USER": "{env:SSH_USER}",
+          "SSH_KEY_PATH": "{env:SSH_KEY_PATH}",
+          "SSH_ALLOWED_HOSTS": "{env:SSH_ALLOWED_HOSTS}",
+          "SSH_TIMEOUT_SECONDS": "{env:SSH_TIMEOUT_SECONDS}",
+          "SSH_TOTAL_TIMEOUT_SECONDS": "{env:SSH_TOTAL_TIMEOUT_SECONDS}",
+          "SSH_PORT": "{env:SSH_PORT}",
+          "NOTIFY_HOST_SCOPE": "{env:NOTIFY_HOST_SCOPE}",
+          "PYTHONPATH": "/opt/mcp-python",
+          "PYTHONUNBUFFERED": "1"
+        }
       }
     }
   },
   "agent": {
     "notify": {
-      "description": "Composes one notification and sends it through notify.sh. Read-only Oracle tools only.",
+      "description": "Composes one notification and sends it through notify.sh. Read-only Oracle and SSH health tools only.",
       "mode": "primary",
       "steps": 12,
       "prompt": "{file:./prompts/notify.md}",
@@ -62,6 +87,7 @@
         "opencode_read_mcp_resource": "deny",
         "oracle_query": "allow",
         "oracle_search_content": "allow",
+        "ssh_probe": "allow",
         "bash": {
           "*": "deny",
           "/app/scripts/notify.sh -m *": "allow",

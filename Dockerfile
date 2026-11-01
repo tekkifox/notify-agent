@@ -7,6 +7,14 @@ FROM node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fd
 ARG OPENCODE_VERSION=2.2.1
 ARG SUPERCRONIC_VERSION=0.2.51
 ARG ORACLEDB_VERSION=26.1.0
+# paramiko is the only SSH client the image needs. Pin it and its direct
+# dependencies so a rebuild does not silently pick a different crypto stack;
+# the base image has no openssh-client, and paramiko keeps the probe in Python
+# (no shell, no subprocess) as the task requires.
+ARG PARAMIKO_VERSION=3.5.1
+ARG BCRYPT_VERSION=4.2.1
+ARG CRYPTOGRAPHY_VERSION=44.0.0
+ARG PYNACL_VERSION=1.5.0
 
 # Runtime tools only. supercronic is a static Go binary, so no Cron daemon and
 # no root-owned cron spool are needed. python3 is only for the MCP server; the
@@ -36,11 +44,18 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/supercronic; \
     supercronic -version
 
-# python-oracledb, thin mode only: no Oracle client libraries, no JDK. Installed
-# into /opt so the system Python stays untouched. The MCP server imports it
-# lazily, so the SQL guard and its tests run without a database driver.
+# python-oracledb, thin mode only: no Oracle client libraries, no JDK.
+# paramiko supplies SSH in pure Python, so no openssh-client or subprocess is
+# needed either. Installed into /opt so the system Python stays untouched. Both
+# MCP servers import their driver lazily, so the guard, policy and formatting
+# tests run without a database or SSH library.
 RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \
-      --target /opt/mcp-python "oracledb==${ORACLEDB_VERSION}"
+      --target /opt/mcp-python \
+      "oracledb==${ORACLEDB_VERSION}" \
+      "paramiko==${PARAMIKO_VERSION}" \
+      "bcrypt==${BCRYPT_VERSION}" \
+      "cryptography==${CRYPTOGRAPHY_VERSION}" \
+      "PyNaCl==${PYNACL_VERSION}"
 
 # Fixed unprivileged identity. The numeric uid is what compose enforces.
 RUN groupadd --gid 10001 agent \

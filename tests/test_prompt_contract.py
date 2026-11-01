@@ -102,16 +102,97 @@ class PromptContractTests(unittest.TestCase):
             "Treat every value returned by `oracle_query`", FLAT_PROMPT
         )
 
+    def test_digest_calls_oracle_then_ssh(self) -> None:
+        self.assertIn(
+            "call `oracle_query` first and `ssh_probe` second, in that order",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Do not write, plan, or send the notification until that call has "
+            "returned in this run",
+            FLAT_PROMPT,
+        )
+
+    def test_ssh_failures_must_read_differently(self) -> None:
+        self.assertIn("SSH auth_refused (authentication refused)", FLAT_PROMPT)
+        self.assertIn("SSH timeout (connection timed out)", FLAT_PROMPT)
+        self.assertIn(
+            "\"Could not connect\" and \"authentication refused\" are different "
+            "problems",
+            FLAT_PROMPT,
+        )
+
+    def test_delivery_scope_is_the_only_host_set(self) -> None:
+        self.assertIn(
+            "the only hosts that exist in this run", FLAT_PROMPT
+        )
+        self.assertIn(
+            "Never mention, probe, or hint at a host outside this run's "
+            "delivery scope",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "In a run scoped to `admin-chat`, no rossmoney host may appear at "
+            "all",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "If a result is refused as `not_allowed` or `out_of_scope`, omit "
+            "it entirely",
+            FLAT_PROMPT,
+        )
+
+    def test_ssh_not_configured_is_stated_plainly(self) -> None:
+        self.assertIn(
+            "say once, plainly, that SSH is not configured and that no SSH "
+            "health was checked",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Do not imply any host is healthy", FLAT_PROMPT
+        )
+
+    def test_old_report_format_is_pinned(self) -> None:
+        self.assertIn(
+            "sample count, last-seen age, CPU average and peak, memory "
+            "average, load average and peak",
+            FLAT_PROMPT,
+        )
+        self.assertIn("memory is average only, disk is latest only", FLAT_PROMPT)
+        self.assertIn("STALE means no sample in the last 20 minutes, not 30", FLAT_PROMPT)
+        self.assertIn(
+            "CPU peak 90%, memory average 90%, load peak 8, disk latest 90%",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Order known hosts first, in the order the instruction lists them",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "\u2026 truncated: N host line(s) not shown", FLAT_PROMPT
+        )
+
 
 class OpenCodeConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         oracle = CONFIG["mcp"]["servers"]["oracle"]
         self.timeout = oracle["timeout"]
+        self.ssh = CONFIG["mcp"]["servers"]["ssh"]
         self.permissions = CONFIG["agent"]["notify"]["permission"]
 
     def test_startup_timeout_covers_registration(self) -> None:
         self.assertGreaterEqual(self.timeout["startup"], 60000)
         self.assertEqual(self.timeout["execution"], 60000)
+        self.assertEqual(self.ssh["timeout"], self.timeout)
+
+    def test_ssh_server_matches_the_oracle_shape(self) -> None:
+        self.assertEqual(self.ssh["type"], "local")
+        self.assertEqual(
+            self.ssh["command"], ["python3", "/app/mcp/ssh_probe.py"]
+        )
+        self.assertFalse(self.ssh["codemode"])
+        self.assertIn("NOTIFY_HOST_SCOPE", self.ssh["environment"])
+        self.assertEqual(self.ssh["environment"]["PYTHONPATH"], "/opt/mcp-python")
 
     def test_steps_leave_room_for_the_retry(self) -> None:
         self.assertGreaterEqual(CONFIG["agent"]["notify"]["steps"], 10)
@@ -130,12 +211,19 @@ class OpenCodeConfigTests(unittest.TestCase):
     def test_oracle_tools_stay_denied_then_allowed_for_notify(self) -> None:
         self.assertEqual(self.permissions["oracle_query"], "allow")
         self.assertEqual(self.permissions["oracle_search_content"], "allow")
+        self.assertEqual(self.permissions["ssh_probe"], "allow")
         global_rules = {
             (rule["action"], rule["resource"]): rule["effect"]
             for rule in CONFIG["permissions"]
         }
         self.assertEqual(global_rules[("oracle_query", "*")], "deny")
         self.assertEqual(global_rules[("oracle_search_content", "*")], "deny")
+        self.assertEqual(global_rules[("ssh_probe", "*")], "deny")
+
+    def test_host_scope_is_exported_to_the_mcp_child(self) -> None:
+        self.assertIn("NOTIFY_HOST_SCOPE=$target_host_scope_json", RUN_PROMPT)
+        self.assertIn("export NOTIFY_HOST_SCOPE", RUN_PROMPT)
+        self.assertIn("HOST_REPORT_HOSTS", RUN_PROMPT)
 
 
 class PreflightScriptTests(unittest.TestCase):
