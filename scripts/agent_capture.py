@@ -41,8 +41,8 @@ MIN_ROOM_BYTES = 16 * 1024
 FOOTER_RESERVE = 512
 # One-line container-log summary.  The instruction excerpt is short and the
 # whole line is hard-capped so a long source name or model cannot balloon it.
-SUMMARY_MAX_CHARS = 200
-SUMMARY_INSTRUCTION_CHARS = 80
+SUMMARY_MAX_CHARS = 320
+SUMMARY_INSTRUCTION_CHARS = 200
 
 
 def log_path(state_dir: Path) -> Path:
@@ -125,6 +125,15 @@ def _shorten(value: str, room: int) -> str:
     return value[: room - 3].rstrip() + "..."
 
 
+def _llm_text(value: object) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    text = str(value).strip()
+    return text if text else "unknown"
+
+
 def summary_line(
     origin: str,
     model: str,
@@ -134,6 +143,11 @@ def summary_line(
     instruction: str,
     *,
     max_chars: int = SUMMARY_MAX_CHARS,
+    llm_calls: object = None,
+    llm: object = None,
+    llm_types: object = None,
+    types: object = None,
+    tools: object = None,
 ) -> str:
     """Build the single-line container-log summary for one run.
 
@@ -151,8 +165,12 @@ def summary_line(
     origin_text = " ".join(str(origin).split())
     model_text = " ".join(str(model).split()) or "unknown"
     stamp = _stamp()
-    tail = f"exit={exit_code} {duration:.1f}s sent={sent_text}"
-
+    llm_value = _llm_text(llm if llm is not None else llm_calls)
+    types_value = types if types is not None else llm_types
+    types_text = "" if types_value is None else " ".join(str(types_value).split())
+    tail = f"exit={exit_code} {duration:.1f}s sent={sent_text} llm={llm_value}"
+    if types_text:
+        tail += f" types={types_text}"
     def build(run_field: str, model_field: str, excerpt: str) -> str:
         return (
             f'{stamp} run={run_field} model={model_field} {tail} '
@@ -297,6 +315,11 @@ def record_end(
     sent: bool | None,
     *,
     max_bytes: int = MAX_BYTES,
+    llm_calls: object = None,
+    llm: object = None,
+    llm_types: object = None,
+    types: object = None,
+    tools: object = None,
 ) -> None:
     """Append the footer, trimming the tail only if it would overflow."""
 
@@ -304,10 +327,21 @@ def record_end(
         sent_text = "unknown"
     else:
         sent_text = "yes" if sent else "no"
-    footer = (
-        f"--- run end: exit={exit_code} duration={duration:.1f}s "
-        f"sent={sent_text} ---\n"
-    ).encode("utf-8", "replace")
+    llm_value = _llm_text(llm if llm is not None else llm_calls)
+    types_value = types if types is not None else llm_types
+    types_text = "" if types_value is None else " ".join(str(types_value).split())
+    tools_value = tools
+    tools_text = "" if tools_value is None else " ".join(str(tools_value).split())
+    footer_parts = [
+        f"--- run end: exit={exit_code} duration={duration:.1f}s",
+        f"sent={sent_text}",
+        f"llm={llm_value}",
+    ]
+    if types_text:
+        footer_parts.append(f"types={types_text}")
+    if tools_text:
+        footer_parts.append(f"tools={tools_text}")
+    footer = (" ".join(footer_parts) + " ---\n").encode("utf-8", "replace")
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     except OSError:

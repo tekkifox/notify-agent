@@ -1360,7 +1360,7 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("\n", line)
         self.assertNotIn("\r", line)
         self.assertNotIn("\t", line)
-        self.assertLessEqual(len(line), 200)
+        self.assertLessEqual(len(line), 320)
         self.assertIn("run=inbound:vortex-admin", line)
         self.assertIn("model=test/model", line)
         self.assertIn("exit=0", line)
@@ -1380,7 +1380,7 @@ class SummaryTests(unittest.TestCase):
             "y" * 500,
         )
         self.assertNotIn("\n", line)
-        self.assertLessEqual(len(line), 200)
+        self.assertLessEqual(len(line), 320)
         self.assertIn("sent=no", line)
 
     def test_summary_has_utc_timestamp_and_schedule_path(self) -> None:
