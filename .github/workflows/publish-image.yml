@@ -173,9 +173,9 @@ jobs:
 
           env_array=$(printf '%s\n' "$get_body" | jq '.Env')
 
-          # Build the request body with jq; compose.yaml contains newlines/quotes/${...}.
+          # Build the request body with jq; compose.deploy.yaml contains newlines/quotes/${...}.
           body=$(jq -n \
-            --rawfile compose compose.yaml \
+            --rawfile compose compose.deploy.yaml \
             --argjson env "$env_array" \
             '{StackFileContent: $compose, Env: $env, PullImage: true}')
 
