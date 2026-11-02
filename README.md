@@ -115,9 +115,10 @@ self-test fails, the preflight logs the self-test's secret-free reason with the
 second failure still fails the run, and sends one short deterministic message
 through `notify.sh` to the same `-t` target (no model call, no statistics) so a
 failed schedule is never silent. The handshake does not touch the database, and
-the preflight captures server output rather than printing it. `opencode.json`
-gives the server a 60-second startup timeout
-so a slow first registration does not turn into a missing tool. The prompt then
+the preflight captures its server output rather than printing it; only the
+self-test's safe reason is logged. `opencode.json` gives the server a 60-second
+startup timeout so a slow first registration does not turn into a missing tool.
+The prompt then
 requires the tool call before any message is composed, retries a registration
 failure once after `/bin/sleep 5`, and writes a tool failure to stdout instead
 of sending it to the notification channel.
