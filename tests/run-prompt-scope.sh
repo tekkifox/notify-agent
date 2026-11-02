@@ -176,6 +176,7 @@ capture() {
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
         NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
+        NOTIFY_PREFLIGHT_RETRY_DELAY=0 \
         BOOKSTACK_TOKEN_ID_OPERATOR="operator-token-id" \
         BOOKSTACK_TOKEN_SECRET_OPERATOR="operator-token-secret" \
         BOOKSTACK_TOKEN_ID_VORTEX="vortex-token-id" \
@@ -836,7 +837,7 @@ else
         no "CMS source: instruction did not use the CMS host_scope"
     elif ! contains "$err" "config source=cms"; then
         no "CMS source: log did not name the CMS"
-    elif [ "$(stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json")" != "600" ]; then
+    elif [ "$(stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null)" != "600" ]; then
         no "CMS source: cache file is not 0600"
     else
         pass "run-prompt resolves the target through the CMS and caches it"

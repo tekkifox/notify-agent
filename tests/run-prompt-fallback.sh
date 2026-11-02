@@ -158,9 +158,3 @@ else pass "whitespace fallback rejected by name"; fi
 
 if [ "$failures" -ne 0 ]; then printf '%d failed\n' "$failures" >&2; exit 1; fi
 printf 'all run-prompt fallback tests passed\n'
-SH
-chmod +x tests/run-prompt-fallback.sh 2>/dev/null || true
-# move into tests dir properly
-mv "$tmp/../run-prompt-fallback.sh" tests/run-prompt-fallback.sh 2>/dev/null || true
-# Actually write file directly instead
-echo "written"
