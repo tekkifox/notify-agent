@@ -19,20 +19,47 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "${script_dir}/.." && pwd)
 mcp_server=${NOTIFY_MCP_SERVER:-${repo_dir}/mcp/oracle_query.py}
 
+# A scheduled run gets one more chance when only the Oracle self-test fails, so
+# a transient database blip does not lose the whole digest. The delay is short
+# enough to retry inside the same cron minute. Tests override it to 0.
+preflight_retry_delay=${NOTIFY_PREFLIGHT_RETRY_DELAY:-60}
+case "$preflight_retry_delay" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_PREFLIGHT_RETRY_DELAY must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
+
+# Set when the self-test fails so the caller can log and report the reason.
+preflight_reason=
+
+# The self-test already returns a short, secret-free reason. Log it with the
+# run-prompt prefix so an incident is answerable from the container log alone.
+# Never print the MCP server's stdout: the environment may contain credentials.
+log_preflight_reason() {
+    reason=$1
+    [ -n "$reason" ] || return 0
+    printf '%s\n' "$reason" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf 'run-prompt: MCP preflight Oracle self-test reason: %s\n' "$line" >&2
+    done
+}
+
 # Prove that the MCP server starts and advertises both tools before OpenCode
 # runs. The handshake does not touch the database, so this is cheap. Server
 # output is captured, never printed: it must not reach the log, and the
-# environment may contain credentials.
+# environment may contain credentials. Return codes: 0 healthy, 1 a
+# configuration/handshake failure, 2 the Oracle self-test failed.
 preflight_mcp() {
     server=$1
 
     if [ ! -f "$server" ]; then
         printf 'run-prompt: MCP preflight failed: server not found: %s\n' "$server" >&2
-        exit 1
+        return 1
     fi
     if ! command -v python3 >/dev/null 2>&1; then
         printf 'run-prompt: MCP preflight failed: python3 is not installed or not on PATH\n' >&2
-        exit 1
+        return 1
     fi
 
     responses=$(
@@ -43,7 +70,7 @@ preflight_mcp() {
             | python3 "$server" 2>/dev/null
     ) || {
         printf 'run-prompt: MCP preflight failed: %s did not start\n' "$server" >&2
-        exit 1
+        return 1
     }
 
     if ! printf '%s' "$responses" | python3 -c '
@@ -74,17 +101,21 @@ for line in sys.stdin:
 sys.exit(0 if initialized and {"query", "search_content"} <= tools else 1)
 ' 2>/dev/null; then
         printf 'run-prompt: MCP preflight failed: %s did not expose query and search_content\n' "$server" >&2
-        exit 1
+        return 1
     fi
 
     # The tool listing is not enough: prove the database is reachable too, so a
     # run cannot message the channel and only then discover Oracle is down.
-    # The selftest's own reason stays suppressed; it is available by running
-    # `python3 /app/mcp/oracle_query.py --selftest` by hand.
-    if ! python3 "$server" --selftest >/dev/null 2>&1; then
-        printf 'run-prompt: MCP preflight failed: %s Oracle self-test failed\n' "$server" >&2
-        exit 1
+    # Capture stderr (the self-test's safe reason) and discard stdout. The
+    # reason is logged by log_preflight_reason and never mixed with the
+    # server's protocol output.
+    if selftest_reason=$(python3 "$server" --selftest 2>&1 >/dev/null); then
+        return 0
     fi
+    preflight_reason=$selftest_reason
+    log_preflight_reason "$selftest_reason"
+    printf 'run-prompt: MCP preflight failed: %s Oracle self-test failed\n' "$server" >&2
+    return 2
 }
 
 usage() {
@@ -467,9 +498,61 @@ if [ -n "$target_host_scope_json" ] && [ "$target_host_scope_json" != "[]" ]; th
     export NOTIFY_HOST_SCOPE
 fi
 
+# Report a persistent preflight failure without starting OpenCode. The message
+# is fixed text plus the self-test's safe reason: it never contains statistics
+# and is delivered through notify.sh, so the target allowlist and host_scope
+# still decide whether it may be sent.
+send_preflight_failure() {
+    reason=$(printf '%s\n' "$preflight_reason" | head -n 1)
+    [ -n "$reason" ] || reason="Oracle self-test failed"
+    # notify.sh refuses a message whose dotted tokens are outside the target's
+    # host_scope. A wallet filename can look like a hostname, so mask dotted
+    # tokens here; the full secret-free reason is already in the log above.
+    if command -v jq >/dev/null 2>&1; then
+        if scrubbed=$(printf '%s' "$reason" | jq -Rr \
+            'gsub("[A-Za-z0-9][A-Za-z0-9._-]*\\.[A-Za-z]{2,}"; "[redacted]")' 2>/dev/null); then
+            reason=$scrubbed
+        fi
+    fi
+    message="The scheduled task could not run because the database was unreachable, so no digest or report was sent. Reason: ${reason}"
+    if [ -n "$target" ]; then
+        if "$script_dir/notify.sh" -t "$target" -m "$message" >&2; then
+            printf 'run-prompt: sent failure notification to target %s\n' "$target" >&2
+        else
+            printf 'run-prompt: could not send failure notification to target %s\n' "$target" >&2
+        fi
+    else
+        if "$script_dir/notify.sh" -m "$message" >&2; then
+            printf 'run-prompt: sent failure notification\n' >&2
+        else
+            printf 'run-prompt: could not send failure notification\n' >&2
+        fi
+    fi
+}
+
 # Fail before OpenCode starts if the MCP server cannot answer initialize and
-# tools/list under the same environment the agent will use.
-preflight_mcp "$mcp_server"
+# tools/list under the same environment the agent will use. Only a failed
+# Oracle self-test is retried: a missing server or a missing tool is a
+# configuration error, and a second database failure still fails the run.
+preflight_rc=0
+preflight_retried=0
+preflight_mcp "$mcp_server" || preflight_rc=$?
+
+if [ "$preflight_rc" -eq 2 ]; then
+    preflight_retried=1
+    printf 'run-prompt: MCP preflight Oracle self-test failed; retrying once in %s seconds\n' \
+        "$preflight_retry_delay" >&2
+    sleep "$preflight_retry_delay"
+    preflight_rc=0
+    preflight_mcp "$mcp_server" || preflight_rc=$?
+fi
+
+if [ "$preflight_rc" -ne 0 ]; then
+    if [ "$preflight_retried" -eq 1 ]; then
+        send_preflight_failure
+    fi
+    exit 1
+fi
 
 # OpenCode 2 removed --pure. --standalone runs a private server for this one
 # invocation instead of attaching to (or leaving behind) a shared background

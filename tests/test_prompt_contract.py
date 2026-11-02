@@ -282,6 +282,24 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertNotIn("printf '%s\\n' \"$responses\"", RUN_PROMPT)
         self.assertNotIn("ORACLE_PASSWORD", RUN_PROMPT)
 
+    def test_preflight_retries_only_the_self_test_once(self) -> None:
+        self.assertIn(
+            "preflight_retry_delay=${NOTIFY_PREFLIGHT_RETRY_DELAY:-60}",
+            RUN_PROMPT,
+        )
+        self.assertIn('if [ "$preflight_rc" -eq 2 ]', RUN_PROMPT)
+        self.assertIn('sleep "$preflight_retry_delay"', RUN_PROMPT)
+        self.assertIn('if [ "$preflight_retried" -eq 1 ]', RUN_PROMPT)
+
+    def test_failed_preflight_notifies_the_same_target(self) -> None:
+        self.assertIn("MCP preflight Oracle self-test reason", RUN_PROMPT)
+        self.assertIn(
+            "could not run because the database was unreachable", RUN_PROMPT
+        )
+        self.assertIn(
+            '"$script_dir/notify.sh" -t "$target" -m "$message"', RUN_PROMPT
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
