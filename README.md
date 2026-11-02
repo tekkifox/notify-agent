@@ -14,7 +14,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Pinned OpenCode `2.2.1`, supercronic `0.2.51`, non-root uid `10001`. |
-| `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then triggers the Portainer redeploy webhook. |
+| `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then redeploys the Portainer stack through its API. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
 | `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
@@ -55,12 +55,12 @@ Schedules default to `./crontab`, so a fresh checkout starts as-is. To keep the 
 
 ## Deploy
 
-Production runs the image published from GitHub, not a local build. A push to `main` runs `.github/workflows/publish-image.yml`, which builds `linux/amd64`, pushes `ghcr.io/tekkifox/notify-agent` to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then calls the Portainer stack webhook. `workflow_dispatch` runs the same job by hand.
+Production runs the image published from GitHub, not a local build. A push to `main` runs `.github/workflows/publish-image.yml`, which builds `linux/amd64`, pushes `ghcr.io/tekkifox/notify-agent` to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then redeploys the Portainer stack through its API. `workflow_dispatch` runs the same job by hand.
 
 - The Portainer stack's compose must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`.
-- When the webhook fires, Portainer pulls the new image and recreates the `agent` container.
+- The deploy job reads the stack through the Portainer API to preserve its `Env` array, then sends `compose.deploy.yaml` back with `PullImage: true`, so Portainer pulls the new image and recreates the `agent` container.
 - `compose.deploy.yaml` is the definition Portainer runs (sent by the API on each deploy); `compose.yaml` is for local development. Edit the deploy file, not the dev one, when changing the running stack.
-- `PORTAINER_WEBHOOK_URL` is a repository secret. Copy it from **Stacks → notify-agent → Webhooks** in Portainer. If the secret is empty, the workflow still succeeds and prints a warning: the image was published, but no redeploy was triggered.
+- The deploy uses two repository secrets: `PORTAINER_URL` (the Portainer base URL) and `PORTAINER_API_KEY` (an API key with access to the stack). Without them the deploy job fails rather than skipping the redeploy.
 - Recreating the container keeps the named `opencode-data` volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
 - The stack directory owns the schedule file, and the stack's compose sets `SCHEDULES_FILE` to it (as an interpolation variable, not in `stack.env`). A redeploy re-reads whatever the host file contains, so schedule changes do not need an image build or a push.
 

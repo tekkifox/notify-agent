@@ -125,21 +125,6 @@ jobs:
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/amd64/digest)" \
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/arm64/digest)"
 
-      - name: Trigger Portainer redeploy
-        shell: bash
-        env:
-          PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
-        run: |
-          set -euo pipefail
-          if [ -z "${PORTAINER_WEBHOOK_URL}" ]; then
-            echo "::warning::Image published, but PORTAINER_WEBHOOK_URL is not set; no Portainer redeploy was triggered."
-            exit 0
-          fi
-          # The URL is a secret: never print it, only the outcome.
-          curl --fail --silent --show-error --retry 3 --retry-delay 5 \
-            -X POST "$PORTAINER_WEBHOOK_URL"
-          echo "Portainer redeploy triggered"
-
   deploy:
     name: Redeploy Portainer stack
     runs-on: ubuntu-latest
