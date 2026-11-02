@@ -59,6 +59,7 @@ Production runs the image published from GitHub, not a local build. A push to `m
 
 - The Portainer stack's compose must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`.
 - When the webhook fires, Portainer pulls the new image and recreates the `agent` container.
+- `compose.deploy.yaml` is the definition Portainer runs (sent by the API on each deploy); `compose.yaml` is for local development. Edit the deploy file, not the dev one, when changing the running stack.
 - `PORTAINER_WEBHOOK_URL` is a repository secret. Copy it from **Stacks → notify-agent → Webhooks** in Portainer. If the secret is empty, the workflow still succeeds and prints a warning: the image was published, but no redeploy was triggered.
 - Recreating the container keeps the named `opencode-data` volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
 - The stack directory owns the schedule file, and the stack's compose sets `SCHEDULES_FILE` to it (as an interpolation variable, not in `stack.env`). A redeploy re-reads whatever the host file contains, so schedule changes do not need an image build or a push.

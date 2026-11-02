@@ -1,0 +1,53 @@
+services:
+  agent:
+    image: ghcr.io/tekkifox/notify-agent:latest
+    pull_policy: always
+    container_name: notify-agent
+    hostname: notify-agent
+    entrypoint: ["/app/scripts/entrypoint.sh"]
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    env_file:
+      - stack.env
+    environment:
+      HOME: /home/agent
+      OPENCODE_CONFIG: /app/opencode.json
+      XDG_DATA_HOME: /home/agent/.local/share
+      XDG_CONFIG_HOME: /home/agent/.config
+      XDG_CACHE_HOME: /home/agent/.cache
+      XDG_STATE_HOME: /home/agent/.local/state
+      COMPOSIO_ARGS: '${COMPOSIO_ARGS}'
+      SSH_KEY_HOST_FILE: /srv/notify-agent/ssh/id_ed25519
+
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /home/agent/.config:rw,nosuid,nodev,size=8m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.cache:rw,nosuid,nodev,size=64m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.local/state:rw,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+      - /home/agent/.opencode:rw,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+
+    volumes:
+      - opencode-data:/home/agent/.local/share/opencode
+      - /home/ross/stacks/notify-agent/crontab:/app/crontab:ro
+      - /home/ross/stacks/notify-agent/wallet:/wallet:ro
+      - /home/ross/stacks/notify-agent/ssh-key:/ssh/id_rsa:ro
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 200
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  opencode-data:
+    name: notify-opencode-data
