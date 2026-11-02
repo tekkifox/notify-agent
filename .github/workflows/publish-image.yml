@@ -139,3 +139,58 @@ jobs:
           curl --fail --silent --show-error --retry 3 --retry-delay 5 \
             -X POST "$PORTAINER_WEBHOOK_URL"
           echo "Portainer redeploy triggered"
+
+  deploy:
+    name: Redeploy Portainer stack
+    runs-on: ubuntu-latest
+    needs:
+      - merge
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Redeploy stack via Portainer API
+        shell: bash
+        env:
+          PORTAINER_URL: ${{ secrets.PORTAINER_URL }}
+          PORTAINER_API_KEY: ${{ secrets.PORTAINER_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Read the current stack to preserve its Env array (never send an empty Env).
+          get_response=$(curl -sS -w "\n%{http_code}" \
+            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            "${PORTAINER_URL}/api/stacks/40")
+          get_status=$(printf '%s\n' "$get_response" | tail -n 1)
+          get_body=$(printf '%s\n' "$get_response" | sed '$d')
+
+          if [ "$get_status" -lt 200 ] || [ "$get_status" -ge 300 ]; then
+            echo "Portainer GET /api/stacks/40 failed with HTTP status ${get_status}"
+            printf '%s\n' "$get_body"
+            exit 1
+          fi
+
+          env_array=$(printf '%s\n' "$get_body" | jq '.Env')
+
+          # Build the request body with jq; compose.yaml contains newlines/quotes/${...}.
+          body=$(jq -n \
+            --rawfile compose compose.yaml \
+            --argjson env "$env_array" \
+            '{StackFileContent: $compose, Env: $env, PullImage: true}')
+
+          put_response=$(curl -sS -w "\n%{http_code}" \
+            -X PUT "${PORTAINER_URL}/api/stacks/40?endpointId=8" \
+            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$body")
+          put_status=$(printf '%s\n' "$put_response" | tail -n 1)
+          put_body=$(printf '%s\n' "$put_response" | sed '$d')
+
+          if [ "$put_status" -lt 200 ] || [ "$put_status" -ge 300 ]; then
+            echo "Portainer PUT /api/stacks/40 failed with HTTP status ${put_status}"
+            printf '%s\n' "$put_body"
+            exit 1
+          fi
+
+          echo "Portainer stack redeployed"
