@@ -1,7 +1,7 @@
 # Supercronic crontab.
 #
-# No active schedule: every schedule below is commented out. Nothing runs until
-# an operator uncomments exactly one line, rebuilds the image, and redeploys.
+# Active schedules are uncommented below; commented lines are examples. Edit
+# this file on the host, then restart the container to pick it up.
 #
 # Format: one line per schedule.
 #   <five cron fields>  /app/scripts/run-prompt.sh [-t <name>] "<prompt>"
@@ -25,7 +25,7 @@
 # Morning host + SSH digest at 09:00, to the automations target. This keeps the
 # old host-report shape and adds SSH status. The target's host_scope must
 # include rossmoney.me, photos.rossmoney.me and vortexservers.co.uk.
-# 0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and CPU peak >= 90, memory average >= 90, load peak >= 8, disk >= 90. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
+0 9 * * * /app/scripts/run-prompt.sh -t automations "Compose the morning digest. Call oracle_query first for the 24-hour host statistics, then ssh_probe for SSH status. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and, for the rest, only sustained signals: average CPU >= 60, average memory >= 85, disk >= 85, or load peak >= twice the host's core count. Report CPU and load peaks as context but never flag on a peak alone. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a host outside this run's scope. If SSH is not configured, say so once. Send it now with notify.sh."
 #
 # Morning Vortex-only digest at 09:00, to the Vortex admin-chat target. The
 # target's host_scope must be vortexservers.co.uk only.
@@ -42,3 +42,9 @@
 #
 # Every hour at minute 5 - heartbeat (noisy; useful only while testing).
 # 5 * * * * /app/scripts/run-prompt.sh "Compose a one-line heartbeat message saying the notification agent is running. Send it now with notify.sh."
+
+# Hourly CPU watch on the Vortex host. Alerts only; it stays silent below the threshold.
+5 * * * * /app/scripts/run-prompt.sh -t admin-chat "Query NOTIFY_RO.HOST_STATS_V for host_label = 'vortexservers.co.uk' covering the last 70 minutes. Find the maximum cpu_percent and the sampled_at of that peak. If that maximum is above 70, send exactly one short alert naming the figure and the time it happened. If it is 70 or below, do not call notify.sh at all - reply with one line and stop. Never invent or round figures you did not read."
+
+# Hourly host digest. Flags only on sustained signals; peaks are context, never a flag.
+15 * * * * /app/scripts/run-prompt.sh -t automations "Build the host digest for every host in NOTIFY_RO.HOST_STATS_V covering the last 70 minutes, and probe SSH for each. Flag a host ONLY when one of these holds: average CPU >= 60 percent; average memory >= 85 percent; disk >= 85 percent; or load peak >= twice the host's core count. Report the CPU and load peaks as context but never flag on a peak alone. State the sample count and last-seen age per host. If nothing is flagged, say so in one line. Never invent or round a figure you did not read."
