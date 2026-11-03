@@ -699,6 +699,8 @@ Both commands send to the real channel. There is no dry-run mode, because a fake
 
 The crontab ships with **no active schedule**. A fresh container runs supercronic and waits, but nothing is posted until an operator activates a line. The file contains commented examples to copy: a daily digest at 09:00, a weekday end-of-day wrap-up, a weekly planning reminder, a monthly maintenance note, and an hourly heartbeat.
 
+`crontab` is the commented template baked into the image; `crontab.live` is the live operator copy of what actually runs. The live copy is deployed at `/home/ross/stacks/notify-agent/crontab` on the photos server, bind-mounted to `/app/crontab`, so editing the image's copy changes nothing on a running deployment. supercronic reads the file at startup, so a change needs a restart — run `docker exec notify-agent supercronic -test /app/crontab` first.
+
 Uncomment exactly one example (or write your own line in the same shape). The live file is the one on the host, bind-mounted read-only over `/app/crontab`; editing it needs a container restart, not an image rebuild and not a push through GitHub.
 
 The image still ships `crontab` and compose uses it by default, so a fresh checkout works with `docker compose up` unchanged. To use an operator file, place it in the stack directory (for example `/srv/notify-agent/crontab`) and point `SCHEDULES_FILE` at it, either in `.env` beside `compose.yaml`:
