@@ -157,14 +157,39 @@ for line in sys.stdin:
     if extra:
         columns.append(extra)
 
+    def latest_with_value(column, good):
+        """Emulate the aggregate over a two-sample window for one column.
+
+        The window holds an older sample with a value and a newer sample from
+        the second writer without one. Oracle sorts NULLS LAST by default, so
+        ``KEEP (DENSE_RANK LAST ORDER BY CASE WHEN <column> IS NOT NULL THEN
+        sampled_at END)`` would pick the newer null row; only ``NULLS FIRST``
+        puts that row first and leaves the latest good sample as the last rank.
+        """
+        window = os.environ.get("PREFETCH_FAILED_LOGIN_WINDOW", "good")
+        if window == "all-null":
+            return None
+        if window == "null-newer":
+            skip_nulls = (
+                "CASE WHEN " + column + " IS NOT NULL THEN sampled_at END"
+                " NULLS FIRST"
+            )
+            return good if skip_nulls in sql else None
+        return good
+
     rows = []
     for host in hosts:
         row = [host, 23, "2026-11-03T08:00:00+00:00", 12.5, 40.0, 33.3, 0.5, 1.2]
         if "cpu_cores" in sql:
             row.append(4)
         row.append(55.5)
-        row.append(12)
-        row.append('[{"user":"root","count":9},{"user":"admin","count":3}]')
+        row.append(latest_with_value("failed_logins", 12))
+        row.append(
+            latest_with_value(
+                "failed_login_users",
+                '[{"user":"root","count":9},{"user":"admin","count":3}]',
+            )
+        )
         if extra:
             row.append("passthrough-value")
         rows.append(row)
@@ -256,10 +281,10 @@ elif ! grep -Fq '"failed_logins_latest":12' "$tmp/scoped"; then
     no "scoped: instruction lost the latest failed-login count"
 elif ! grep -Fq '"failed_login_users_latest":"[{\"user\":\"root\",\"count\":9},{\"user\":\"admin\",\"count\":3}]"' "$tmp/scoped"; then
     no "scoped: instruction lost the latest failed-login users"
-elif ! grep -q "failed_logins).*KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_logins_latest" "$tmp/scoped.sql" 2>/dev/null; then
-    no "scoped: the query did not take failed logins from the latest sample"
-elif ! grep -q "failed_login_users).*KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_login_users_latest" "$tmp/scoped.sql" 2>/dev/null; then
-    no "scoped: the query did not take failed-login users from the latest sample"
+elif ! grep -q "failed_logins).*KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_logins IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_logins_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query does not take the latest failed-login value"
+elif ! grep -q "failed_login_users).*KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_login_users IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_login_users_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query does not take the latest failed-login users"
 elif ! contains "$err" "run-prompt: prefetch: 2 host(s), window 70m"; then
     no "scoped: success was not logged"
 elif ! contains "$err" 'prefetch=ok "'; then
@@ -405,6 +430,45 @@ elif ! grep -Fq '"unexpected_column":"passthrough-value"' "$tmp/passthrough"; th
     no "passthrough: an extra column did not reach the per-host object"
 else
     pass "the parser passes unknown columns through unchanged"
+fi
+
+# 9. A second, older writer inserts samples without the failed-login columns,
+#    interleaved with the good three-minute samples. A newer null sample must
+#    not hide the latest value, and a window of all nulls must stay null.
+run_case null_newer automations NOTIFY_PREFETCH=host_stats \
+    PREFETCH_FAILED_LOGIN_WINDOW=null-newer
+prompt=$(cat "$tmp/null_newer" 2>/dev/null || true)
+err=$(cat "$tmp/null_newer.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "null newer: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "null newer: instruction did not carry the statistics section"
+elif ! grep -Fq '"failed_logins_latest":12' "$tmp/null_newer"; then
+    no "null newer: a newer null sample hid the latest failed-login count"
+elif ! grep -Fq '"failed_login_users_latest":"[{\"user\":\"root\",\"count\":9},{\"user\":\"admin\",\"count\":3}]"' "$tmp/null_newer"; then
+    no "null newer: a newer null sample hid the latest failed-login users"
+elif ! grep -q "CASE WHEN failed_logins IS NOT NULL THEN sampled_at END NULLS FIRST" "$tmp/null_newer.sql" 2>/dev/null; then
+    no "null newer: the query does not order null samples before the good ones"
+elif ! grep -q "CASE WHEN failed_login_users IS NOT NULL THEN sampled_at END NULLS FIRST" "$tmp/null_newer.sql" 2>/dev/null; then
+    no "null newer: the users column does not order null samples first"
+else
+    pass "a null sample newer than the latest good one does not hide it"
+fi
+
+run_case all_null automations NOTIFY_PREFETCH=host_stats \
+    PREFETCH_FAILED_LOGIN_WINDOW=all-null
+prompt=$(cat "$tmp/all_null" 2>/dev/null || true)
+err=$(cat "$tmp/all_null.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "all null: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "all null: instruction did not carry the statistics section"
+elif ! grep -Fq '"failed_logins_latest":null' "$tmp/all_null"; then
+    no "all null: the failed-login count was not null"
+elif ! grep -Fq '"failed_login_users_latest":null' "$tmp/all_null"; then
+    no "all null: the failed-login users were not null"
+else
+    pass "a window of all nulls stays null"
 fi
 
 if [ "$failures" -ne 0 ]; then

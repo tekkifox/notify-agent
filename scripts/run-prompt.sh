@@ -297,6 +297,12 @@ sys.exit(0 if initialized and {"query", "search_content"} <= tools else 1)
 # Build the aggregate statement for the pre-fetch. One row per host, never raw
 # samples: a 70-minute window is roughly 86 rows per host, and the instruction
 # must stay small. cpu_cores is optional because the view may not expose it yet.
+# A second, older writer inserts samples without failed_logins or cpu_cores, so
+# the failed-login columns take the newest sample that carries a value rather
+# than the newest sample outright. The CASE yields NULL for a row without a
+# value, and Oracle sorts NULLS LAST by default, so NULLS FIRST is what puts
+# those rows before the good ones and lets DENSE_RANK LAST pick the latest good
+# value. With no value anywhere in the window the result stays NULL.
 prefetch_build_sql() {
     include_cores=$1
     if [ "$include_cores" -eq 1 ]; then
@@ -315,8 +321,8 @@ SELECT host_label,
        MAX(load_avg) AS load_peak,
 $cores_column
        MAX(disk_percent) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS disk_latest,
-       MAX(failed_logins) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_logins_latest,
-       MAX(failed_login_users) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_login_users_latest
+       MAX(failed_logins) KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_logins IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_logins_latest,
+       MAX(failed_login_users) KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_login_users IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_login_users_latest
 FROM NOTIFY_RO.HOST_STATS_V
 WHERE sampled_at >= SYSTIMESTAMP - NUMTODSINTERVAL($prefetch_window, 'MINUTE')
   AND host_label IN ($host_list)
