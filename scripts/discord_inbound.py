@@ -72,6 +72,8 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -118,10 +120,19 @@ DEFAULT_MAX_INSTRUCTION_CHARS = 1_000
 MAX_INSTRUCTION_CHARS = 2_000
 DEFAULT_QUEUE_SIZE = 4
 MAX_QUEUE_SIZE = 100
-DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
+DEFAULT_RUN_TIMEOUT_SECONDS = 180.0
 MIN_RUN_TIMEOUT_SECONDS = 30.0
 MAX_RUN_TIMEOUT_SECONDS = 3_600.0
+DEFAULT_LOCK_WAIT_SECONDS = 60.0
+MAX_LOCK_WAIT_SECONDS = 600.0
 DEFAULT_STATE_FILE = "/home/agent/.local/share/opencode/discord-inbound-state.json"
+RUN_LOCK_NAME = "notify-agent-run.lock"
+# One short line, delivered through notify.sh, when a scheduled run holds the
+# single-flight lock. It names no host, tool or model.
+BUSY_LINE = (
+    "A scheduled job is running right now, so this reply was not started. "
+    "Please try again in a minute."
+)
 AGENT_LOG_NAME = agent_capture.DEBUG_LOG_NAME
 AGENT_LOG_MAX_BYTES = agent_capture.MAX_BYTES
 SEND_MARKER_PREFIX = ".discord-inbound-send-"
@@ -236,6 +247,8 @@ class Config:
     max_instruction_chars: int
     queue_size: int
     run_timeout_seconds: float
+    lock_wait_seconds: float
+    run_lock: Path
     state_file: Path
     opencode_model: str
     opencode_bin: str
@@ -824,13 +837,29 @@ def load_config(environ: Mapping[str, str]) -> Config:
         1,
         MAX_QUEUE_SIZE,
     )
+    # NOTIFY_INBOUND_TIMEOUT is the hard per-attempt limit.
+    # NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS is the older name for the same value,
+    # kept so an existing deployment keeps its configured limit.
+    timeout_name = (
+        "NOTIFY_INBOUND_TIMEOUT"
+        if (env.get("NOTIFY_INBOUND_TIMEOUT") or "").strip()
+        else "NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS"
+    )
     run_timeout = _positive_float(
         env,
-        "NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS",
+        timeout_name,
         DEFAULT_RUN_TIMEOUT_SECONDS,
         MIN_RUN_TIMEOUT_SECONDS,
         MAX_RUN_TIMEOUT_SECONDS,
     )
+    lock_wait = _positive_float(
+        env,
+        "NOTIFY_INBOUND_LOCK_WAIT",
+        DEFAULT_LOCK_WAIT_SECONDS,
+        0.0,
+        MAX_LOCK_WAIT_SECONDS,
+    )
+    run_lock = _run_lock_path(env)
 
     sources, delivery = _load_sources(
         env,
@@ -855,6 +884,8 @@ def load_config(environ: Mapping[str, str]) -> Config:
         max_instruction_chars=max_chars,
         queue_size=queue_size,
         run_timeout_seconds=run_timeout,
+        lock_wait_seconds=lock_wait,
+        run_lock=run_lock,
         state_file=state_path,
         opencode_model=model,
         opencode_bin=opencode_bin,
@@ -916,6 +947,24 @@ def _check_state_path(path: Path) -> None:
                 os.unlink(probe)
             except OSError:
                 pass
+
+
+def _run_lock_path(env: Mapping[str, str]) -> Path:
+    """The single-flight lock both callers share.
+
+    The default matches ``scripts/run-prompt.sh`` exactly
+    (``${TMPDIR:-/tmp}/notify-agent-run.lock``): scheduler and listener run as
+    the same user in the same container, so one path serialises both.
+    """
+
+    raw = (env.get("NOTIFY_RUN_LOCK") or "").strip()
+    if not raw:
+        temporary = (env.get("TMPDIR") or "").strip() or "/tmp"
+        raw = f"{temporary.rstrip('/')}/{RUN_LOCK_NAME}"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConfigError("NOTIFY_RUN_LOCK must be an absolute path")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1570,33 +1619,74 @@ def _discard_send_marker(path: Path) -> None:
         pass
 
 
-def _run_agent_once(
-    config: Config,
-    chosen: InboundSource,
-    instruction: str,
+class LockError(RuntimeError):
+    """The single-flight lock could not be used at all."""
+
+
+class LockBusyError(RuntimeError):
+    """Another run held the single-flight lock for the whole wait."""
+
+
+def _acquire_run_lock(
+    path: Path,
+    wait_seconds: float,
     stop_event: threading.Event | None,
-    summary_text: str | None = None,
-    model: str | None = None,
-) -> tuple[bool, bool]:
-    """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
+) -> int:
+    """Take the shared single-flight lock, waiting up to ``wait_seconds``.
 
-    effective_model = model if model is not None else config.opencode_model
+    Returns the descriptor that owns the lock; the caller closes it in a
+    ``finally``. The wait is polled rather than blocking, so a shutdown request
+    is honoured while waiting, and the lock stays held for every retry and
+    fallback attempt of this run. A zero wait tries exactly once.
+    """
 
-    command = [config.opencode_bin, "run"]
-    if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
-        # Explicitly requested for one debugging run: provider-level detail.
-        # It is far too verbose to enable by default.
-        command.extend(["--print-logs", "--log-level", "debug"])
-    command.extend(
-        [
-            "--agent",
-            "notify",
-            "--model",
-            effective_model,
-            "--",
-            instruction,
-        ]
-    )
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as error:
+        raise LockError(
+            f"run lock could not be opened: {type(error).__name__}"
+        ) from None
+    deadline = time.monotonic() + max(wait_seconds, 0.0)
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                os.close(descriptor)
+                raise LockError(
+                    f"run lock could not be taken: {type(error).__name__}"
+                ) from None
+        if stop_event is not None and stop_event.is_set():
+            os.close(descriptor)
+            raise LockBusyError(
+                "shutdown requested while waiting for the run lock"
+            )
+        if time.monotonic() >= deadline:
+            os.close(descriptor)
+            raise LockBusyError("another run is in progress")
+        time.sleep(0.1)
+
+
+def _release_run_lock(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _agent_environment(config: Config, chosen: InboundSource) -> dict[str, str]:
+    """The environment one reply run gets: the validated delivery boundary.
+
+    Shared by the agent attempt and the busy line, so both can only reach the
+    source's own channel with the source's own target guards.
+    """
 
     environment = os.environ.copy()
     # Carry the resolved (CMS, cache or environment) configuration to the
@@ -1649,6 +1739,76 @@ def _run_agent_once(
         environment["COMPOSIO_ARGS"] = json.dumps(
             {"channel_id": chosen.channel_id}, separators=(",", ":")
         )
+    return environment
+
+
+def _deliver_busy_line(config: Config, chosen: InboundSource) -> bool:
+    """Send one short line through the same delivery path as an answer.
+
+    Best-effort: the caller already decided not to run the model, so a failed
+    send is logged and changes nothing else.
+    """
+
+    script = Path(__file__).resolve().with_name("notify.sh")
+    command = [str(script)]
+    if chosen.target is not None:
+        command.extend(["-t", chosen.target.name])
+    command.extend(["-m", BUSY_LINE])
+    environment = _agent_environment(config, chosen)
+    environment.pop("NOTIFY_SEND_MARKER", None)
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=HTTP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        LOG.warning(
+            "busy line could not be delivered: %s", type(error).__name__
+        )
+        return False
+    if completed.returncode != 0:
+        LOG.warning(
+            "busy line was not delivered: notify.sh exited %s",
+            completed.returncode,
+        )
+        return False
+    return True
+
+
+def _run_agent_once(
+    config: Config,
+    chosen: InboundSource,
+    instruction: str,
+    stop_event: threading.Event | None,
+    summary_text: str | None = None,
+    model: str | None = None,
+) -> tuple[bool, bool]:
+    """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
+
+    effective_model = model if model is not None else config.opencode_model
+
+    command = [config.opencode_bin, "run"]
+    if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
+        # Explicitly requested for one debugging run: provider-level detail.
+        # It is far too verbose to enable by default.
+        command.extend(["--print-logs", "--log-level", "debug"])
+    command.extend(
+        [
+            "--agent",
+            "notify",
+            "--model",
+            effective_model,
+            "--",
+            instruction,
+        ]
+    )
+
+    environment = _agent_environment(config, chosen)
 
     marker = _new_send_marker(config)
     environment["NOTIFY_SEND_MARKER"] = str(marker)
@@ -1775,7 +1935,20 @@ def run_agent(
     source: InboundSource | None = None,
     summary_text: str | None = None,
 ) -> bool:
-    """Run the notify agent, retrying once when it exits without sending.
+    """Run the notify agent under the shared single-flight lock.
+
+    The scheduler (``scripts/run-prompt.sh``) and this listener use one
+    ``flock`` on ``NOTIFY_RUN_LOCK`` so two OpenCode processes never touch the
+    same session database at once.  This run waits at most
+    ``NOTIFY_INBOUND_LOCK_WAIT`` seconds for it; if the wait expires the model
+    is not started and one short busy line is delivered through ``notify.sh``,
+    so the operator is told a scheduled job is running rather than left
+    guessing.  The lock is held for every attempt (including the retry and the
+    fallback) and released on every exit path.
+
+    Each attempt is bounded by ``NOTIFY_INBOUND_TIMEOUT``; the agent runs in its
+    own process group, so a timeout terminates the agent and its MCP children
+    together instead of hanging the listener.
 
     Every attempt's complete stdout and stderr go to the shared, size-capped
     ``notify-debug.log`` under the state directory, framed by a header (time,
@@ -1804,6 +1977,44 @@ def run_agent(
     """
 
     chosen = _resolve_source(config, source)
+    lock_descriptor: int | None = None
+    try:
+        lock_descriptor = _acquire_run_lock(
+            config.run_lock, config.lock_wait_seconds, stop_event
+        )
+    except LockBusyError:
+        LOG.warning(
+            "agent skipped: another run is in progress: source=%s "
+            "waited=%.0fs",
+            chosen.name,
+            config.lock_wait_seconds,
+        )
+        if stop_event is not None and stop_event.is_set():
+            # Shutting down: no point starting a delivery.
+            return False
+        _deliver_busy_line(config, chosen)
+        return False
+    except LockError as error:
+        # A lock file that cannot be opened is a deployment problem, but it
+        # must not silence the reply path: run unlocked, exactly as before.
+        LOG.warning("%s; running without the single-flight lock", error)
+    try:
+        return _run_agent_locked(
+            config, chosen, instruction, stop_event, summary_text
+        )
+    finally:
+        _release_run_lock(lock_descriptor)
+
+
+def _run_agent_locked(
+    config: Config,
+    chosen: InboundSource,
+    instruction: str,
+    stop_event: threading.Event | None,
+    summary_text: str | None,
+) -> bool:
+    """The retrying run itself; the caller holds the single-flight lock."""
+
     log_path = agent_log_path(config)
     preferred = config.opencode_model
     fallback = config.opencode_model_fallback
