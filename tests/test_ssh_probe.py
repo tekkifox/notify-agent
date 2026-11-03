@@ -18,7 +18,9 @@ import json
 import os
 import pathlib
 import socket
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -56,8 +58,84 @@ class Connector:
         self.ports.append(settings.port)
         outcome = self.outcomes.get(host)
         if outcome is None:
-            return ssh_probe.Outcome("ok", 12, "connected")
+            return ssh_probe.Outcome("ok", 12, "connected", 0)
         return outcome
+
+
+class _FakeStatusEvent:
+    """The part of paramiko's threading.Event the probe waits on."""
+
+    def __init__(self, ready=True):
+        self.ready = ready
+        self.waits = []
+
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        return self.ready
+
+
+class _FakeChannel:
+    def __init__(self, exit_status=0, ready=True):
+        self.exit_status = exit_status
+        self.status_event = _FakeStatusEvent(ready)
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+
+class _FakeStream:
+    def __init__(self, payload, channel, error=None):
+        self.payload = payload
+        self.channel = channel
+        self.error = error
+
+    def read(self, size):
+        if self.error is not None:
+            raise self.error
+        return self.payload[:size]
+
+
+class JournalClient:
+    """A fake SSH client whose only command is the fixed journal read."""
+
+    def __init__(self, payload=b"", exit_status=0, ready=True, read_error=None):
+        self.channel = _FakeChannel(exit_status, ready)
+        self.stream = _FakeStream(payload, self.channel, read_error)
+        self.commands = []
+
+    def exec_command(self, command, timeout=None):
+        self.commands.append((command, timeout))
+        return io.BytesIO(), self.stream, io.BytesIO()
+
+
+class ParamikoClient(JournalClient):
+    """A fake paramiko SSHClient for the full _probe_with_paramiko path."""
+
+    def __init__(self, connect_error=None, **kwargs):
+        super().__init__(**kwargs)
+        self.connect_error = connect_error
+        self.connect_kwargs = None
+        self.policy = None
+        self.closed = False
+
+    def set_missing_host_key_policy(self, policy):
+        self.policy = policy
+
+    def connect(self, **kwargs):
+        self.connect_kwargs = kwargs
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def close(self):
+        self.closed = True
+
+
+def _fake_paramiko(client):
+    module = types.ModuleType("paramiko")
+    module.SSHClient = lambda: client
+    module.AutoAddPolicy = lambda: object()
+    return module
 
 
 class PolicyTests(unittest.TestCase):
@@ -254,7 +332,7 @@ class FailureTests(unittest.TestCase):
                 "host1.example.com": ssh_probe.Outcome(
                     "auth_refused", None, "authentication refused"
                 ),
-                "host2.example.com": ssh_probe.Outcome("ok", 30, "connected"),
+                "host2.example.com": ssh_probe.Outcome("ok", 30, "connected", 4),
             }
         )
         payload = ssh_probe.probe(
@@ -324,6 +402,185 @@ class FailureTests(unittest.TestCase):
         self.assertNotIn("agent", text)
         self.assertNotIn("/run/secrets", text)
         self.assertNotIn("id_ed25519", text)
+
+
+class FailedLoginTests(unittest.TestCase):
+    def test_count_is_reported_alongside_the_existing_success_fields(self) -> None:
+        journal = (
+            b"Accepted publickey for agent from 203.0.113.10 port 51234 ssh2\n"
+            b"Failed password for invalid user admin from 203.0.113.10 port 51235 ssh2\n"
+            b"Failed password for root from 203.0.113.11 port 51236 ssh2\n"
+            b"Failed password for root from 203.0.113.12 port 51237 ssh2\n"
+        )
+        client = JournalClient(payload=journal)
+        count, reason = ssh_probe._read_failed_logins(client, 2.5)
+        self.assertEqual((count, reason), (3, None))
+        self.assertEqual(
+            client.commands, [(ssh_probe.FAILED_LOGIN_COMMAND, 2.5)]
+        )
+        self.assertEqual(client.channel.timeouts, [2.5])
+        self.assertEqual(client.channel.status_event.waits, [2.5])
+
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("ok", 12, "connected", count, reason),
+            0.0,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["latency_ms"], 12)
+        self.assertEqual(result["message"], "connected")
+        self.assertEqual(result["failed_logins"], 3)
+        self.assertNotIn("failed_logins_reason", result)
+
+    def test_a_readable_journal_with_no_failures_is_zero(self) -> None:
+        client = JournalClient(
+            payload=b"Accepted publickey for agent from 203.0.113.10 ssh2\n"
+        )
+        self.assertEqual(
+            ssh_probe._read_failed_logins(client, 2.0), (0, None)
+        )
+
+    def test_unreadable_journal_is_null_with_a_reason(self) -> None:
+        client = JournalClient(payload=b"", exit_status=1)
+        self.assertEqual(
+            ssh_probe._read_failed_logins(client, 2.0),
+            (None, "unreadable"),
+        )
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("ok", 12, "connected", None, "unreadable"),
+            0.0,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(result["failed_logins"])
+        self.assertEqual(result["failed_logins_reason"], "unreadable")
+
+    def test_command_timeout_is_null_with_a_reason(self) -> None:
+        client = JournalClient(read_error=socket.timeout())
+        self.assertEqual(
+            ssh_probe._read_failed_logins(client, 2.0), (None, "timeout")
+        )
+
+    def test_command_that_never_finishes_is_a_timeout(self) -> None:
+        client = JournalClient(payload=b"", ready=False)
+        self.assertEqual(
+            ssh_probe._read_failed_logins(client, 2.0), (None, "timeout")
+        )
+
+    def test_missing_journalctl_is_unavailable_not_zero(self) -> None:
+        client = JournalClient(exit_status=127)
+        self.assertEqual(
+            ssh_probe._read_failed_logins(client, 2.0),
+            (None, "unavailable"),
+        )
+
+    def test_a_truncated_journal_is_null_not_an_undercount(self) -> None:
+        client = JournalClient(
+            payload=b"Failed password for root from 203.0.113.10 ssh2\n"
+        )
+        with mock.patch.object(ssh_probe, "FAILED_LOGIN_MAX_BYTES", 16):
+            count, reason = ssh_probe._read_failed_logins(client, 2.0)
+        self.assertIsNone(count)
+        self.assertEqual(reason, "unavailable")
+
+    def test_the_count_never_leaks_journal_text_or_the_command(self) -> None:
+        journal = (
+            b"Failed password for root from 203.0.113.10 port 22 ssh2\n"
+            b"Failed password for admin from 203.0.113.11 port 22 ssh2\n"
+            b"Accepted key /run/secrets/id_ed25519 for agent\n"
+        )
+        client = JournalClient(payload=journal)
+        count, reason = ssh_probe._read_failed_logins(client, 2.0)
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("ok", 12, "connected", count, reason),
+            0.0,
+        )
+        self.assertEqual(result["failed_logins"], 2)
+        text = json.dumps(result)
+        for secret in (
+            "Failed password",
+            "203.0.113.10",
+            "203.0.113.11",
+            "id_ed25519",
+            "journalctl",
+            "--unit=ssh",
+            ssh_probe.FAILED_LOGIN_COMMAND,
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, text)
+
+    def test_a_connector_cannot_smuggle_text_into_the_count_fields(self) -> None:
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome(
+                "ok",
+                12,
+                "connected",
+                "Failed password for root from 203.0.113.10",
+                "journalctl --unit=ssh",
+            ),
+            0.0,
+        )
+        self.assertIsNone(result["failed_logins"])
+        self.assertEqual(result["failed_logins_reason"], "unavailable")
+        text = json.dumps(result)
+        self.assertNotIn("Failed password", text)
+        self.assertNotIn("journalctl", text)
+
+    def test_a_failed_connection_has_no_count_field(self) -> None:
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("timeout", None, "connection timed out", 3, None),
+            1.0,
+        )
+        self.assertNotIn("failed_logins", result)
+        self.assertNotIn("failed_logins_reason", result)
+
+    def test_the_probe_runs_the_fixed_command_on_the_session_it_opened(self) -> None:
+        client = ParamikoClient(
+            payload=(
+                b"Failed password for root from 203.0.113.10 ssh2\n"
+                b"Failed password for admin from 203.0.113.11 ssh2\n"
+            )
+        )
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            outcome = ssh_probe._probe_with_paramiko(
+                "host1.example.com", SETTINGS, 5.0
+            )
+        self.assertEqual(outcome.status, "ok")
+        self.assertEqual(outcome.failed_logins, 2)
+        self.assertIsNone(outcome.failed_logins_reason)
+        self.assertEqual(client.connect_kwargs["hostname"], "host1.example.com")
+        self.assertEqual(
+            [command for command, _timeout in client.commands],
+            [ssh_probe.FAILED_LOGIN_COMMAND],
+        )
+        self.assertEqual(
+            client.commands[0][1], ssh_probe.FAILED_LOGIN_TIMEOUT_SECONDS
+        )
+        self.assertTrue(client.closed)
+
+    def test_unreadable_journal_keeps_the_probe_ok_but_null(self) -> None:
+        client = ParamikoClient(exit_status=1)
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            outcome = ssh_probe._probe_with_paramiko(
+                "host1.example.com", SETTINGS, 5.0
+            )
+        self.assertEqual(outcome.status, "ok")
+        self.assertIsNone(outcome.failed_logins)
+        self.assertEqual(outcome.failed_logins_reason, "unreadable")
+        self.assertTrue(client.closed)
+
+    def test_a_failed_connect_runs_no_command_and_closes(self) -> None:
+        client = ParamikoClient(connect_error=socket.timeout())
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            outcome = ssh_probe._probe_with_paramiko(
+                "host1.example.com", SETTINGS, 5.0
+            )
+        self.assertEqual(outcome.status, "timeout")
+        self.assertEqual(client.commands, [])
+        self.assertTrue(client.closed)
 
 
 class ConfigurationTests(unittest.TestCase):
