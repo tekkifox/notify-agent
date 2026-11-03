@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the notify agent's targets and sources.
+"""Resolve the notify agent's targets, sources and per-host SSH ports.
 
 The operator can edit the bot configuration in the CMS admin panel.  This
 module is the single resolver both delivery paths use:
@@ -7,11 +7,18 @@ module is the single resolver both delivery paths use:
 * ``scripts/run-prompt.sh`` needs ``NOTIFY_TARGETS`` for a scheduled prompt.
 * ``scripts/discord_inbound.py`` needs ``NOTIFY_TARGETS`` and
   ``NOTIFY_INBOUND_SOURCES`` for inbound replies.
+* both need ``NOTIFY_HOST_PORTS`` so ``mcp/ssh_probe.py`` dials a host's own
+  SSH port instead of the single global one.
 
 Precedence is CMS, then the last good cached copy, then the environment.  The
 resolver never raises for a CMS problem: a website outage must not silence the
 09:00 digest.  When ``BOT_SETTINGS_URL`` is unset, it returns the environment
 values unchanged, so the feature is enabled and disabled by one variable.
+
+The CMS ``hosts`` array is optional so an older panel still works.  Each entry
+is ``{"name": "<host>", "sshPort": <1-65535>}``.  A malformed entry is dropped
+individually and counted in the one-line source log; it never invalidates the
+rest of the document and never changes which hosts are permitted.
 
 Security boundaries:
 
@@ -31,9 +38,12 @@ Command line, for ``run-prompt.sh``::
 
     python3 scripts/bot_config.py --targets
     python3 scripts/bot_config.py --sources
+    python3 scripts/bot_config.py --host-ports
+    python3 scripts/bot_config.py --json
 
-The resolved JSON is printed to stdout; the single source log line goes to
-stderr.
+``--json`` resolves once and prints the three values as escaped JSON strings, so
+a caller that needs more than one does not fetch the panel twice.  The resolved
+JSON is printed to stdout; the single source log line goes to stderr.
 """
 
 from __future__ import annotations
@@ -41,6 +51,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -55,6 +66,18 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 CACHE_DIR_NAME = "notify-agent"
 CACHE_FILE_NAME = "bot-settings-cache.json"
 LOG_PREFIX = "config"
+
+HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
+MAX_HOST_CHARS = 253
+MIN_PORT = 1
+MAX_PORT = 65535
+
+# The same conservative host shape mcp/ssh_probe.py accepts.  A name that
+# cannot be dialled is not worth carrying into the map.
+_HOST_NAME = re.compile(
+    r"^(?=.{1,%d}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+    % MAX_HOST_CHARS
+)
 
 TARGETS_SHAPE_ERROR = (
     "NOTIFY_TARGETS must be a JSON object mapping names to objects with a "
@@ -90,16 +113,26 @@ _OPENER = urllib.request.build_opener(_NoRedirect())
 
 @dataclasses.dataclass(frozen=True)
 class Resolution:
-    """The effective targets/sources and where they came from."""
+    """The effective configuration and where it came from."""
 
     targets_json: str
     sources_json: str
     source: str
     reason: str = ""
+    host_ports_json: str = ""
+    hosts_total: int = 0
+    host_ports_count: int = 0
+    hosts_dropped: int = 0
 
     @property
     def log_line(self) -> str:
-        line = f"{LOG_PREFIX} source={self.source}"
+        line = (
+            f"{LOG_PREFIX} source={self.source}"
+            f" hosts={self.hosts_total}"
+            f" ssh_ports={self.host_ports_count}"
+        )
+        if self.hosts_dropped:
+            line = f"{line} dropped={self.hosts_dropped}"
         if self.reason:
             line = f"{line} reason={self.reason}"
         return line
@@ -148,14 +181,37 @@ def _format_seconds(value: float) -> str:
     return f"{value:g}s"
 
 
+def _env_host_ports(environ: Mapping[str, str]) -> tuple[str, int]:
+    """Return the inherited map verbatim and its entry count for the log.
+
+    The environment path is byte-for-byte pass-through: ``ssh_probe.py`` owns
+    strict validation and fails loudly rather than the resolver rewriting it.
+    """
+
+    raw = environ.get(HOST_PORTS_ENV) or ""
+    count = 0
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            count = len(parsed)
+    return raw, count
+
+
 def _env_resolution(
     environ: Mapping[str, str], reason: str = ""
 ) -> Resolution:
+    host_ports_json, host_ports_count = _env_host_ports(environ)
     return Resolution(
         targets_json=environ.get("NOTIFY_TARGETS") or "",
         sources_json=environ.get("NOTIFY_INBOUND_SOURCES") or "",
         source="env",
         reason=reason,
+        host_ports_json=host_ports_json,
+        hosts_total=host_ports_count,
+        host_ports_count=host_ports_count,
     )
 
 
@@ -257,10 +313,65 @@ def _validate_sources(
         raise DocumentProblem(message) from None
 
 
+def _normalise_host(host: str) -> str:
+    return host.strip().lower().rstrip(".")
+
+
+def _usable_host_port(entry: object) -> tuple[str, int] | None:
+    """Return one validated ``(host, port)`` pair, or None to drop it.
+
+    An entry must be an object with a usable ``name`` and an integer
+    ``sshPort`` in range.  Everything else is dropped, never guessed at.
+    """
+
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if not isinstance(name, str):
+        return None
+    host = _normalise_host(name)
+    if not host or not _HOST_NAME.match(host):
+        return None
+    port = entry.get("sshPort")
+    if isinstance(port, bool) or not isinstance(port, int):
+        return None
+    if not MIN_PORT <= port <= MAX_PORT:
+        return None
+    return host, port
+
+
+def _validate_hosts(
+    hosts: object,
+) -> tuple[dict[str, int], int, int]:
+    """Return the per-host map, the array length and the dropped count.
+
+    ``hosts`` is optional: a panel that predates the per-host ports change
+    simply leaves the global ``SSH_PORT`` in charge.  A non-array value is a
+    document problem so the cache can be preferred, but a bad entry is dropped
+    on its own so one typo does not discard every other host.
+    """
+
+    if hosts is None:
+        return {}, 0, 0
+    if not isinstance(hosts, list):
+        raise DocumentProblem("document hosts must be a JSON array")
+
+    mapping: dict[str, int] = {}
+    dropped = 0
+    for entry in hosts:
+        pair = _usable_host_port(entry)
+        if pair is None:
+            dropped += 1
+            continue
+        host, port = pair
+        mapping[host] = port
+    return mapping, len(hosts), dropped
+
+
 def validate_document(
     document: object, environ: Mapping[str, str]
-) -> tuple[object, object]:
-    """Validate a CMS document and return its targets and sources."""
+) -> tuple[object, object, dict[str, int], int, int]:
+    """Validate a CMS document and return targets, sources and host ports."""
 
     if not isinstance(document, dict):
         raise DocumentProblem("document is not a JSON object")
@@ -279,7 +390,8 @@ def validate_document(
         raise DocumentProblem("document sources must be a JSON array")
     _validate_targets(targets)
     _validate_sources(environ, targets, sources)
-    return targets, sources
+    host_ports, hosts_total, dropped = _validate_hosts(document.get("hosts"))
+    return targets, sources, host_ports, hosts_total, dropped
 
 
 def _encode(value: object) -> str:
@@ -373,6 +485,27 @@ def _read_cache(path: Path) -> bytes | None:
         raise DocumentProblem("cache unreadable") from None
 
 
+def _document_resolution(
+    source: str,
+    targets: object,
+    sources: object,
+    host_ports: Mapping[str, int],
+    hosts_total: int,
+    dropped: int,
+    reason: str = "",
+) -> Resolution:
+    return Resolution(
+        targets_json=_encode(targets),
+        sources_json="" if not sources else _encode(sources),
+        source=source,
+        reason=reason,
+        host_ports_json="" if not host_ports else _encode(host_ports),
+        hosts_total=hosts_total,
+        host_ports_count=len(host_ports),
+        hosts_dropped=dropped,
+    )
+
+
 def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
     """Resolve configuration with CMS -> cache -> environment precedence."""
 
@@ -388,7 +521,9 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
 
     try:
         raw = _fetch(url, api_key, timeout)
-        targets, sources = validate_document(_parse_document(raw), env)
+        targets, sources, host_ports, hosts_total, dropped = validate_document(
+            _parse_document(raw), env
+        )
     except DocumentProblem as error:
         reason = f"cms {_safe_reason(error.reason)}"
         try:
@@ -400,17 +535,24 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
         if cached_raw is None:
             return _env_resolution(env, reason)
         try:
-            targets, sources = validate_document(
-                _parse_document(cached_raw), env
-            )
+            (
+                targets,
+                sources,
+                host_ports,
+                hosts_total,
+                dropped,
+            ) = validate_document(_parse_document(cached_raw), env)
         except DocumentProblem as cache_error:
             return _env_resolution(
                 env, f"{reason} cache {_safe_reason(cache_error.reason)}"
             )
-        return Resolution(
-            targets_json=_encode(targets),
-            sources_json="" if not sources else _encode(sources),
-            source="cache",
+        return _document_resolution(
+            "cache",
+            targets,
+            sources,
+            host_ports,
+            hosts_total,
+            dropped,
             reason=reason,
         )
 
@@ -421,18 +563,17 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
         # not fail the run.  There is deliberately no extra log line.
         pass
 
-    return Resolution(
-        targets_json=_encode(targets),
-        sources_json="" if not sources else _encode(sources),
-        source="cms",
+    return _document_resolution(
+        "cms", targets, sources, host_ports, hosts_total, dropped
     )
 
 
 def _main(argv: list[str]) -> int:
     mode = argv[1] if len(argv) > 1 else "--targets"
-    if mode not in ("--targets", "--sources", "--log"):
+    if mode not in ("--targets", "--sources", "--host-ports", "--json", "--log"):
         sys.stderr.write(
-            "usage: bot_config.py [--targets|--sources|--log]\n"
+            "usage: bot_config.py "
+            "[--targets|--sources|--host-ports|--json|--log]\n"
         )
         return 64
     resolution = resolve()
@@ -440,6 +581,20 @@ def _main(argv: list[str]) -> int:
         sys.stdout.write(resolution.targets_json)
     elif mode == "--sources":
         sys.stdout.write(resolution.sources_json)
+    elif mode == "--host-ports":
+        sys.stdout.write(resolution.host_ports_json)
+    elif mode == "--json":
+        # One resolve, three values.  Escaped strings keep an environment
+        # value byte-for-byte when the panel is not the source.
+        sys.stdout.write(
+            _encode(
+                {
+                    "targets": resolution.targets_json,
+                    "sources": resolution.sources_json,
+                    "host_ports": resolution.host_ports_json,
+                }
+            )
+        )
     else:
         sys.stdout.write(resolution.log_line)
         return 0
