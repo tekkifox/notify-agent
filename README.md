@@ -33,7 +33,8 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `tests/test_ssh_probe.py` | SSH policy, scope, per-host port, failure-class, timeout, selftest and protocol tests; no live connection. |
 | `tests/test_bookstack.py` | BookStack allowlist, scope-gate, token-leak, configuration, timeout and protocol tests against a loopback stub; no live wiki. |
 | `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every threshold, SSH lines and truncation. |
-| `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue and refusal-path tests; no network or model required. |
+| `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue, refusal-path, single-flight lock, busy-line and timeout tests; no network or model required. |
+| `tests/run-prompt-single-flight.sh` | Scheduled-run lock skip and wait, per-attempt timeout, and quota-memo tests against a fake `opencode`. |
 | `stack.env.example` | Every environment variable, documented, no secrets. |
 
 ## Quick start
@@ -74,7 +75,7 @@ docker compose run --rm agent opencode auth login "OpenCode Console" --method de
 
 Use the integration name that matches the provider in `OPENCODE_MODEL` (the example is OpenCode's own integration). Approve the code in the browser. The credential is written to the `opencode-data` volume at `/home/agent/.local/share/opencode`, so it survives container recreation and redeploys. It does not survive `docker compose down -v`.
 
-The preferred model is `OPENCODE_MODEL` (Beam Free); the optional `OPENCODE_MODEL_FALLBACK` (DeepSeek Flash 4.1) is used only when the preferred model cannot serve the request, such as Beam Free's "Free usage limit reached" or a model-not-found/unavailable error. The fallback fires at most once, never after a message was already sent, and never on an ordinary failure. A fallback run is visible in the transcript and the container summary shows the model that did the work.
+The preferred model is `OPENCODE_MODEL` (Beam Free); the optional `OPENCODE_MODEL_FALLBACK` (DeepSeek Flash 4.1) is used only when the preferred model cannot serve the request, such as Beam Free's "Free usage limit reached" or a model-not-found/unavailable error. The fallback fires at most once, never after a message was already sent, and never on an ordinary failure. A fallback run is visible in the transcript and the container summary shows the model that did the work. An exhausted free tier is remembered for fifteen minutes (`NOTIFY_QUOTA_MEMO_SECONDS`), so the next scheduled run goes straight to the fallback instead of probing the dead model again.
 
 An API key remains available as a second method:
 
@@ -829,6 +830,20 @@ The name must exist in `NOTIFY_TARGETS` (see [Named targets](#named-targets)). `
 
 Schedules are **trusted operator configuration**, not user input. The agent runs whatever command a schedule line names, with the container's full runtime access. Anyone who can edit the schedule file can make the agent post anything, to any configured target, at any time. Treat write access to it like write access to `stack.env`.
 
+## Single flight, attempt timeouts and the quota memo
+
+Three protections sit between a schedule line and the model. They change nothing about what the agent says, which model it prefers or how it delivers.
+
+**One lock for every model call.** `scripts/run-prompt.sh` (scheduled runs) and `scripts/discord_inbound.py` (replies) take the same `flock` on `NOTIFY_RUN_LOCK` before starting OpenCode and hold it for every attempt of that run, including the fallback. The default is `${TMPDIR:-/tmp}/notify-agent-run.lock`, and both callers derive it the same way, so they serialise against each other. Two overlapping runs were the trigger for the 2026-11-03 outage, when a private `--standalone` server and the shared service contended over the one session database and every call then failed instantly; the lock keeps the two callers from overlapping regardless of how the CLI is started.
+
+- A scheduled run waits `NOTIFY_RUN_LOCK_WAIT` seconds (default `600`). If the wait expires it prints `run-prompt: skipped: another run is in progress` and exits **0**: a skip is not a failure, so supercronic does not report a broken job.
+- An inbound reply waits `NOTIFY_INBOUND_LOCK_WAIT` seconds (default `60`). If it cannot get the lock it does not start the model; it sends one short line through `notify.sh` saying a scheduled job is running and to try again in a minute. The queue and author checks are unchanged.
+- Every exit path releases the lock — the kernel drops it when the process or descriptor ends, so there is no pid file to go stale.
+
+**A hard timeout per attempt.** Each scheduled attempt runs under `timeout ${NOTIFY_RUN_TIMEOUT:-300}` (signal `TERM`, then `KILL` after ten seconds when the local `timeout` supports `--kill-after`). A timed-out attempt is a failure and follows the existing retry and fallback rules. The inbound listener applies its own hard per-attempt limit, `NOTIFY_INBOUND_TIMEOUT` (default `180`, older name `NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS`), by terminating the agent's process group with `TERM` and then `KILL`. A timed-out reply is logged and counted like any other failed run; the listener deliberately sends no failure line to the channel, because tool and provider problems stay internal (see `prompts/notify.md`).
+
+**A memo for a dead free tier.** When the preferred model fails with `Free usage limit reached` and the fallback is used, `run-prompt.sh` writes a small stamp to `${XDG_STATE_HOME:-$HOME/.local/state}/notify-agent/quota-skip.json` (directory created `0700`). While that stamp names the preferred model and has not expired, the next run skips it entirely, logs `run-prompt: preferred model <model> skipped until <HH:MM>Z (quota)` and goes straight to the fallback. `NOTIFY_QUOTA_MEMO_SECONDS` (default `900`, `0` disables it) is the lifetime. A successful preferred-model run clears the stamp; an expired, unreadable or differently-named stamp is ignored, so it can never block a run. Only that one quota message is remembered — a missing model or a network error is not.
+
 ## Read logs
 
 ```sh
@@ -1158,7 +1173,9 @@ NOTIFY_INBOUND_CONNECTED_ACCOUNT_ID=
 NOTIFY_INBOUND_POLL_SECONDS=30
 NOTIFY_INBOUND_MAX_INSTRUCTION_CHARS=1000
 NOTIFY_INBOUND_QUEUE_SIZE=4
-NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS=300
+NOTIFY_INBOUND_TIMEOUT=180
+NOTIFY_INBOUND_LOCK_WAIT=60
+NOTIFY_RUN_LOCK=/tmp/notify-agent-run.lock
 NOTIFY_INBOUND_STATE_FILE=/home/agent/.local/share/opencode/discord-inbound-state.json
 ```
 
@@ -1291,10 +1308,14 @@ refuse to start rather than guess which messages were handled.
 
 One worker thread runs the agent. `NOTIFY_INBOUND_QUEUE_SIZE` bounds the
 waiting instructions; when the queue is full the message is recorded, dropped
-and logged as `dropped reason=queue_full`. Two agents never run at once.
-`NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS` is a hard limit; the agent runs in its own
-process group so a timeout or container shutdown terminates the agent and its
-MCP children together.
+and logged as `dropped reason=queue_full`. Two inbound agents never run at
+once, and the shared `NOTIFY_RUN_LOCK` keeps an inbound reply from overlapping
+a scheduled run (see
+[Single flight, attempt timeouts and the quota memo](#single-flight-attempt-timeouts-and-the-quota-memo)).
+`NOTIFY_INBOUND_TIMEOUT` is a hard per-attempt limit (default `180`; the older
+name `NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS` is still read when the new one is
+unset); the agent runs in its own process group so a timeout or container
+shutdown terminates the agent and its MCP children together.
 
 Recording before queuing gives **at-most-once** semantics: a crash can lose a
 queued instruction, but it cannot replay one. That is the deliberate trade for
@@ -1522,7 +1543,7 @@ Verified while building this branch:
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **377 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **392 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`.
 - `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-preflight.sh` passes against a stub MCP server and the real `notify.sh` with a stubbed `curl`: a transient self-test failure is logged with its safe reason, retried once and the run continues to `opencode`; a persistent failure runs exactly two preflights, does not start `opencode`, and sends exactly one message to the configured target through `notify.sh`, with no statistics and no environment leak; host-like wallet filenames are masked so the target's `host_scope` guard still allows the failure message; and the healthy path keeps one handshake and one self-test.
@@ -1551,6 +1572,7 @@ Inbound listener checks on this branch:
 - `python3 -m unittest discover -s tests -p 'test_*.py' -v` passes: the existing SQL-guard suite plus the inbound suite. No network, Discord channel, Composio account, database or model is used.
 - The inbound suite covers: an empty, missing, whitespace-only or non-numeric allowlist refusing to start; the channel filter; bot and webhook authors being ignored; reply type 19 accepted and system types refused; the length cap; mention stripping including `@everyone`, `@here`, user, role and channel forms; dedupe across a simulated restart; a corrupt state file refusing to start; the bounded queue; the worker's `max_active` staying at 1; baseline-without-actioning, including the time-based fallback when history is unreadable; backwards pagination to the cursor; the `DISCORDBOT_LIST_MESSAGES` tool request shape (`connected_account_id`, `user_id`, `channel_id`, `limit`, `before`, `x-api-key`) against a stub; success, empty, HTTP error, API failure, malformed payload, missing id, invalid JSON and redirect-refusal cases; and the exact `opencode run --agent notify --model ... -- <instruction>` argv, asserting `--standalone` is absent, with `NOTIFY_CONTENT_DISABLED` set only for a target whose `allow_content` is false, and `NOTIFY_RUNBOOKS_ALLOWED`/`NOTIFY_BOOKSTACK_URL`/`NOTIFY_BOOKSTACK_BOOKS`/`NOTIFY_BOOKSTACK_TOKEN_ID`/`NOTIFY_BOOKSTACK_TOKEN_SECRET` set only when the target has `allow_runbooks: true`, a `bookstack` object and a configured credential pair. It also asserts that an `admin-chat` run exports only the Vortex URL, its six books and the `vortex` pair, and an `automations` run exports only the operator URL, `runbooks` and the `operator` pair; a grant without an instance, an instance without a grant, and an unconfigured suffix export nothing.
 - The multi-source suite covers: two sources with their own accounts, channels and reply modes; per-source state file names; per-source allowlists overriding the global list; a source with neither list refusing to start and naming itself; duplicate source names and unsafe names refused; target channel/account mismatches refused; sources plus a webhook refused; independent baselines and cursors; per-source dedupe for the same message id; and both reply paths (named target instruction, and bot environment pinned to the source's `DISCORDBOT_CREATE_MESSAGE` account and channel with webhook/default-target removed).
+- The single-flight suite covers: the default lock path matching `run-prompt.sh` (`${TMPDIR:-/tmp}/notify-agent-run.lock`) and honouring `TMPDIR`; a relative `NOTIFY_RUN_LOCK` refused; `NOTIFY_INBOUND_LOCK_WAIT` defaulting to 60 and refusing a negative; `NOTIFY_INBOUND_TIMEOUT` defaulting to 180 while the older `NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS` name is still read, with the new name winning when both are set; a lock held elsewhere making the listener deliver one busy line and start no model; that busy line going through `notify.sh` with the source target and no send marker in its environment; a failed busy line being logged and harmless; the lock being released after a run and after a timed-out attempt; and a run waiting for a released lock before starting exactly one attempt.
 - The refusal path is exercised at the real process boundary: with `subprocess.Popen` patched, a message from a disallowed author produces no `Popen` call, no enqueue, and this log line (message id hashed, body absent):
   `refused source=default reason=author_not_allowed msg=d1a35b8e`
 - `composio tools info DISCORDBOT_LIST_MESSAGES` was inspected locally: the tool slug, `channel_id` requirement, `limit`, and `before`/`after`/`around` parameters match the implementation. `python3 -m py_compile` and the unit tests stub the HTTP call; no live listener poll was performed.
@@ -1564,5 +1586,6 @@ Not verified, because this repository contains no credentials or live services, 
 - `opencode auth login "OpenCode Console" --method device` (no provider account was used; the probe above only confirms the `device` and `key` methods exist).
 - A live Oracle query or a live `search_content` call (no credentials or wallet were used; the first mate runs the live checks). The guard, protocol, bind, cap, and failure paths were exercised without a database.
 - `docker compose config`, an image build, and `shellcheck` (Docker and shellcheck are not installed in the build environment used for this branch).
+- The single-flight lock and the `timeout` wrapper were exercised on the development host, with a `fcntl.flock` shim where util-linux `flock` is absent, not inside the built image. The Debian base image provides `/usr/bin/flock` and `timeout`; no container was started here.
 
 Do those checks on the target host after copying `stack.env`, mounting the wallet, granting the bot Read Message History in the admin channel, and completing the device flow.

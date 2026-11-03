@@ -906,6 +906,16 @@ run_attempt() {
     attempt_output=$2
 
     set -- opencode run
+    # Hard bound for this attempt, around the agent and (in the transcript
+    # path) the capture wrapper. A timeout exits non-zero, so it is handled by
+    # the same failure rules as any other failed attempt.
+    if [ "$timeout_available" -eq 1 ]; then
+        if [ "$timeout_kill_after" -eq 1 ]; then
+            set -- timeout --signal=TERM --kill-after=10 "$run_timeout" "$@"
+        else
+            set -- timeout --signal=TERM "$run_timeout" "$@"
+        fi
+    fi
     if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
         set -- "$@" --print-logs --log-level debug
     fi
@@ -979,9 +989,11 @@ run_attempt() {
         return 0
     fi
 
-    # No transcript: run directly, capturing output for inspection.
+    # No transcript: run directly, capturing output for inspection. The lock fd
+    # is closed for the child, so a lingering MCP process cannot keep holding
+    # the single-flight lock after this run finishes.
     set +e
-    "$@" >"$attempt_output" 2>&1
+    "$@" >"$attempt_output" 2>&1 9>&-
     ATTEMPT_RC=$?
     set -e
     if [ -n "${NOTIFY_SEND_MARKER:-}" ] && [ -e "${NOTIFY_SEND_MARKER}" ]; then
@@ -1012,31 +1024,78 @@ fallback="${OPENCODE_MODEL_FALLBACK:-}"
 attempt_output=$(mktemp "${TMPDIR:-/tmp}/notify-attempt.XXXXXX" 2>/dev/null) || attempt_output=/tmp/notify-attempt.$$
 : > "$attempt_output"
 
-# First attempt on the preferred model.
-set +e
-run_attempt "$OPENCODE_MODEL" "$attempt_output"
-set -e
-rc=$ATTEMPT_RC
-
-sent=0
-if send_marker_present "$attempt_output"; then
-    sent=1
+# Take the shared single-flight lock before the first model attempt and hold it
+# for every attempt of this run. The kernel releases it when this script exits,
+# including on an error or a timeout, so there is no pid file to go stale. A
+# wait that expires is a skip: exit 0, so it is not a failed job.
+if command -v flock >/dev/null 2>&1; then
+    if : 2>/dev/null >>"$run_lock"; then
+        exec 9>>"$run_lock"
+        if ! flock -w "$run_lock_wait" 9 2>/dev/null; then
+            printf 'run-prompt: skipped: another run is in progress\n' >&2
+            rm -f "$attempt_output"
+            exit 0
+        fi
+    else
+        printf 'run-prompt: warning: run lock %s is not writable; running without the single-flight lock\n' "$run_lock" >&2
+    fi
+else
+    printf 'run-prompt: warning: flock is not installed; running without the single-flight lock\n' >&2
 fi
 
-if [ "$rc" -ne 0 ] && [ "$sent" -eq 0 ] && [ -n "$fallback" ] && model_unavailable "$attempt_output"; then
-    # Extract a short reason line for the transcript.
-    reason=$(grep -Eim1 'free usage limit reached|model not found|model unavailable|model is unavailable|unknown model|no such model|does not exist' "$attempt_output" 2>/dev/null | head -n1 | tr -d '\r')
-    [ -n "$reason" ] || reason="model unavailable"
-    if [ -n "$debug_log" ]; then
-        printf 'fallback: preferred model %s unavailable (%s); retrying with %s\n' \
-            "$OPENCODE_MODEL" "$reason" "$fallback" >> "$debug_log"
-    fi
-    printf 'run-prompt: preferred model unavailable; retrying with %s\n' "$fallback" >&2
+# A dead free tier is remembered: while a valid stamp names the preferred
+# model, go straight to the fallback instead of probing it again. Without a
+# fallback the memo is pointless, so the preferred model is still attempted.
+skip_until=
+if [ "$quota_memo_seconds" -gt 0 ] && [ -n "$fallback" ]; then
+    skip_until=$(quota_memo check "$OPENCODE_MODEL") || skip_until=
+fi
 
+sent=0
+if [ -n "$skip_until" ]; then
+    printf 'run-prompt: preferred model %s skipped until %sZ (quota)\n' \
+        "$OPENCODE_MODEL" "$skip_until" >&2
     set +e
     run_attempt "$fallback" "$attempt_output"
     set -e
     rc=$ATTEMPT_RC
+else
+    # First attempt on the preferred model.
+    set +e
+    run_attempt "$OPENCODE_MODEL" "$attempt_output"
+    set -e
+    rc=$ATTEMPT_RC
+
+    if send_marker_present "$attempt_output"; then
+        sent=1
+    fi
+
+    if [ "$rc" -eq 0 ] && [ "$quota_memo_seconds" -gt 0 ]; then
+        # The preferred model works again: forget the exhausted tier.
+        quota_memo clear || printf 'run-prompt: warning: could not clear the quota memo\n' >&2
+    fi
+
+    if [ "$rc" -ne 0 ] && [ "$sent" -eq 0 ] && [ -n "$fallback" ] && model_unavailable "$attempt_output"; then
+        # Remember an exhausted free tier so the next run does not spend time
+        # (and risk a hang) discovering it again.
+        if quota_exhausted "$attempt_output" && [ "$quota_memo_seconds" -gt 0 ]; then
+            quota_memo write "$OPENCODE_MODEL" "$quota_memo_seconds" \
+                || printf 'run-prompt: warning: could not record the quota memo\n' >&2
+        fi
+        # Extract a short reason line for the transcript.
+        reason=$(grep -Eim1 'free usage limit reached|model not found|model unavailable|model is unavailable|unknown model|no such model|does not exist' "$attempt_output" 2>/dev/null | head -n1 | tr -d '\r')
+        [ -n "$reason" ] || reason="model unavailable"
+        if [ -n "$debug_log" ]; then
+            printf 'fallback: preferred model %s unavailable (%s); retrying with %s\n' \
+                "$OPENCODE_MODEL" "$reason" "$fallback" >> "$debug_log"
+        fi
+        printf 'run-prompt: preferred model unavailable; retrying with %s\n' "$fallback" >&2
+
+        set +e
+        run_attempt "$fallback" "$attempt_output"
+        set -e
+        rc=$ATTEMPT_RC
+    fi
 fi
 
 rm -f "$attempt_output" "$attempt_output.sent"
