@@ -314,7 +314,9 @@ SELECT host_label,
        AVG(load_avg) AS load_avg,
        MAX(load_avg) AS load_peak,
 $cores_column
-       MAX(disk_percent) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS disk_latest
+       MAX(disk_percent) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS disk_latest,
+       MAX(failed_logins) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_logins_latest,
+       MAX(failed_login_users) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_login_users_latest
 FROM NOTIFY_RO.HOST_STATS_V
 WHERE sampled_at >= SYSTIMESTAMP - NUMTODSINTERVAL($prefetch_window, 'MINUTE')
   AND host_label IN ($host_list)

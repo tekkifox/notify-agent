@@ -27,6 +27,10 @@ FLAT_PROMPT = " ".join(PROMPT.split())
 CONFIG = json.loads((ROOT / "opencode.json").read_text(encoding="utf-8"))
 RUN_PROMPT = (ROOT / "scripts" / "run-prompt.sh").read_text(encoding="utf-8")
 SSH_SERVER = ROOT / "mcp" / "ssh_probe.py"
+CRONTABS = {
+    name: (ROOT / name).read_text(encoding="utf-8")
+    for name in ("crontab", "crontab.live")
+}
 
 
 def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]):
@@ -415,6 +419,77 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertIn(
             '"$script_dir/notify.sh" -t "$target" -m "$message"', RUN_PROMPT
         )
+
+
+class FleetDigestScheduleTests(unittest.TestCase):
+    """The two fleet-wide digest prompts must ask for failed logins per user."""
+
+    def _schedule_line(self, name: str, schedule: str, target: str) -> str:
+        for line in CRONTABS[name].splitlines():
+            stripped = line.lstrip("# ")
+            if stripped.startswith(schedule) and f"-t {target} " in stripped:
+                return stripped
+        self.fail(f"{name}: no {schedule!r} line for target {target!r}")
+
+    def _digest_lines(self) -> list[tuple[str, str]]:
+        return [
+            (
+                f"{name} {label}",
+                self._schedule_line(name, schedule, "automations"),
+            )
+            for name in CRONTABS
+            for label, schedule in (
+                ("morning", "0 9 * * * "),
+                ("hourly", "15 * * * * "),
+            )
+        ]
+
+    def test_failed_logins_are_requested_per_user(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn("failed logins", line)
+                self.assertIn("top three usernames", line)
+                self.assertIn("failed logins: n/a", line)
+                self.assertIn("'failed logins: 0'", line)
+                self.assertIn("Never invent a username or a number", line)
+
+    def test_ssh_probe_is_not_the_failed_login_source(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn(
+                    "ssh_probe answers reachability and key authentication only",
+                    line,
+                )
+                self.assertIn(
+                    "must not be used as the source of failed-login figures",
+                    line,
+                )
+                self.assertIn("those figures come from the supplied statistics", line)
+
+    def test_sustained_signal_rule_is_unchanged(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn("average CPU >= 60", line)
+                self.assertIn("average memory >= 85", line)
+                self.assertIn("disk >= 85", line)
+                self.assertIn("load peak >= twice the host's core count", line)
+                self.assertIn("never flag on a peak alone", line)
+
+    def test_morning_digest_keeps_its_character_limit(self) -> None:
+        line = self._schedule_line("crontab", "0 9 * * * ", "automations")
+        self.assertIn("2,000 characters", line)
+
+    def test_live_copy_matches_the_template_for_the_digests(self) -> None:
+        for schedule in ("0 9 * * * ", "15 * * * * "):
+            self.assertEqual(
+                self._schedule_line("crontab", schedule, "automations"),
+                self._schedule_line("crontab.live", schedule, "automations"),
+            )
+
+    def test_the_single_host_admin_chat_job_is_untouched(self) -> None:
+        for name in CRONTABS:
+            line = self._schedule_line(name, "5 * * * * ", "admin-chat")
+            self.assertNotIn("failed logins", line)
 
 
 if __name__ == "__main__":
