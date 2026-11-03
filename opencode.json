@@ -95,7 +95,7 @@
     "notify": {
       "description": "Composes one notification and sends it through notify.sh. Read-only Oracle, SSH health and runbook documentation tools only.",
       "mode": "primary",
-      "steps": 12,
+      "steps": 18,
       "prompt": "{file:./prompts/notify.md}",
       "permission": {
         "*": "deny",

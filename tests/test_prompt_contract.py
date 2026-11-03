@@ -165,11 +165,19 @@ class PromptContractTests(unittest.TestCase):
             FLAT_PROMPT,
         )
 
-    def test_first_failure_gets_one_pause_and_one_retry(self) -> None:
-        self.assertIn("run exactly `/bin/sleep 5` once", FLAT_PROMPT)
-        self.assertIn("call `oracle_query` again once", FLAT_PROMPT)
-        self.assertIn("single retry in rule 22", FLAT_PROMPT)
-        self.assertIn("If both calls fail", FLAT_PROMPT)
+    def test_first_failure_gets_up_to_three_retries(self) -> None:
+        self.assertIn(
+            "the Oracle/SSH MCP tools register a moment after the run starts, "
+            "so the first call in a run can fail before the tool exists",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Run `/bin/sleep 5`, then call `oracle_query` again, up to three "
+            "times, 5 seconds apart",
+            FLAT_PROMPT,
+        )
+        self.assertIn("Do not conclude anything from the first failure", FLAT_PROMPT)
+        self.assertIn("If all calls fail", FLAT_PROMPT)
 
     def test_tool_errors_carry_code_and_retryable(self) -> None:
         self.assertIn(

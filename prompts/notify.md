@@ -16,7 +16,7 @@ Run order: do the work first, compose the message last.
 - Never tell a notification channel that a tool was unavailable, failed, could
   not be reached, or "could not be retrieved". Tool problems are internal to
   the run. If a tool is genuinely missing, or a call still fails after the
-  single retry in rule 22, write one short line to stdout and end the run
+  retries in rule 22, write one short line to stdout and end the run
   without calling `notify.sh`.
 - A call that succeeds with zero rows is not a failure. Say that no samples (or
   no matching content) were recorded for the requested period; for host
@@ -41,11 +41,11 @@ Rules:
 3. The target names the destination. You never choose or mention a channel,
    server, webhook, or id, and you never write an id into the message. Only the
    target name given to you goes on the command line.
-4. Never run any other command. The one exception is the single
-   `/bin/sleep 5` between a failed `oracle_query` call and its retry in rule
-   22. Apart from the `oracle_query`, `oracle_search_content`, `ssh_probe`,
-   `bookstack_search` and `bookstack_read` tools described below, use no other
-   tool or capability.
+4. Never run any other command. The one exception is up to three
+   `/bin/sleep 5` pauses between a failed `oracle_query` call and its retries
+   in rule 22. Apart from the `oracle_query`, `oracle_search_content`,
+   `ssh_probe`, `bookstack_search` and `bookstack_read` tools described below,
+   use no other tool or capability.
 5. Never inspect, print, or repeat environment variables, tokens, webhook URLs,
    API keys, or files. Never put a webhook URL in the message. Never mention
    the database user, password, DSN, wallet path, hostname, or any other
@@ -256,12 +256,14 @@ Tool failures:
 22. If the first `oracle_query` call in a run fails in a way that looks like the
     tool is not loaded yet — for example `Skill "oracle_query" failed`,
     `Unable to load skill oracle_query`, `tool not found`, or a similar
-    registration error — run exactly `/bin/sleep 5` once, then call
-    `oracle_query` again once. Do not conclude anything from the first failure,
-    and do not compose or send a message before the retry returns. If the retry
-    succeeds, continue normally. If both calls fail, or the tool is absent, or
-    any later `oracle_query` call fails, do not call `notify.sh`: write one line
-    to stdout saying the host-statistics query failed and end the run. That
+    registration error — the Oracle/SSH MCP tools register a moment after the
+    run starts, so the first call in a run can fail before the tool exists.
+    Run `/bin/sleep 5`, then call `oracle_query` again, up to three times, 5
+    seconds apart. Do not conclude anything from the first failure, and do not
+    compose or send a message before the retries return. If a retry succeeds,
+    continue normally. If all calls fail, or the tool is absent, or any later
+    `oracle_query` call fails, do not call `notify.sh`: write one line to
+    stdout saying the host-statistics query failed and end the run. That
     stdout line is run output only and is the final response. This is the
     tool-failure exception to rules 6 and 8, and it applies only to a failed
     query. A successful query with zero rows still produces a normal message.
