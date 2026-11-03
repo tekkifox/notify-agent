@@ -143,15 +143,44 @@ jobs:
         run: |
           set -euo pipefail
 
+          stack_name="notify-agent"
+
+          # Stack and endpoint ids change when a stack is re-created, so discover
+          # them by name instead of hardcoding them.
+          list_response=$(curl -sS -w "\n%{http_code}" \
+            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            "${PORTAINER_URL}/api/stacks")
+          list_status=$(printf '%s\n' "$list_response" | tail -n 1)
+          list_body=$(printf '%s\n' "$list_response" | sed '$d')
+
+          if [ "$list_status" -lt 200 ] || [ "$list_status" -ge 300 ]; then
+            echo "Portainer GET /api/stacks failed with HTTP status ${list_status}"
+            printf '%s\n' "$list_body"
+            exit 1
+          fi
+
+          stack_id=$(printf '%s\n' "$list_body" | \
+            jq -r --arg name "$stack_name" 'first(.[] | select(.Name == $name) | .Id) // empty')
+          endpoint_id=$(printf '%s\n' "$list_body" | \
+            jq -r --arg name "$stack_name" 'first(.[] | select(.Name == $name) | .EndpointId) // empty')
+
+          if [ -z "$stack_id" ] || [ -z "$endpoint_id" ]; then
+            echo "Portainer stack '${stack_name}' not found in GET /api/stacks response"
+            printf '%s\n' "$list_body"
+            exit 1
+          fi
+
+          echo "Discovered Portainer stack '${stack_name}' (id=${stack_id}, endpointId=${endpoint_id})"
+
           # Read the current stack to preserve its Env array (never send an empty Env).
           get_response=$(curl -sS -w "\n%{http_code}" \
             -H "X-API-Key: ${PORTAINER_API_KEY}" \
-            "${PORTAINER_URL}/api/stacks/40")
+            "${PORTAINER_URL}/api/stacks/${stack_id}")
           get_status=$(printf '%s\n' "$get_response" | tail -n 1)
           get_body=$(printf '%s\n' "$get_response" | sed '$d')
 
           if [ "$get_status" -lt 200 ] || [ "$get_status" -ge 300 ]; then
-            echo "Portainer GET /api/stacks/40 failed with HTTP status ${get_status}"
+            echo "Portainer GET /api/stacks/${stack_id} failed with HTTP status ${get_status}"
             printf '%s\n' "$get_body"
             exit 1
           fi
@@ -165,7 +194,7 @@ jobs:
             '{StackFileContent: $compose, Env: $env, PullImage: true}')
 
           put_response=$(curl -sS -w "\n%{http_code}" \
-            -X PUT "${PORTAINER_URL}/api/stacks/40?endpointId=8" \
+            -X PUT "${PORTAINER_URL}/api/stacks/${stack_id}?endpointId=${endpoint_id}" \
             -H "X-API-Key: ${PORTAINER_API_KEY}" \
             -H "Content-Type: application/json" \
             -d "$body")
@@ -173,7 +202,7 @@ jobs:
           put_body=$(printf '%s\n' "$put_response" | sed '$d')
 
           if [ "$put_status" -lt 200 ] || [ "$put_status" -ge 300 ]; then
-            echo "Portainer PUT /api/stacks/40 failed with HTTP status ${put_status}"
+            echo "Portainer PUT /api/stacks/${stack_id} failed with HTTP status ${put_status}"
             printf '%s\n' "$put_body"
             exit 1
           fi
