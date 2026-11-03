@@ -151,6 +151,11 @@ for line in sys.stdin:
     if "cpu_cores" in sql:
         columns.append("cpu_cores")
     columns.append("disk_latest")
+    columns.append("failed_logins_latest")
+    columns.append("failed_login_users_latest")
+    extra = os.environ.get("PREFETCH_EXTRA_COLUMN")
+    if extra:
+        columns.append(extra)
 
     rows = []
     for host in hosts:
@@ -158,6 +163,10 @@ for line in sys.stdin:
         if "cpu_cores" in sql:
             row.append(4)
         row.append(55.5)
+        row.append(12)
+        row.append('[{"user":"root","count":9},{"user":"admin","count":3}]')
+        if extra:
+            row.append("passthrough-value")
         rows.append(row)
 
     text = json.dumps(
@@ -243,6 +252,14 @@ elif ! contains "$prompt" "Do not call oracle_query for host statistics in this 
     no "scoped: instruction did not tell the model the data is complete"
 elif ! contains "$prompt" "SSH status is still yours to collect"; then
     no "scoped: instruction did not leave SSH to the model"
+elif ! grep -Fq '"failed_logins_latest":12' "$tmp/scoped"; then
+    no "scoped: instruction lost the latest failed-login count"
+elif ! grep -Fq '"failed_login_users_latest":"[{\"user\":\"root\",\"count\":9},{\"user\":\"admin\",\"count\":3}]"' "$tmp/scoped"; then
+    no "scoped: instruction lost the latest failed-login users"
+elif ! grep -q "failed_logins).*KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_logins_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take failed logins from the latest sample"
+elif ! grep -q "failed_login_users).*KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS failed_login_users_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take failed-login users from the latest sample"
 elif ! contains "$err" "run-prompt: prefetch: 2 host(s), window 70m"; then
     no "scoped: success was not logged"
 elif ! contains "$err" 'prefetch=ok "'; then
@@ -371,6 +388,23 @@ elif ! contains "$err" "prefetch=failed"; then
     no "timeout: run summary did not record prefetch=failed"
 else
     pass "a hung pre-fetch is bounded and leaves the run on the tool"
+fi
+
+# 8. The parser is a generic column-to-key pass-through: a column the query did
+#    not name still reaches the per-host object, so adding a view column needs
+#    no parser change.
+run_case passthrough automations NOTIFY_PREFETCH=host_stats \
+    PREFETCH_EXTRA_COLUMN=unexpected_column
+prompt=$(cat "$tmp/passthrough" 2>/dev/null || true)
+err=$(cat "$tmp/passthrough.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "passthrough: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "passthrough: instruction did not carry the statistics section"
+elif ! grep -Fq '"unexpected_column":"passthrough-value"' "$tmp/passthrough"; then
+    no "passthrough: an extra column did not reach the per-host object"
+else
+    pass "the parser passes unknown columns through unchanged"
 fi
 
 if [ "$failures" -ne 0 ]; then
