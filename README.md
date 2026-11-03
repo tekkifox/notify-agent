@@ -30,7 +30,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `mcp/host_report.py` | Pure digest formatter: deterministic ordering, stale rule, thresholds, SSH lines and 2,000-character truncation. |
 | `mcp/bookstack.py` | Single-file read-only BookStack MCP server (Python 3, standard library) exposing `search` and `read` as `bookstack_search` and `bookstack_read`, restricted to an allowlist of books. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
-| `tests/test_ssh_probe.py` | SSH policy, scope, failure-class, timeout, selftest and protocol tests; no live connection. |
+| `tests/test_ssh_probe.py` | SSH policy, scope, per-host port, failure-class, timeout, selftest and protocol tests; no live connection. |
 | `tests/test_bookstack.py` | BookStack allowlist, scope-gate, token-leak, configuration, timeout and protocol tests against a loopback stub; no live wiki. |
 | `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every threshold, SSH lines and truncation. |
 | `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue and refusal-path tests; no network or model required. |
@@ -373,6 +373,17 @@ a timeout (`SSH_TIMEOUT_SECONDS`, default 5) and the whole call has a deadline
 a scheduled run. Hosts that would start after the deadline are returned as
 `timeout` with `attempted: false` and `not attempted: total time cap reached`.
 
+A host's SSH port comes from `NOTIFY_HOST_PORTS`, a JSON object of
+`{"host": port}` that `run-prompt.sh` and `discord_inbound.py` export from the
+CMS. Resolution for one host is the map entry, then `SSH_PORT`, then the
+built-in default (`22`). A host absent from the map keeps the old behaviour, so
+an unset or empty map changes nothing. The map is validated strictly: it must
+be a JSON object, every name must be a usable hostname and every port a whole
+number from 1 to 65535. A malformed map fails startup with a message naming
+`NOTIFY_HOST_PORTS`, never a host or port value. The map only decides which
+port is dialled; `SSH_ALLOWED_HOSTS` and `NOTIFY_HOST_SCOPE` are still checked
+first and are unchanged.
+
 ### Two host boundaries, enforced in code
 
 Before any connection is attempted, the tool applies two checks:
@@ -410,7 +421,8 @@ subprocess is involved.
 | `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `host1.example.com,host2.example.com,host3.example.com` |
 | `SSH_TIMEOUT_SECONDS` | no | Per-host timeout, default 5; capped at 30 |
 | `SSH_TOTAL_TIMEOUT_SECONDS` | no | Whole-call deadline, default 20; capped at 60 |
-| `SSH_PORT` | no | SSH port for every host, default 22 |
+| `SSH_PORT` | no | Default SSH port for hosts without an entry in `NOTIFY_HOST_PORTS`; default 22 |
+| `NOTIFY_HOST_PORTS` | no | Optional JSON object of `{"host": port}` set by the run from the CMS `hosts` array; a per-host port overrides `SSH_PORT` |
 | `SSH_KEY_HOST_FILE` | compose only | Host path bind-mounted read-only at `/ssh/id_ed25519`; set in `.env` or the shell, not `stack.env` |
 | `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `host1.example.com,host2.example.com,host3.example.com` |
 
@@ -979,26 +991,33 @@ bot-settings global. It is sent only as `Authorization: users API-Key <key>`,
 never placed in a URL, and never logged or included in an error. Redirects are
 refused so it cannot be forwarded to another host.
 
-The panel returns `{version, targets, sources}`. `targets` has the same shape as
-`NOTIFY_TARGETS`; `sources` has the same shape as `NOTIFY_INBOUND_SOURCES`
-(an empty array leaves inbound in its environment-configured single-channel
-mode). Nothing else moves: Composio credentials, author allowlists, state
-paths and model settings stay in `stack.env`.
+The panel returns `{version, targets, sources, hosts}`. `targets` has the same
+shape as `NOTIFY_TARGETS`; `sources` has the same shape as
+`NOTIFY_INBOUND_SOURCES` (an empty array leaves inbound in its
+environment-configured single-channel mode). `hosts` is an optional array of
+`{"name": "<host>", "sshPort": <1-65535>}`; it becomes `NOTIFY_HOST_PORTS` for
+the run, so `mcp/ssh_probe.py` dials each host on its own port. An entry with
+no usable `name` or `sshPort` is dropped and counted in the source log, never
+passed through. Nothing else moves: Composio credentials, author allowlists,
+state paths and model settings stay in `stack.env`.
 
 Resolution order, for every scheduled prompt and every inbound reply:
 
 1. **CMS.** `GET BOT_SETTINGS_URL`, HTTP 200, valid JSON, `version`, `targets`
    and `sources` present. The document is validated with the agent's own
    parsers: targets by the rules `notify.sh` applies at the send boundary,
-   sources by `discord_inbound`'s `_load_sources`. A document the agent would
-   refuse from the environment is refused from the panel with the same errors.
+   sources by `discord_inbound`'s `_load_sources`, hosts entry by entry. A
+   document the agent would refuse from the environment is refused from the
+   panel with the same errors.
 2. **Cache.** A validated fetch is written atomically (temp file plus
    `os.replace`) with mode `0600` to
    `$XDG_STATE_HOME/notify-agent/bot-settings-cache.json`. On any CMS failure
    (network error, timeout, non-200, malformed JSON, failed validation) the
-   last good copy is used.
-3. **Environment.** If there is no usable cache, `NOTIFY_TARGETS` and
-   `NOTIFY_INBOUND_SOURCES` are used exactly as before.
+   last good copy is used, including its `hosts` map.
+3. **Environment.** If there is no usable cache, `NOTIFY_TARGETS`,
+   `NOTIFY_INBOUND_SOURCES` and `NOTIFY_HOST_PORTS` are used exactly as before.
+   When the environment has no map, it stays unset and the global `SSH_PORT`
+   governs.
 
 The timeout is 5 seconds by default and capped at 30; a malformed value falls
 back to 5 rather than failing a run. The cache is internal configuration, not a
@@ -1007,14 +1026,16 @@ layout `$XDG_STATE_HOME` is tmpfs, so the cache survives a CMS outage during a
 container's life but not a restart; the environment fallback still keeps the
 09:00 digest running either way.
 
-One line is logged per run, naming the source and, when it is not the CMS, why:
+One line is logged per run, naming the source, the number of host entries and
+how many carry an explicit port, and, when it is not the CMS, why:
 
 ```text
-config source=cms
-config source=cache reason=cms timeout 5s
-config source=cache reason=cms 401
-config source=env reason=cms invalid JSON
-config source=env reason=cms invalid host_scope for target(s) automations: expected a non-empty string or an array of non-empty strings
+config source=cms hosts=5 ssh_ports=2
+config source=cms hosts=5 ssh_ports=2 dropped=1
+config source=cache hosts=5 ssh_ports=2 reason=cms timeout 5s
+config source=cache hosts=5 ssh_ports=2 reason=cms 401
+config source=env hosts=0 ssh_ports=0 reason=cms invalid JSON
+config source=env hosts=0 ssh_ports=0 reason=cms invalid host_scope for target(s) automations: expected a non-empty string or an array of non-empty strings
 ```
 
 The line never includes the API key, a full URL, a channel id or an account id.
@@ -1457,11 +1478,11 @@ Verified while building this branch:
 - Image size on this branch, measured with `docker save | gzip -9` and `du -sh /` inside each image: `main` without content search is `242,637,972` bytes compressed / `593 MB` root filesystem; this branch is `242,638,242` bytes compressed / `593 MB` root filesystem. That is `+270` bytes compressed and `+2,245` bytes uncompressed: only the MCP Python file, prompt and OpenCode config changed, with no new package or dependency. The earlier Python 3, pip, `python-oracledb` and wheel cost (roughly `205 MB` to `232 MB` by the previous measurement) is unchanged. The 512 MB `mem_limit` is memory, not image size; the MCP server is only started when a session calls it.
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **363 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`. The inbound suite covers the transcript header/footer and cap, the unsent retry (exactly once, marker present means no retry, two misses stop, non-zero exits unchanged), `NOTIFY_DEBUG_LLM` being off by default and opt-in, the one-line container-log summary (flattened, truncated, capped even with a long source name), and the generated instruction never naming a withheld capability.
-- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; and no key path, user or key material in output. No live SSH connection was made.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **377 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_bookstack.py`.
+- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each threshold at the boundary and one below, the inline flag text, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-preflight.sh` passes against a stub MCP server and the real `notify.sh` with a stubbed `curl`: a transient self-test failure is logged with its safe reason, retried once and the run continues to `opencode`; a persistent failure runs exactly two preflights, does not start `opencode`, and sends exactly one message to the configured target through `notify.sh`, with no statistics and no environment leak; host-like wallet filenames are masked so the target's `host_scope` guard still allows the failure message; and the healthy path keeps one handshake and one self-test.
-- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
+- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The CMS case resolves `NOTIFY_HOST_PORTS` from the panel `hosts` array, and a panel without it clears an inherited map while an unset URL keeps the environment map verbatim. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
 - `python3 -m py_compile` passes on `mcp/bookstack.py`, `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_bookstack.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh`, `tests/run-prompt-fallback.sh`, `tests/run-prompt-preflight.sh` and `tests/run-prompt-scope.sh`.
 - `opencode.json` statically registers three MCP servers (`oracle`, `ssh` and `bookstack`), gives all three the same 60-second startup/execution budget, keeps the global denies on `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read`, and allows all five for `notify`.
 - `tests/test_bookstack.py` makes real HTTP requests to loopback stubs (with a test-only opener that maps a fake `https://` host to each stub) and asserts what each stub received: search asks only the resolved book on the selected instance, a result whose `book.id` is outside the allowlist is dropped and never contributes to `count`, a page with `book_id: 99` is refused in both id and slug form without fetching its content, and a forbidden page, a missing page and an unknown slug return the identical `page is not available` message with no book or page name. It also covers default-deny: with `NOTIFY_RUNBOOKS_ALLOWED` missing, empty or any value other than `1`, both tools refuse with zero requests, even with a complete BookStack configuration; a grant without a URL, books or token pair refuses; a URL that is absent or not `https` fails configuration; there is no fallback to a global `BOOKSTACK_TOKEN_*` pair; the token appearing only in the `Authorization` header (never in a URL parameter) and never in output on a 401 or 500 whose body echoes it; redirect refusal; the allowlist/URL/timeout configuration errors; the startup exit path naming the variable without echoing the value; a startup without the grant serving without configuration; and a server that accepts a connection and never answers failing inside `BOOKSTACK_TIMEOUT_SECONDS`. The isolation tests run an `admin-chat` (Vortex) environment against a Vortex stub and an `automations` (operator) environment against an operator stub: each contacts only its own stub, the other stub receives zero requests, and the exported URLs and token pairs differ; each stub authenticates with its own credential. The allowlist tests also prove that a slug which does not exist on the instance is skipped, that a search with no resolvable book returns an empty result, and that a read is then refused, rather than failing the run.

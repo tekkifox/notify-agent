@@ -48,10 +48,12 @@ class Connector:
 
     def __init__(self, outcomes=None):
         self.calls = []
+        self.ports = []
         self.outcomes = outcomes or {}
 
     def __call__(self, host, settings, timeout):
         self.calls.append((host, timeout))
+        self.ports.append(settings.port)
         outcome = self.outcomes.get(host)
         if outcome is None:
             return ssh_probe.Outcome("ok", 12, "connected")
@@ -128,6 +130,101 @@ class PolicyTests(unittest.TestCase):
     def test_invalid_host_is_rejected_before_any_policy_or_connection(self) -> None:
         with self.assertRaises(ssh_probe.InputError):
             ssh_probe.prepare_hosts({"hosts": ["good.example\nvortex"]})
+
+
+class HostPortTests(unittest.TestCase):
+    def test_host_in_the_map_is_dialled_on_its_own_port(self) -> None:
+        settings = SETTINGS._replace(
+            host_ports=(("host1.example.com", 2222),)
+        )
+        connector = Connector()
+        payload = ssh_probe.probe(
+            ["host1.example.com"], settings, connector=connector
+        )
+        self.assertEqual(payload["results"][0]["status"], "ok")
+        self.assertEqual(connector.ports, [2222])
+
+    def test_host_absent_from_the_map_uses_ssh_port(self) -> None:
+        settings = SETTINGS._replace(
+            port=2022, host_ports=(("host1.example.com", 2222),)
+        )
+        connector = Connector()
+        ssh_probe.probe(["host2.example.com"], settings, connector=connector)
+        self.assertEqual(connector.ports, [2022])
+
+    def test_map_keys_are_matched_after_normalisation(self) -> None:
+        settings = SETTINGS._replace(
+            host_ports=(("HOST1.Example.COM.", 2222),)
+        )
+        connector = Connector()
+        ssh_probe.probe(["host1.example.com"], settings, connector=connector)
+        self.assertEqual(connector.ports, [2222])
+
+    def test_refused_hosts_are_still_refused_before_any_port_is_used(self) -> None:
+        settings = SETTINGS._replace(
+            host_ports=(("evil.example", 2222), ("host2.example.com", 2200))
+        )
+        connector = Connector()
+        payload = ssh_probe.probe(
+            ["evil.example", "host2.example.com"],
+            settings,
+            scope=["host1.example.com"],
+            connector=connector,
+        )
+        self.assertEqual(connector.calls, [])
+        self.assertEqual(connector.ports, [])
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["not_allowed", "out_of_scope"],
+        )
+
+    def test_load_settings_reads_and_normalises_the_map(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "SSH_PORT": "2022",
+                "NOTIFY_HOST_PORTS": (
+                    '{"HOST1.Example.COM.":2222,"host2.example.com":2200}'
+                ),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                settings = ssh_probe.load_settings()
+        self.assertEqual(settings.port, 2022)
+        self.assertEqual(
+            settings.host_ports,
+            (("host1.example.com", 2222), ("host2.example.com", 2200)),
+        )
+
+    def test_malformed_map_fails_configuration_naming_the_variable(self) -> None:
+        cases = (
+            "not json",
+            "[]",
+            '"host1.example.com"',
+            '{"host1.example.com":"22"}',
+            '{"host1.example.com":0}',
+            '{"host1.example.com":65536}',
+            '{"host1.example.com":true}',
+            '{"host1.example.com":22.5}',
+            '{"host1.example.com":null}',
+            '{"bad host":22}',
+            '{"host1.example.com":22,"bad host":2222}',
+        )
+        with tempfile.NamedTemporaryFile() as key:
+            for raw in cases:
+                with self.subTest(raw=raw):
+                    env = {
+                        "SSH_USER": "agent",
+                        "SSH_KEY_PATH": key.name,
+                        "NOTIFY_HOST_PORTS": raw,
+                    }
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        with self.assertRaises(ssh_probe.ConfigError) as raised:
+                            ssh_probe.load_settings()
+                    message = str(raised.exception)
+                    self.assertIn("NOTIFY_HOST_PORTS", message)
+                    self.assertNotIn("bad host", message)
+                    self.assertNotIn(raw, message)
 
 
 class FailureTests(unittest.TestCase):
@@ -281,6 +378,7 @@ class ConfigurationTests(unittest.TestCase):
                 "SSH_TIMEOUT_SECONDS": "5",
                 "SSH_TOTAL_TIMEOUT_SECONDS": "20",
                 "SSH_ALLOWED_HOSTS": "host1.example.com,host3.example.com",
+                "NOTIFY_HOST_PORTS": '{"host1.example.com":2222}',
             }
             boom = mock.Mock(side_effect=AssertionError("must not connect"))
             stdout = io.StringIO()
@@ -292,8 +390,10 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("ssh configured", output)
         self.assertIn("SSH_KEY_PATH readable", output)
+        self.assertIn("per-host ports 1", output)
         self.assertNotIn(key.name, output)
         self.assertNotIn("agent", output)
+        self.assertNotIn("2222", output)
         boom.assert_not_called()
 
     def test_selftest_without_configuration_is_successful_and_plain(self) -> None:

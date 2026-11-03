@@ -29,7 +29,14 @@ Credentials are a single unprivileged key, mounted read-only like the Oracle
 wallet. Configuration comes from the environment and is never echoed:
 
     SSH_USER, SSH_KEY_PATH, SSH_TIMEOUT_SECONDS, SSH_TOTAL_TIMEOUT_SECONDS,
-    SSH_PORT, SSH_ALLOWED_HOSTS
+    SSH_PORT, NOTIFY_HOST_PORTS, SSH_ALLOWED_HOSTS
+
+``NOTIFY_HOST_PORTS`` is an optional JSON object of ``{"host": port}`` set by
+the run from the CMS. Port resolution for each host is the map entry, then
+``SSH_PORT``, then the built-in default (22). The map is validated strictly at
+startup: a malformed map fails loudly while naming the variable, and no value
+is echoed. A map entry never widens the allowlist or the run scope: the port
+decides where to dial, never which hosts are permitted.
 
 ``SSH_USER`` and ``SSH_KEY_PATH`` are required to probe. If either is absent,
 or the key file is not readable, the tool returns ``configured: false`` with a
@@ -66,7 +73,7 @@ import time
 from typing import Any, Callable, NamedTuple, Sequence
 
 SERVER_NAME = "notify-ssh"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 PROTOCOL_VERSIONS = (
     "2024-11-05",
     "2025-03-26",
@@ -87,6 +94,10 @@ DEFAULT_ALLOWED_HOSTS = (
 # the opencode process, so it inherits this value.
 HOST_SCOPE_ENV = "NOTIFY_HOST_SCOPE"
 
+# Set by run-prompt.sh / discord_inbound.py from the CMS hosts array. JSON
+# object of host to port. Optional: without it every host uses SSH_PORT.
+HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
+
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TIMEOUT_SECONDS = 30.0
 DEFAULT_TOTAL_TIMEOUT_SECONDS = 20.0
@@ -98,8 +109,8 @@ MAX_HOST_CHARS = 253
 MAX_MESSAGE_CHARS = 200
 
 # Deliberately conservative: a hostname label or an IP literal, no spaces,
-# slashes, newlines or shell metacharacters. Ports are configured once with
-# SSH_PORT, not per host, so a host cannot smuggle one in.
+# slashes, newlines or shell metacharacters. Ports come from the per-host map
+# or SSH_PORT, never from the host string, so a host cannot smuggle one in.
 HOST_PATTERN = re.compile(
     r"^(?=.{1,%d}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
     % MAX_HOST_CHARS
@@ -202,6 +213,8 @@ class Settings(NamedTuple):
     total_timeout: float
     port: int
     allowed_hosts: tuple[str, ...]
+    # Validated (host, port) pairs. Empty means every host uses ``port``.
+    host_ports: tuple[tuple[str, int], ...] = ()
 
 
 class Outcome(NamedTuple):
@@ -242,6 +255,61 @@ def _port() -> int:
             "SSH_PORT must be between 1 and 65535", not_configured=False
         )
     return value
+
+
+def _host_ports() -> tuple[tuple[str, int], ...]:
+    """Parse NOTIFY_HOST_PORTS strictly, naming the variable only.
+
+    A malformed map is a configuration error, not something to half-apply: a
+    wrong port is invisible until a probe fails, so guessing is worse than
+    refusing to start. No host or port value is echoed in the message.
+    """
+
+    raw = _env(HOST_PORTS_ENV)
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"{HOST_PORTS_ENV} must be a JSON object of host to port",
+            not_configured=False,
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ConfigError(
+            f"{HOST_PORTS_ENV} must be a JSON object of host to port",
+            not_configured=False,
+        )
+
+    entries: dict[str, int] = {}
+    for name, port in parsed.items():
+        host = _canonical(name) if isinstance(name, str) else ""
+        if not host or not HOST_PATTERN.match(host):
+            raise ConfigError(
+                f"{HOST_PORTS_ENV} contains an invalid host name",
+                not_configured=False,
+            )
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ConfigError(
+                f"{HOST_PORTS_ENV} ports must be whole numbers between 1 and 65535",
+                not_configured=False,
+            )
+        entries[host] = port
+    return tuple(entries.items())
+
+
+def _port_for(host: str, settings: Settings) -> int:
+    """Return the per-host port, then SSH_PORT, then the built-in default."""
+
+    canonical = _canonical(host)
+    for name, port in settings.host_ports:
+        if _canonical(name) == canonical:
+            return port
+    return settings.port
 
 
 def parse_allowed_hosts(value: str | None = None) -> tuple[str, ...]:
@@ -340,6 +408,7 @@ def load_settings() -> Settings:
         total_timeout=total_timeout,
         port=_port(),
         allowed_hosts=parse_allowed_hosts(),
+        host_ports=_host_ports(),
     )
 
 
@@ -588,8 +657,11 @@ def probe(
 
         host_timeout = min(settings.timeout, remaining)
         host_started = now()
+        # The policy checks above already passed, so the map only chooses the
+        # port for a host that is allowed to be dialled at all.
+        host_settings = settings._replace(port=_port_for(host, settings))
         try:
-            outcome = connector(host, settings, host_timeout)
+            outcome = connector(host, host_settings, host_timeout)
         except Exception as exc:
             outcome = _classify_exception(exc)
         elapsed = now() - host_started
@@ -655,6 +727,9 @@ def selftest() -> int:
         f"port {settings.port}; "
         f"allowed hosts {len(settings.allowed_hosts)}"
     )
+    if settings.host_ports:
+        # Count only: the map itself is configuration, not log material.
+        detail += f"; per-host ports {len(settings.host_ports)}"
     if scope:
         detail += f"; run scope {len(scope)} host(s)"
     print(f"selftest: ssh configured: {detail}")

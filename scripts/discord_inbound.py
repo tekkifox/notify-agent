@@ -247,6 +247,7 @@ class Config:
     # validated, instead of the stale environment copy.
     targets_json: str = ""
     sources_json: str = ""
+    host_ports_json: str = ""
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -862,6 +863,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         opencode_model_fallback=opencode_model_fallback,
         targets_json=env.get("NOTIFY_TARGETS") or "",
         sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
+        host_ports_json=env.get("NOTIFY_HOST_PORTS") or "",
     )
 
 
@@ -882,6 +884,13 @@ def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
     env = dict(environ)
     env["NOTIFY_TARGETS"] = resolution.targets_json
     env["NOTIFY_INBOUND_SOURCES"] = resolution.sources_json
+    if resolution.host_ports_json:
+        env["NOTIFY_HOST_PORTS"] = resolution.host_ports_json
+    else:
+        # The panel (or the environment) supplied no per-host ports: leave the
+        # global SSH_PORT in charge and do not let a stale inherited map leak
+        # into the agent run.
+        env.pop("NOTIFY_HOST_PORTS", None)
     return env
 
 
@@ -1598,6 +1607,11 @@ def _run_agent_once(
         environment["NOTIFY_INBOUND_SOURCES"] = config.sources_json
     else:
         environment.pop("NOTIFY_INBOUND_SOURCES", None)
+    # Per-host SSH ports are optional and must not leak an inherited map from
+    # another run. Absent means ssh_probe.py uses the global SSH_PORT.
+    environment.pop("NOTIFY_HOST_PORTS", None)
+    if config.host_ports_json:
+        environment["NOTIFY_HOST_PORTS"] = config.host_ports_json
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"

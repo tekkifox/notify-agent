@@ -54,6 +54,9 @@ fi
 if [ -n "${CAPTURE_SCOPE:-}" ]; then
     printf '%s' "${NOTIFY_HOST_SCOPE-}" > "$CAPTURE_SCOPE"
 fi
+if [ -n "${CAPTURE_HOST_PORTS:-}" ]; then
+    printf '%s' "${NOTIFY_HOST_PORTS-}" > "$CAPTURE_HOST_PORTS"
+fi
 if [ -n "${CAPTURE_OUTPUT:-}" ]; then
     printf 'agent stdout line\n'
     printf 'agent stderr line\n' >&2
@@ -171,7 +174,8 @@ capture() {
     shift
     rm -f "$out" "$out.env" "$out.scope" "$out.runbooks" \
         "$out.bookstack-url" "$out.bookstack-books" \
-        "$out.bookstack-token-id" "$out.bookstack-token-secret"
+        "$out.bookstack-token-id" "$out.bookstack-token-secret" \
+        "$out.host-ports"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
@@ -189,6 +193,7 @@ capture() {
         CAPTURE_BOOKSTACK_BOOKS="$out.bookstack-books" \
         CAPTURE_BOOKSTACK_TOKEN_ID="$out.bookstack-token-id" \
         CAPTURE_BOOKSTACK_TOKEN_SECRET="$out.bookstack-token-secret" \
+        CAPTURE_HOST_PORTS="$out.host-ports" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -798,7 +803,7 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
 server.serve_forever()
 PY
 
-cms_doc='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[]}'
+cms_doc='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[],"hosts":[{"name":"cms.example","sshPort":2222},{"name":"other.example","sshPort":2200}]}'
 start_cms() {
     printf '%s' "$1" > "$tmp/cms-body.json"
     rm -f "$tmp/cms-port"
@@ -835,19 +840,52 @@ else
         no "CMS source: instruction did not use the CMS target"
     elif ! contains "$prompt" "The delivery scope for this run is \`cms.example\`."; then
         no "CMS source: instruction did not use the CMS host_scope"
-    elif ! contains "$err" "config source=cms"; then
-        no "CMS source: log did not name the CMS"
+    elif ! contains "$err" "config source=cms hosts=2 ssh_ports=2"; then
+        no "CMS source: log did not name the CMS and host-port counts"
+    elif [ "$(cat "$tmp/cms.host-ports" 2>/dev/null)" != '{"cms.example":2222,"other.example":2200}' ]; then
+        no "CMS source: NOTIFY_HOST_PORTS was not exported from the panel"
     elif [ "$(stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null)" != "600" ]; then
         no "CMS source: cache file is not 0600"
     else
-        pass "run-prompt resolves the target through the CMS and caches it"
+        pass "run-prompt resolves targets and host ports through the CMS and caches them"
     fi
 fi
 
-# 18. With BOT_SETTINGS_URL unset the resolver is not called at all: the
+# 18. A panel document without a hosts array clears an inherited map, so the
+#     global SSH_PORT governs instead of a stale value from another run.
+if [ -n "$cms_pid" ]; then
+    kill "$cms_pid" 2>/dev/null || true
+    cms_pid=
+fi
+cms_doc_no_hosts='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[]}'
+if ! start_cms "$cms_doc_no_hosts"; then
+    no "CMS no hosts: loopback stub did not start"
+else
+    set +e
+    capture "$tmp/cms-no-ports" \
+        BOT_SETTINGS_URL="$cms_url" \
+        BOT_SETTINGS_API_KEY="cms-test-key" \
+        XDG_STATE_HOME="$tmp/state-no-ports" \
+        NOTIFY_HOST_PORTS='{"stale.example":2222}' \
+        "$run_prompt" -t cms-target "Compose a status message." 2>/dev/null
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        no "CMS no hosts: run-prompt.sh failed: $(cat "$tmp/cms-no-ports.stderr")"
+    elif [ -n "$(cat "$tmp/cms-no-ports.host-ports" 2>/dev/null)" ]; then
+        no "CMS no hosts: an inherited NOTIFY_HOST_PORTS leaked into the run"
+    elif ! contains "$(cat "$tmp/cms-no-ports.stderr")" "config source=cms hosts=0 ssh_ports=0"; then
+        no "CMS no hosts: log did not report zero host ports"
+    else
+        pass "a panel without hosts clears an inherited NOTIFY_HOST_PORTS"
+    fi
+fi
+
+# 19. With BOT_SETTINGS_URL unset the resolver is not called at all: the
 #     environment is used exactly as before and no source line is logged.
 set +e
 capture "$tmp/url-unset" NOTIFY_TARGETS="$targets" \
+    NOTIFY_HOST_PORTS='{"host1.example.com":2222}' \
     "$run_prompt" -t general "Compose a status message." 2>/dev/null
 rc=$?
 set -e
@@ -855,6 +893,8 @@ if [ "$rc" -ne 0 ]; then
     no "unset URL: run-prompt.sh failed: $(cat "$tmp/url-unset.stderr")"
 elif [ "$(cat "$tmp/url-unset")" != "$expected_unscoped" ]; then
     no "unset URL: instruction changed"
+elif [ "$(cat "$tmp/url-unset.host-ports" 2>/dev/null)" != '{"host1.example.com":2222}' ]; then
+    no "unset URL: inherited NOTIFY_HOST_PORTS was not preserved"
 elif contains "$(cat "$tmp/url-unset.stderr")" "config source="; then
     no "unset URL: a config source line was logged"
 else

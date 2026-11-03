@@ -70,11 +70,19 @@ CMS_SOURCES = [
     }
 ]
 
+CMS_HOSTS = [
+    {"name": "host1.example.com", "sshPort": 2222},
+    {"name": "host2.example.com", "sshPort": 2200},
+]
+
+_UNSET = object()
+
 
 def document(
     *,
     targets: object | None = None,
     sources: object | None = None,
+    hosts: object = _UNSET,
     version: object = 3,
     omit: str | None = None,
 ) -> dict[str, object]:
@@ -83,6 +91,10 @@ def document(
         "targets": CMS_TARGETS if targets is None else targets,
         "sources": CMS_SOURCES if sources is None else sources,
     }
+    if hosts is _UNSET:
+        body["hosts"] = CMS_HOSTS
+    elif hosts is not None:
+        body["hosts"] = hosts
     if omit is not None:
         body.pop(omit, None)
     return body
@@ -203,10 +215,17 @@ class ResolverTests(unittest.TestCase):
 
             self.assertEqual(resolution.source, "cms")
             self.assertEqual(resolution.reason, "")
-            self.assertEqual(resolution.log_line, "config source=cms")
+            self.assertEqual(
+                resolution.log_line,
+                "config source=cms hosts=2 ssh_ports=2",
+            )
             self.assertTrue(resolution.log_required)
             self.assertEqual(json.loads(resolution.targets_json), CMS_TARGETS)
             self.assertEqual(json.loads(resolution.sources_json), CMS_SOURCES)
+            self.assertEqual(
+                json.loads(resolution.host_ports_json),
+                {"host1.example.com": 2222, "host2.example.com": 2200},
+            )
             self.assertEqual(len(server.requests), 1)
             self.assertEqual(server.requests[0]["path"], "/api/bot-settings")
             self.assertEqual(
@@ -220,6 +239,81 @@ class ResolverTests(unittest.TestCase):
         leftovers = list(self.cache.parent.glob(".bot-settings-*.tmp"))
         self.assertEqual(leftovers, [])
 
+    def test_hosts_absent_leaves_host_ports_unset(self) -> None:
+        with StubServer(200, encode(document(hosts=None))) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cms")
+        self.assertEqual(resolution.host_ports_json, "")
+        self.assertEqual(
+            resolution.log_line, "config source=cms hosts=0 ssh_ports=0"
+        )
+
+    def test_bad_host_entries_are_dropped_and_counted(self) -> None:
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222},
+            "not-an-object",
+            {"name": "", "sshPort": 22},
+            {"name": "host2.example.com", "sshPort": 0},
+            {"name": "host3.example.com", "sshPort": "2200"},
+            {"name": "host4.example.com", "sshPort": 65535},
+        ]
+        with StubServer(
+            200, encode(document(hosts=hosts, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cms")
+        self.assertEqual(
+            json.loads(resolution.host_ports_json),
+            {"host1.example.com": 2222, "host4.example.com": 65535},
+        )
+        self.assertEqual(
+            resolution.log_line,
+            "config source=cms hosts=6 ssh_ports=2 dropped=4",
+        )
+
+    def test_host_ports_fall_back_to_the_environment(self) -> None:
+        inherited = '{"env.example.com":2200}'
+        with StubServer(401, b"denied") as server:
+            resolution = self.resolve(
+                server.url, NOTIFY_HOST_PORTS=inherited
+            )
+
+        self.assertEqual(resolution.source, "env")
+        self.assertEqual(resolution.host_ports_json, inherited)
+        self.assertEqual(
+            resolution.log_line,
+            "config source=env hosts=1 ssh_ports=1 reason=cms 401",
+        )
+
+    def test_unset_url_keeps_the_environment_map_verbatim(self) -> None:
+        inherited = '{ "env.example.com" : 2200 }'
+        env = dict(self.env)
+        env["NOTIFY_HOST_PORTS"] = inherited
+
+        resolution = bot_config.resolve(env)
+
+        self.assertEqual(resolution.source, "env")
+        self.assertEqual(resolution.host_ports_json, inherited)
+        self.assertFalse(resolution.log_required)
+
+    def test_non_array_hosts_falls_through_to_the_cache(self) -> None:
+        with StubServer(200, encode(document())) as server:
+            self.assertEqual(self.resolve(server.url).source, "cms")
+
+        with StubServer(
+            200, encode(document(hosts={"host1.example.com": 2222}))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cache")
+        self.assertIn("cms document hosts must be a JSON array", resolution.reason)
+        self.assertEqual(
+            json.loads(resolution.host_ports_json),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+
     def test_401_falls_back_to_the_cache(self) -> None:
         good = encode(document())
         with StubServer(200, good) as server:
@@ -231,9 +325,14 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.source, "cache")
         self.assertEqual(resolution.reason, "cms 401")
         self.assertEqual(
-            resolution.log_line, "config source=cache reason=cms 401"
+            resolution.log_line,
+            "config source=cache hosts=2 ssh_ports=2 reason=cms 401",
         )
         self.assertEqual(json.loads(resolution.targets_json), CMS_TARGETS)
+        self.assertEqual(
+            json.loads(resolution.host_ports_json),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
         self.assertNotIn(API_KEY, resolution.log_line)
 
     def test_no_cache_and_401_uses_the_environment(self) -> None:
@@ -243,9 +342,11 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.source, "env")
         self.assertEqual(resolution.reason, "cms 401")
         self.assertEqual(
-            resolution.log_line, "config source=env reason=cms 401"
+            resolution.log_line,
+            "config source=env hosts=0 ssh_ports=0 reason=cms 401",
         )
         self.assertEqual(resolution.targets_json, ENV_TARGETS)
+        self.assertEqual(resolution.host_ports_json, "")
 
     def test_timeout_uses_the_cache(self) -> None:
         with StubServer(200, encode(document())) as server:
@@ -264,7 +365,7 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.reason, "cms timeout 0.25s")
         self.assertEqual(
             resolution.log_line,
-            "config source=cache reason=cms timeout 0.25s",
+            "config source=cache hosts=2 ssh_ports=2 reason=cms timeout 0.25s",
         )
 
     def test_invalid_url_falls_back_without_raising(self) -> None:
@@ -408,7 +509,10 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(result.stdout, ENV_TARGETS)
         self.assertNotIn(API_KEY, result.stderr)
         self.assertNotIn(API_KEY, result.stdout)
-        self.assertIn("config source=env reason=cms network error", result.stderr)
+        self.assertIn(
+            "config source=env hosts=0 ssh_ports=0 reason=cms network error",
+            result.stderr,
+        )
 
 
 class CommandLineTests(unittest.TestCase):
@@ -446,7 +550,44 @@ class CommandLineTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), CMS_TARGETS)
-        self.assertEqual(result.stderr, "config source=cms\n")
+        self.assertEqual(
+            result.stderr, "config source=cms hosts=2 ssh_ports=2\n"
+        )
+
+    def test_cli_prints_host_ports_and_escaped_json(self) -> None:
+        with StubServer(200, encode(document())) as server:
+            host_ports = self.run_cli(server.url, "--host-ports")
+            combined = self.run_cli(server.url, "--json")
+
+        self.assertEqual(host_ports.returncode, 0)
+        self.assertEqual(
+            json.loads(host_ports.stdout),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+        self.assertEqual(
+            host_ports.stderr, "config source=cms hosts=2 ssh_ports=2\n"
+        )
+        self.assertEqual(combined.returncode, 0)
+        payload = json.loads(combined.stdout)
+        self.assertEqual(json.loads(payload["targets"]), CMS_TARGETS)
+        self.assertEqual(json.loads(payload["sources"]), CMS_SOURCES)
+        self.assertEqual(
+            json.loads(payload["host_ports"]),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+        self.assertEqual(
+            combined.stderr, "config source=cms hosts=2 ssh_ports=2\n"
+        )
+
+    def test_cli_host_ports_absent_is_empty_and_still_logs_counts(self) -> None:
+        with StubServer(200, encode(document(hosts=None))) as server:
+            result = self.run_cli(server.url, "--host-ports")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "config source=cms hosts=0 ssh_ports=0\n"
+        )
 
     def test_cli_unset_url_is_silent_and_exact(self) -> None:
         raw = '{ "env-target" : {"channel_id":"999999999999999999"} }'
@@ -523,6 +664,28 @@ class InboundWiringTests(unittest.TestCase):
             json.loads(child_env["NOTIFY_TARGETS"]), CMS_TARGETS
         )
         self.assertTrue(child_env["NOTIFY_INBOUND_SOURCES"])
+        self.assertEqual(
+            json.loads(child_env["NOTIFY_HOST_PORTS"]),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+
+    def test_agent_child_does_not_inherit_a_stale_host_port_map(self) -> None:
+        with StubServer(200, encode(document(hosts=None))) as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            env["NOTIFY_HOST_PORTS"] = '{"stale.example":2222}'
+            config = discord_inbound.load_config(
+                discord_inbound.resolve_environment(env)
+            )
+        process = mock.Mock()
+        process.poll.return_value = 0
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", return_value=process
+        ) as popen:
+            discord_inbound.run_agent(config, "instruction text")
+
+        child_env = popen.call_args.kwargs["env"]
+        self.assertNotIn("NOTIFY_HOST_PORTS", child_env)
 
     def test_listener_falls_back_to_env_without_a_cache(self) -> None:
         with StubServer(401, b"denied") as server:
@@ -535,7 +698,7 @@ class InboundWiringTests(unittest.TestCase):
         self.assertEqual([source.name for source in config.sources], ["env-source"])
         self.assertTrue(
             any(
-                "config source=env reason=cms 401" in line
+                "config source=env hosts=0 ssh_ports=0 reason=cms 401" in line
                 for line in logs.output
             )
         )

@@ -165,18 +165,51 @@ if [ -z "$target" ]; then
     target=${NOTIFY_DEFAULT_TARGET:-}
 fi
 
+# Read one escaped string field from bot_config.py --json without needing jq.
+json_value() {
+    python3 -c '
+import json
+import sys
+
+print(json.load(sys.stdin).get(sys.argv[1], ""), end="")
+' "$1"
+}
+
 # Prefer the CMS configuration when the operator enabled it. bot_config.py
 # validates the panel's document with the same rules notify.sh applies, caches
 # the last good copy and falls back to this environment on any failure. When
 # BOT_SETTINGS_URL is unset nothing is called and NOTIFY_TARGETS is untouched.
+# One resolve returns both values, so the panel is fetched once.
 if [ -n "${BOT_SETTINGS_URL:-}" ]; then
     if command -v python3 >/dev/null 2>&1; then
-        resolved_targets=$(python3 "$script_dir/bot_config.py" --targets) || {
+        resolved_config=$(python3 "$script_dir/bot_config.py" --json) || {
             printf 'run-prompt: could not resolve bot configuration; using NOTIFY_TARGETS from the environment\n' >&2
-            resolved_targets=${NOTIFY_TARGETS:-}
+            resolved_config=
         }
+        if [ -n "$resolved_config" ]; then
+            resolved_targets=$(printf '%s' "$resolved_config" | json_value targets) || {
+                printf 'run-prompt: could not read resolved targets; using NOTIFY_TARGETS from the environment\n' >&2
+                resolved_targets=${NOTIFY_TARGETS:-}
+            }
+            resolved_host_ports=$(printf '%s' "$resolved_config" | json_value host_ports) || {
+                printf 'run-prompt: could not read resolved SSH ports; using the environment\n' >&2
+                resolved_host_ports=${NOTIFY_HOST_PORTS:-}
+            }
+        else
+            resolved_targets=${NOTIFY_TARGETS:-}
+            resolved_host_ports=${NOTIFY_HOST_PORTS:-}
+        fi
         NOTIFY_TARGETS=$resolved_targets
         export NOTIFY_TARGETS
+        # Per-host SSH ports are optional. Export the resolved map when there
+        # is one, and clear an inherited value when the panel has none so the
+        # global SSH_PORT governs; ssh_probe.py does the same for a hand-run.
+        if [ -n "$resolved_host_ports" ]; then
+            NOTIFY_HOST_PORTS=$resolved_host_ports
+            export NOTIFY_HOST_PORTS
+        else
+            unset NOTIFY_HOST_PORTS
+        fi
     else
         printf 'run-prompt: python3 is not installed; using NOTIFY_TARGETS from the environment\n' >&2
     fi
