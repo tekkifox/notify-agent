@@ -33,6 +33,142 @@ esac
 # Set when the self-test fails so the caller can log and report the reason.
 preflight_reason=
 
+# Single flight: the scheduler and the inbound listener share one lock, so two
+# OpenCode processes never touch the same session database at once. A wait that
+# expires is a skip, not a failure: exit 0 so supercronic stays quiet and the
+# next schedule can still run.
+run_lock=${NOTIFY_RUN_LOCK:-${TMPDIR:-/tmp}/notify-agent-run.lock}
+run_lock_wait=${NOTIFY_RUN_LOCK_WAIT:-600}
+case "$run_lock_wait" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_RUN_LOCK_WAIT must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
+
+# Every model attempt is bounded, so a call that never returns cannot hold the
+# lock (and the following digest) for ever. A timed-out attempt is a failure
+# and follows the existing retry and fallback rules.
+run_timeout=${NOTIFY_RUN_TIMEOUT:-300}
+case "$run_timeout" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_RUN_TIMEOUT must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
+
+# An exhausted free tier is remembered for this long, so the next run goes
+# straight to the fallback instead of probing a dead model again. Zero disables
+# the memo.
+quota_memo_seconds=${NOTIFY_QUOTA_MEMO_SECONDS:-900}
+case "$quota_memo_seconds" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_QUOTA_MEMO_SECONDS must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
+if [ -n "${XDG_STATE_HOME:-}" ]; then
+    state_home=$XDG_STATE_HOME
+elif [ -n "${HOME:-}" ]; then
+    state_home=$HOME/.local/state
+else
+    state_home=${TMPDIR:-/tmp}
+fi
+quota_memo_file=$state_home/notify-agent/quota-skip.json
+
+# `timeout` bounds every attempt. --kill-after is used when this build supports
+# it, so a wedged process that ignores TERM is killed shortly afterwards. A
+# missing `timeout` only costs the bound, never the run.
+timeout_available=0
+timeout_kill_after=0
+if command -v timeout >/dev/null 2>&1; then
+    timeout_available=1
+    if timeout --kill-after=10 1 true >/dev/null 2>&1; then
+        timeout_kill_after=1
+    fi
+else
+    printf 'run-prompt: warning: timeout is not installed; attempts are not bounded\n' >&2
+fi
+
+# Remember or forget an exhausted free tier. The stamp is one small JSON object
+# under the state directory; an unreadable or expired stamp is ignored, so it
+# can never block a run. `check` prints the expiry as HH:MM in UTC when a stamp
+# for the given model is still valid.
+quota_memo() {
+    quota_command=$1
+    shift
+    python3 - "$quota_memo_file" "$quota_command" "$@" <<'PY'
+import json
+import os
+import sys
+import time
+
+path = sys.argv[1]
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+model = sys.argv[3] if len(sys.argv) > 3 else ""
+
+if command == "check":
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            stamp = json.load(handle)
+    except (OSError, ValueError):
+        sys.exit(1)
+    if not isinstance(stamp, dict) or stamp.get("model") != model:
+        sys.exit(1)
+    expires = stamp.get("expires")
+    if not isinstance(expires, (int, float)):
+        sys.exit(1)
+    now = time.time()
+    if expires <= now:
+        sys.exit(1)
+    sys.stdout.write(time.strftime("%H:%M", time.gmtime(expires)))
+    sys.exit(0)
+
+if command == "write":
+    if len(sys.argv) <= 4:
+        sys.exit(1)
+    try:
+        seconds = int(sys.argv[4])
+    except ValueError:
+        sys.exit(1)
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError:
+        sys.exit(1)
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump({"model": model, "expires": int(time.time()) + seconds}, handle)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        sys.exit(1)
+    sys.exit(0)
+
+if command == "clear":
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        sys.exit(1)
+    sys.exit(0)
+
+sys.exit(2)
+PY
+}
+
+# True only for the "free usage limit reached" failure, which is the one the
+# memo is for; a missing model or a network error is not a quota problem.
+quota_exhausted() {
+    grep -Eiq 'free usage limit reached' "$1" 2>/dev/null
+}
+
 # Opt-in host-statistics pre-fetch. NOTIFY_PREFETCH=host_stats fetches one
 # aggregate row per in-scope host before OpenCode starts and appends the rows to
 # the instruction, so the model does not have to race the MCP tool registration.
@@ -957,7 +1093,7 @@ run_attempt() {
                 --model "$attempt_model" \
                 --instruction "$prompt" \
                 --marker "${attempt_marker:-}" \
-                -- "$@" 2>"$attempt_stderr"
+                -- "$@" 2>"$attempt_stderr" 9>&-
             ATTEMPT_RC=$?
             append_prefetch_field < "$attempt_stderr" >&2
             rm -f "$attempt_stderr"
@@ -968,7 +1104,7 @@ run_attempt() {
                 --model "$attempt_model" \
                 --instruction "$prompt" \
                 --marker "${attempt_marker:-}" \
-                -- "$@"
+                -- "$@" 9>&-
             ATTEMPT_RC=$?
         fi
         set -e
