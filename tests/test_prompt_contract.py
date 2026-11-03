@@ -479,17 +479,42 @@ class FleetDigestScheduleTests(unittest.TestCase):
         line = self._schedule_line("crontab", "0 9 * * * ", "automations")
         self.assertIn("2,000 characters", line)
 
-    def test_live_copy_matches_the_template_for_the_digests(self) -> None:
-        for schedule in ("0 9 * * * ", "15 * * * * "):
-            self.assertEqual(
-                self._schedule_line("crontab", schedule, "automations"),
-                self._schedule_line("crontab.live", schedule, "automations"),
-            )
+    def test_live_morning_digest_matches_the_template(self) -> None:
+        self.assertEqual(
+            self._schedule_line("crontab", "0 9 * * * ", "automations"),
+            self._schedule_line("crontab.live", "0 9 * * * ", "automations"),
+        )
 
-    def test_the_single_host_admin_chat_job_is_untouched(self) -> None:
-        for name in CRONTABS:
-            line = self._schedule_line(name, "5 * * * * ", "admin-chat")
-            self.assertNotIn("failed logins", line)
+    def test_live_hourly_digests_stay_silent_unless_something_is_flagged(
+        self,
+    ) -> None:
+        silence_rule = (
+            "Call notify.sh only when at least one host is flagged or the "
+            "supplied statistics report failed logins; if neither, do not call "
+            "notify.sh at all - reply with one line and stop."
+        )
+        for schedule, target in (
+            ("5 * * * * ", "admin-chat"),
+            ("15 * * * * ", "automations"),
+        ):
+            with self.subTest(schedule=schedule, target=target):
+                line = self._schedule_line("crontab.live", schedule, target)
+                self.assertIn("/app/scripts/run-prompt.sh", line)
+                self.assertIn(f"-t {target} ", line)
+                self.assertIn(silence_rule, line)
+                self.assertNotIn("If nothing is flagged", line)
+
+    def test_the_admin_chat_hourly_job_reports_failed_logins(self) -> None:
+        line = self._schedule_line("crontab.live", "5 * * * * ", "admin-chat")
+        self.assertIn("failed logins", line)
+        self.assertIn("top three usernames", line)
+        self.assertIn("Never invent a username or a number", line)
+        self.assertIn(
+            "Call notify.sh only when at least one host is flagged or the "
+            "supplied statistics report failed logins",
+            line,
+        )
+        self.assertIn("if neither, do not call notify.sh at all", line)
 
 
 if __name__ == "__main__":
