@@ -87,12 +87,18 @@ run_scenario() {
     : > "$tmp/counter"; : > "$tmp/models"
     data="$tmp/data-$scenario"
     rm -rf "$data"; mkdir -p "$data"
+    # Keep the single-flight lock and the quota memo inside this scenario, so
+    # one case cannot skip the next one.
+    state="$tmp/state-$scenario"
+    rm -rf "$state"; mkdir -p "$state"
     set +e
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
         OPENCODE_MODEL_FALLBACK="$fallback" \
         NOTIFY_MCP_SERVER="$tmp/mcp-good.py" \
+        NOTIFY_RUN_LOCK="$tmp/run-$scenario.lock" \
+        XDG_STATE_HOME="$state" \
         XDG_DATA_HOME="$data" \
         SCENARIO="$scenario" \
         COUNTER_FILE="$tmp/counter" \

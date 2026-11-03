@@ -10,6 +10,8 @@ Run with:
 
 from __future__ import annotations
 
+import dataclasses
+import fcntl
 import importlib.util
 import io
 import json
@@ -64,6 +66,7 @@ def base_env(tmpdir: str) -> dict[str, str]:
         ),
         "OPENCODE_MODEL": "test/model",
         "OPENCODE_BIN": TRUE_BIN,
+        "NOTIFY_RUN_LOCK": str(pathlib.Path(tmpdir) / "run.lock"),
         "NOTIFY_INBOUND_STATE_FILE": str(pathlib.Path(tmpdir) / "state.json"),
         "NOTIFY_INBOUND_POLL_SECONDS": "5",
         "NOTIFY_INBOUND_MAX_INSTRUCTION_CHARS": "1000",
@@ -337,6 +340,57 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.target)
         self.assertIn("/app/scripts/notify.sh -m", discord_inbound.build_instruction(config, "hi"))
         self.assertNotIn("/app/scripts/notify.sh -t", discord_inbound.build_instruction(config, "hi"))
+
+    def test_run_lock_defaults_to_the_scheduler_path(self) -> None:
+        config = self.load(NOTIFY_RUN_LOCK=None)
+        self.assertEqual(
+            config.run_lock, pathlib.Path("/tmp") / "notify-agent-run.lock"
+        )
+
+    def test_run_lock_honours_tmpdir(self) -> None:
+        temporary = pathlib.Path(self.temp.name)
+        config = self.load(NOTIFY_RUN_LOCK=None, TMPDIR=str(temporary))
+        self.assertEqual(
+            config.run_lock, temporary / "notify-agent-run.lock"
+        )
+
+    def test_run_lock_must_be_absolute(self) -> None:
+        with self.assertRaises(discord_inbound.ConfigError) as raised:
+            self.load(NOTIFY_RUN_LOCK="run.lock")
+        self.assertIn("NOTIFY_RUN_LOCK", str(raised.exception))
+
+    def test_lock_wait_defaults_to_sixty_seconds(self) -> None:
+        self.assertEqual(self.load().lock_wait_seconds, 60.0)
+
+    def test_lock_wait_accepts_zero_and_rejects_a_negative(self) -> None:
+        self.assertEqual(
+            self.load(NOTIFY_INBOUND_LOCK_WAIT="0").lock_wait_seconds, 0.0
+        )
+        with self.assertRaises(discord_inbound.ConfigError) as raised:
+            self.load(NOTIFY_INBOUND_LOCK_WAIT="-1")
+        self.assertIn("NOTIFY_INBOUND_LOCK_WAIT", str(raised.exception))
+
+    def test_per_attempt_timeout_defaults_to_180_seconds(self) -> None:
+        config = self.load(
+            NOTIFY_INBOUND_TIMEOUT=None,
+            NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS=None,
+        )
+        self.assertEqual(config.run_timeout_seconds, 180.0)
+
+    def test_the_older_timeout_name_is_still_honoured(self) -> None:
+        config = self.load(
+            NOTIFY_INBOUND_TIMEOUT=None,
+            NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS="45",
+        )
+        self.assertEqual(config.run_timeout_seconds, 45.0)
+        self.assertEqual(self.load().run_timeout_seconds, 30.0)
+
+    def test_the_new_timeout_name_wins_over_the_older_one(self) -> None:
+        config = self.load(
+            NOTIFY_INBOUND_TIMEOUT="90",
+            NOTIFY_INBOUND_RUN_TIMEOUT_SECONDS="45",
+        )
+        self.assertEqual(config.run_timeout_seconds, 90.0)
 
 
 CHANNEL2 = "1314326014318481459"
@@ -1782,6 +1836,147 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("sent=no", lines[0])
         self.assertIn("sent=yes", lines[1])
+
+
+class SingleFlightTests(unittest.TestCase):
+    """The shared run lock, the busy line and the per-attempt timeout."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.env = base_env(self.temp.name)
+        self.config = discord_inbound.load_config(self.env)
+        self.lock_path = pathlib.Path(self.env["NOTIFY_RUN_LOCK"])
+
+    def _config(self, **changes: object) -> discord_inbound.Config:
+        return dataclasses.replace(self.config, **changes)
+
+    def _hold(self) -> io.IOBase:
+        handle = open(self.lock_path, "a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(handle.close)
+        return handle
+
+    @staticmethod
+    def _sending_popen(command: object, **kwargs: object) -> FakeProcess:
+        marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+        pathlib.Path(marker).write_text("", encoding="utf-8")
+        return FakeProcess(0)
+
+    def test_another_run_makes_the_listener_skip_the_model(self) -> None:
+        config = self._config(lock_wait_seconds=0.0)
+        self._hold()
+        with mock.patch.object(
+            discord_inbound, "_deliver_busy_line", return_value=True
+        ) as busy:
+            with mock.patch.object(
+                discord_inbound.subprocess, "Popen"
+            ) as popen:
+                with self.assertLogs(
+                    "discord-inbound", level="WARNING"
+                ) as logs:
+                    result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        popen.assert_not_called()
+        busy.assert_called_once()
+        self.assertIn("another run is in progress", "\n".join(logs.output))
+
+    def test_the_busy_line_uses_notify_sh_with_the_target(self) -> None:
+        config = self._config(lock_wait_seconds=0.0)
+        self._hold()
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            discord_inbound.subprocess, "run", return_value=completed
+        ) as run:
+            with self.assertLogs("discord-inbound", level="WARNING"):
+                self.assertFalse(
+                    discord_inbound.run_agent(config, "instruction")
+                )
+        script = pathlib.Path(discord_inbound.__file__).with_name("notify.sh")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], str(script))
+        self.assertEqual(command[1:3], ["-t", "admin-chat"])
+        self.assertEqual(command[3:], ["-m", discord_inbound.BUSY_LINE])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["NOTIFY_TARGETS"],
+            config.targets_json,
+        )
+        self.assertNotIn("NOTIFY_SEND_MARKER", run.call_args.kwargs["env"])
+
+    def test_a_failed_busy_line_is_logged_and_harmless(self) -> None:
+        config = self._config(lock_wait_seconds=0.0)
+        self._hold()
+        with mock.patch.object(
+            discord_inbound.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=1),
+        ):
+            with self.assertLogs(
+                "discord-inbound", level="WARNING"
+            ) as logs:
+                self.assertFalse(
+                    discord_inbound.run_agent(config, "instruction")
+                )
+        output = "\n".join(logs.output)
+        self.assertIn("busy line was not delivered", output)
+
+    def test_the_lock_is_released_after_a_run(self) -> None:
+        with mock.patch.object(
+            discord_inbound.subprocess,
+            "Popen",
+            side_effect=self._sending_popen,
+        ):
+            self.assertTrue(
+                discord_inbound.run_agent(self.config, "instruction")
+            )
+        descriptor = os.open(self.lock_path, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_the_run_waits_for_the_lock_then_proceeds(self) -> None:
+        config = self._config(lock_wait_seconds=5.0)
+        handle = self._hold()
+        timer = threading.Timer(
+            0.4, lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        )
+        timer.start()
+        self.addCleanup(timer.cancel)
+        started = time.monotonic()
+        with mock.patch.object(
+            discord_inbound.subprocess,
+            "Popen",
+            side_effect=self._sending_popen,
+        ) as popen:
+            self.assertTrue(discord_inbound.run_agent(config, "instruction"))
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        popen.assert_called_once()
+
+    def test_an_attempt_that_never_returns_times_out(self) -> None:
+        class NeverEndingProcess(FakeProcess):
+            def poll(self) -> int | None:
+                return None
+
+        config = self._config(lock_wait_seconds=0.0, run_timeout_seconds=0.05)
+        with mock.patch.object(
+            discord_inbound,
+            "_terminate",
+        ) as terminate:
+            with mock.patch.object(
+                discord_inbound.subprocess,
+                "Popen",
+                return_value=NeverEndingProcess(),
+            ):
+                with self.assertLogs(
+                    "discord-inbound", level="WARNING"
+                ) as logs:
+                    self.assertFalse(
+                        discord_inbound.run_agent(config, "instruction")
+                    )
+        self.assertTrue(terminate.called)
+        self.assertIn("agent timed out", "\n".join(logs.output))
+        descriptor = os.open(self.lock_path, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class SummaryTests(unittest.TestCase):
