@@ -15,6 +15,7 @@ checks that need the container and credentials.
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import unittest
@@ -25,6 +26,103 @@ PROMPT = (ROOT / "prompts" / "notify.md").read_text(encoding="utf-8")
 FLAT_PROMPT = " ".join(PROMPT.split())
 CONFIG = json.loads((ROOT / "opencode.json").read_text(encoding="utf-8"))
 RUN_PROMPT = (ROOT / "scripts" / "run-prompt.sh").read_text(encoding="utf-8")
+SSH_SERVER = ROOT / "mcp" / "ssh_probe.py"
+
+
+def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]):
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current
+        current = parents.get(current)
+    return None
+
+
+def _env_vars_read_by_ssh_server() -> set[str]:
+    """Return every environment variable name ``ssh_probe.py`` reads.
+
+    Derived from the server's own source so the passthrough contract cannot
+    go stale. ``_env`` is the only reader of ``os.environ``; a helper that
+    forwards its first parameter to an env accessor (such as
+    ``_positive_float``) is followed as if it were an accessor too.
+    """
+
+    tree = ast.parse(SSH_SERVER.read_text(encoding="utf-8"))
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+    def resolve(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        return None
+
+    accessors = {"_env"}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            parameters = node.args.posonlyargs + node.args.args
+            if not parameters:
+                continue
+            first = parameters[0].arg
+            forwards = any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in accessors
+                and call.args
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == first
+                for call in ast.walk(node)
+            )
+            if forwards and node.name not in accessors:
+                accessors.add(node.name)
+                changed = True
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    names: set[str] = set()
+    unresolved: list[str] = []
+    for call in ast.walk(tree):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in accessors
+            and call.args
+        ):
+            continue
+        name = resolve(call.args[0])
+        if name is not None:
+            names.add(name)
+            continue
+        # A bare parameter is resolved at the call site that passes it in.
+        function = _enclosing_function(call, parents)
+        parameters = function.args.posonlyargs + function.args.args if function else []
+        if not (
+            isinstance(call.args[0], ast.Name)
+            and call.args[0].id in {parameter.arg for parameter in parameters}
+        ):
+            unresolved.append(ast.unparse(call))
+
+    if unresolved:
+        raise AssertionError(
+            "cannot derive environment names from ssh_probe.py: "
+            + ", ".join(sorted(unresolved))
+        )
+    return names
 
 
 class PromptContractTests(unittest.TestCase):
@@ -197,6 +295,16 @@ class OpenCodeConfigTests(unittest.TestCase):
         self.assertFalse(self.ssh["codemode"])
         self.assertIn("NOTIFY_HOST_SCOPE", self.ssh["environment"])
         self.assertEqual(self.ssh["environment"]["PYTHONPATH"], "/opt/mcp-python")
+
+    def test_every_ssh_env_var_is_passed_through(self) -> None:
+        environment = self.ssh["environment"]
+        expected = _env_vars_read_by_ssh_server()
+        # Guard against a derivation that silently stops finding anything.
+        self.assertTrue(expected)
+        for name in sorted(expected):
+            with self.subTest(variable=name):
+                self.assertIn(name, environment)
+                self.assertEqual(environment[name], f"{{env:{name}}}")
 
     def test_steps_leave_room_for_the_retry(self) -> None:
         self.assertGreaterEqual(CONFIG["agent"]["notify"]["steps"], 10)

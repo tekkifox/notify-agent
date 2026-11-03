@@ -65,6 +65,7 @@
           "SSH_TOTAL_TIMEOUT_SECONDS": "{env:SSH_TOTAL_TIMEOUT_SECONDS}",
           "SSH_PORT": "{env:SSH_PORT}",
           "NOTIFY_HOST_SCOPE": "{env:NOTIFY_HOST_SCOPE}",
+          "NOTIFY_HOST_PORTS": "{env:NOTIFY_HOST_PORTS}",
           "PYTHONPATH": "/opt/mcp-python",
           "PYTHONUNBUFFERED": "1"
         }
