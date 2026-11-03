@@ -1317,12 +1317,12 @@ class RunAgentTests(unittest.TestCase):
                 )
         self.assertTrue(result)
         command = popen.call_args.args[0]
+        self.assertNotIn("--standalone", command)
         self.assertEqual(
             command,
             [
                 TRUE_BIN,
                 "run",
-                "--standalone",
                 "--agent",
                 "notify",
                 "--model",

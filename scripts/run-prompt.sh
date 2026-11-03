@@ -587,11 +587,13 @@ if [ "$preflight_rc" -ne 0 ]; then
     exit 1
 fi
 
-# OpenCode 2 removed --pure. --standalone runs a private server for this one
-# invocation instead of attaching to (or leaving behind) a shared background
-# service, which is what an unattended cron job wants. No plugins are installed
-# in the image, so the run stays reproducible. There is no --auto: anything not
-# explicitly allowed by opencode.json is denied.
+# OpenCode 2 removed --pure. The run attaches to the container's shared
+# background service rather than passing --standalone to start a private server
+# for this one invocation: the service registers the MCP servers once, so
+# oracle_query and ssh_probe are available from the first turn, and no second
+# server contends with the service for the session database. No plugins are
+# installed in the image, so the run stays reproducible. There is no --auto:
+# anything not explicitly allowed by opencode.json is denied.
 #
 # Provider-level logs are opt-in for a run someone is actively debugging.
 # Determine the transcript location first so both attempts share it.
@@ -623,7 +625,6 @@ run_attempt() {
         set -- "$@" --print-logs --log-level debug
     fi
     set -- "$@" \
-        --standalone \
         --agent notify \
         --model "$attempt_model" \
         -- "$prompt"

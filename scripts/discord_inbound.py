@@ -1589,7 +1589,6 @@ def _run_agent_once(
         command.extend(["--print-logs", "--log-level", "debug"])
     command.extend(
         [
-            "--standalone",
             "--agent",
             "notify",
             "--model",
