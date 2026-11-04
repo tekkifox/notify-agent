@@ -55,7 +55,7 @@ WINDOW_HOURS = 24
 #: like 60.1%. CPU peaks are context and are deliberately not a threshold.
 CPU_AVG_PERCENT = 60.0
 MEMORY_PERCENT = 85.0
-DISK_PERCENT = 85.0
+DISK_PERCENT = 95.0
 
 #: The average load flags a host only at or above this multiple of its own core
 #: count. An absolute figure would flag every host that spikes, and a peak is
