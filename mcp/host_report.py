@@ -21,8 +21,8 @@ are rendered:
 * ``disk`` — ``disk_percent`` from the newest sample (latest only, deliberately)
 
 A host is flagged only on a sustained signal: average CPU, average memory, the
-latest disk reading, or a load peak at least twice the host's own core count.
-A CPU peak is context and never flags a host.
+latest disk reading, or an average load at least twice the host's own core
+count. CPU peak and load peak are context and never flag a host.
 
 The prompt asks the agent to run one aggregate SQL query and then render the
 result with these rules. ``build_report`` and ``build_digest`` are the
@@ -57,9 +57,10 @@ CPU_AVG_PERCENT = 60.0
 MEMORY_PERCENT = 85.0
 DISK_PERCENT = 85.0
 
-#: The load peak flags a host only at or above this multiple of its own core
-#: count. An absolute figure would flag every host that spikes. A null core
-#: count makes the rule inapplicable — the formatter never guesses one.
+#: The average load flags a host only at or above this multiple of its own core
+#: count. An absolute figure would flag every host that spikes, and a peak is
+#: context only. A null core count makes the rule inapplicable — the formatter
+#: never guesses one.
 LOAD_CORES_MULTIPLIER = 2
 
 #: Mirrors the old ``HOST_REPORT_HOSTS`` default. Override in the prompt
@@ -219,11 +220,11 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
         summary.flags.append(
             f"disk {summary.disk:.1f}% >= {DISK_PERCENT:.0f}%"
         )
-    if summary.cpu_cores is not None and summary.load_peak is not None:
+    if summary.cpu_cores is not None and summary.load_avg is not None:
         cores = summary.cpu_cores
-        if summary.load_peak >= LOAD_CORES_MULTIPLIER * cores:
+        if summary.load_avg >= LOAD_CORES_MULTIPLIER * cores:
             summary.flags.append(
-                f"load peak {summary.load_peak:.2f} >= "
+                f"load avg {summary.load_avg:.2f} >= "
                 f"{LOAD_CORES_MULTIPLIER}x{cores} {_cores_noun(cores)}"
             )
     return summary

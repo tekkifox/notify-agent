@@ -87,7 +87,12 @@ Silent scheduled runs:
     exactly that: do not call `notify.sh`, do not write a chat reply, and end
     the run with no output at all. Never write a reply instead of, or in
     addition to, a notification. When a host is flagged, the notification
-    itself carries the finding; there is still no separate reply.
+    itself carries the finding; there is still no separate reply. The delivery
+    boundary enforces this too: when a run is configured to require a flag,
+    `notify.sh` reads the message before any delivery and refuses to send one
+    that carries no `[!]` marker. A refused send is a silent skip, not a
+    failure. `[!]` is the only marker the boundary checks, so never add it to a
+    message unless a host is actually flagged.
 
 Host statistics:
 
@@ -149,7 +154,7 @@ Morning digest:
 
     **Host report** — YYYY-MM-DD HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 2.31 avg / 4.90 peak; disk 30.9%; SSH ok (42 ms) (load peak 4.90 >= 2x2 cores)
+    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 8.74 avg / 9.50 peak; disk 30.9%; SSH ok (42 ms) (load avg 8.74 >= 2x2 cores)
 
     The header line is the UTC date and time of this run. The summary line
     counts all hosts in the report, including known hosts with no samples.
@@ -198,16 +203,16 @@ Morning digest:
     exactly 20 minutes old is still fresh; stale means older than 20 minutes.
 29. Thresholds are inclusive and exact, and every one of them is a sustained
     signal: average CPU >= 60 %, average memory >= 85 %, disk from the latest
-    sample >= 85 %, or load peak >= twice that host's own core count. A host at
-    or above any of them gets a `[!]` marker and an inline reason naming the
-    signal and the value, for example `(CPU avg 76.7% >= 60%)`,
-    `(memory 88.0% >= 85%)`, `(disk 85.4% >= 85%)`, or
-    `(load peak 8.74 >= 2x2 cores)`. CPU peak and load peak are context, never
-    a flag on their own: a CPU peak never flags a host, and a load peak flags
-    it only when it reaches twice the host's own core count. The load test
-    reads that core count from `cpu_cores`, rendered as `2x2 cores` for a
-    2-core host; when the core count is null the load rule cannot apply, so
-    the host is never flagged on load — do not guess or invent a core count.
+    sample >= 85 %, or average load >= twice that host's own core count, judged
+    from the average load over the window. A host at or above any of them gets
+    a `[!]` marker and an inline reason naming the signal and the value, for
+    example `(CPU avg 76.7% >= 60%)`, `(memory 88.0% >= 85%)`,
+    `(disk 85.4% >= 85%)`, or `(load avg 8.74 >= 2x2 cores)`. CPU peak and load
+    peak are context, never a flag on their own: a CPU peak never flags a host,
+    and a load peak never flags one either. The load test compares the average
+    load with twice the core count from `cpu_cores`, rendered as `2x2 cores`
+    for a 2-core host; when the core count is null the load rule cannot apply,
+    so the host is never flagged on load — do not guess or invent a core count.
     Put the reasons after the SSH text in this order: STALE, then average CPU,
     memory, disk, load. A value one below a threshold is not flagged.
 30. Order known hosts first, in the order the instruction lists them, then any

@@ -9,7 +9,7 @@
 #   notify.sh -m "hello"
 #
 # Exit codes:
-#   0  delivered
+#   0  delivered, or skipped because NOTIFY_REQUIRE_FLAG found no flag
 #   1  delivery failed (configuration, network, or remote rejection)
 #   64 usage error
 set -eu
@@ -55,6 +55,14 @@ Optional send record:
                        inbound listener uses it to detect a run that delivered
                        nothing. Unset is a no-op, and a marker that cannot be
                        written never changes the exit status.
+
+Optional flag guard:
+  NOTIFY_REQUIRE_FLAG  when set to exactly 1, the message must contain the
+                       `[!]` flag marker. Without it the send is refused before
+                       any request, one line is printed to stderr, and the
+                       script exits 0: a silent skip, not a failure. Unset or
+                       any other value keeps the normal behaviour. Scheduled
+                       digests set it so a run with nothing flagged cannot post.
 
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
@@ -144,6 +152,23 @@ if [ "$original_chars" -gt "$MAX_CHARS" ]; then
         | jq -Rs --argjson max "$MAX_CHARS" '.[0:$max]' -r 2>/dev/null) \
         || fail "could not truncate message"
     printf '%s: message truncated to %s characters\n' "$PROG" "$MAX_CHARS" >&2
+fi
+
+# Hard silence guard. A scheduled digest must send nothing when nothing is
+# flagged, and that cannot rest on the prompt alone: the model can still call
+# this script. When NOTIFY_REQUIRE_FLAG=1, the message must carry the `[!]`
+# marker that every flagged host line starts with. The check runs on the final
+# message and before any target lookup or request; a refusal is a silent skip
+# (exit 0) so the scheduler does not report a broken job. `[!]` is the only
+# marker checked, and the prompt forbids adding it when nothing is flagged.
+if [ "${NOTIFY_REQUIRE_FLAG:-}" = "1" ]; then
+    case "$message" in
+        *"[!]"*) ;;
+        *)
+            printf '%s: nothing was flagged, so nothing was sent\n' "$PROG" >&2
+            exit 0
+            ;;
+    esac
 fi
 
 # Named targets are trusted operator configuration. Validate the allowlist
