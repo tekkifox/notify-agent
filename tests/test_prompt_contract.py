@@ -355,6 +355,61 @@ class PromptContractTests(unittest.TestCase):
             FLAT_PROMPT,
         )
 
+    def test_view_columns_include_accepted_logins(self) -> None:
+        # The five accepted-login columns must each say what they mean, so the
+        # model can render them instead of reporting them as missing.
+        self.assertIn(
+            "`ssh_logins` (accepted SSH logins in the hour before the sample, "
+            "an integer or null)",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`ssh_login_users` (the per-user breakdown behind those accepted "
+            "logins",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`ssh_logins_today` (accepted SSH logins since the start of the "
+            "current UTC day, an integer or null)",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`ssh_login_users_today` (the per-user breakdown behind those "
+            "logins, the same JSON shape or null)",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`ssh_logins_today_since` (the start of that UTC day, as ISO text "
+            "or null)",
+            FLAT_PROMPT,
+        )
+
+    def test_render_order_names_the_login_fragment(self) -> None:
+        self.assertIn(
+            "then disk from the latest sample, then failed logins, then "
+            "accepted logins",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Write the login fragment as `logins: 12 last hour (root 9, ross "
+            "3), 497 today`",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "the top three users by count in that last-hour list, then the "
+            "running UTC-day total",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "When a last-hour figure is null write `logins: n/a`; when the "
+            "day's total is null write `today: n/a`",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Never invent a number or a username that is not in the data",
+            FLAT_PROMPT,
+        )
+
     def test_worked_example_shows_the_core_count(self) -> None:
         self.assertIn("last-seen 4m ago; 2 cores; CPU 44.8% avg", FLAT_PROMPT)
 
@@ -556,6 +611,21 @@ class FleetDigestScheduleTests(unittest.TestCase):
                 self.assertIn("'1 core'", line)
                 self.assertIn("'cores n/a'", line)
                 self.assertIn("Never invent a username or a number", line)
+
+    def test_accepted_logins_are_requested_on_every_host_line(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn("accepted logins from the latest sample", line)
+                self.assertIn(
+                    "'logins: 12 last hour (root 9, ross 3), 497 today'", line
+                )
+                self.assertIn("top three usernames by count", line)
+                self.assertIn("'logins: n/a'", line)
+                self.assertIn("'today: n/a'", line)
+                self.assertIn(
+                    "Never invent a number or a username that is not in the data",
+                    line,
+                )
 
     def test_sustained_signal_rule_is_unchanged(self) -> None:
         for label, line in self._digest_lines():

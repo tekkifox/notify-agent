@@ -99,9 +99,16 @@ Host statistics:
     null on an old sample), `memory_percent`, `disk_percent`, `load_avg`,
     `process_count`, `swap_percent` (may be null), `network_rx_mb`,
     `network_tx_mb`, `failed_logins` (failed SSH password attempts in the hour
-    before the sample, an integer or null), and `failed_login_users` (the
+    before the sample, an integer or null), `failed_login_users` (the
     per-user breakdown behind those failures, as a JSON array of
-    `{"user", "count"}` or null).
+    `{"user", "count"}` or null), `ssh_logins` (accepted SSH logins in the hour
+    before the sample, an integer or null), `ssh_login_users` (the per-user
+    breakdown behind those accepted logins, as a JSON array of
+    `{"user", "count"}` or null), `ssh_logins_today` (accepted SSH logins since
+    the start of the current UTC day, an integer or null),
+    `ssh_login_users_today` (the per-user breakdown behind those logins, the
+    same JSON shape or null), and `ssh_logins_today_since` (the start of that
+    UTC day, as ISO text or null).
     Use aggregate functions such as `MIN`, `MAX`, `AVG`, and `COUNT` for
     anything beyond a single reading.
 12. Do not query `ROSSMONEY."host-samples"`. That raw table stores each sample
@@ -148,9 +155,19 @@ Morning digest:
     counts all hosts in the report, including known hosts with no samples.
 26. Render one line per host in this order: sample count, last-seen age, the
     CPU core count, CPU average and peak, memory average, load average and
-    peak, then disk from the latest sample. Write the core count as `2 cores`
-    or `1 core`, taken from the newest sample that has a value; when the count
-    is null write `cores n/a`, and never invent or round a number. Keep the
+    peak, then disk from the latest sample, then failed logins, then accepted
+    logins. Write the core count as `2 cores` or `1 core`, taken from the
+    newest sample that has a value; when the count is null write `cores n/a`,
+    and never invent or round a number. Write failed logins as the count and
+    then the top three usernames with their counts, for example
+    `failed logins: 12 (root 9, admin 3)`; when the count is null write
+    `failed logins: n/a`, and when it is zero write `failed logins: 0`. Write
+    the login fragment as `logins: 12 last hour (root 9, ross 3), 497 today`:
+    the last-hour count, then the top three users by count in that last-hour
+    list, then the running UTC-day total. When a last-hour figure is null write
+    `logins: n/a`; when the day's total is null write `today: n/a`. When the
+    last-hour user breakdown is null, give the count without a user list.
+    Never invent a number or a username that is not in the data. Keep the
     asymmetries: memory is average only, disk is latest only, and load has both
     average and peak. Do not average everything just because it is tidier.
 27. Use one aggregate query over `NOTIFY_RO.HOST_STATS_V` for the last 24
