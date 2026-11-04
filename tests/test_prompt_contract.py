@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -308,10 +309,6 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("memory is average only, disk is latest only", FLAT_PROMPT)
         self.assertIn("STALE means no sample in the last 20 minutes, not 30", FLAT_PROMPT)
         self.assertIn(
-            "CPU peak 90%, memory average 90%, load peak 8, disk latest 90%",
-            FLAT_PROMPT,
-        )
-        self.assertIn(
             "Order known hosts first, in the order the instruction lists them",
             FLAT_PROMPT,
         )
@@ -418,6 +415,94 @@ class PromptContractTests(unittest.TestCase):
             "`last_seen`, `cpu_cores`, `cpu_avg`, `cpu_peak`", FLAT_PROMPT
         )
         self.assertIn("MAX(cpu_cores) AS cpu_cores,", PROMPT)
+
+
+class SustainedSignalRuleTests(unittest.TestCase):
+    """Rule 29 flags a host only on a sustained signal, never on a peak alone.
+
+    The old rule flagged a host on a 90 % CPU peak, a 90 % memory average, an
+    absolute load peak of 8 and a 90 % disk reading. Those thresholds fired on
+    every host that spiked, so the rule now matches the crontab prompts:
+    average CPU, average memory, the latest disk reading, and load measured
+    against the host's own core count.
+    """
+
+    #: Every parenthesised threshold in the prompt must be one of the four
+    #: sustained signals. A peak may appear as context, never as a reason.
+    FLAG_REASON = re.compile(r"\(([^()]*>= [^()]*)\)")
+    ALLOWED_REASON = re.compile(
+        r"^(?:"
+        r"CPU avg \d+(?:\.\d+)?% >= 60%"
+        r"|memory \d+(?:\.\d+)?% >= 85%"
+        r"|disk \d+(?:\.\d+)?% >= 85%"
+        r"|load peak \d+(?:\.\d+)? >= 2x\d+ cores"
+        r")$"
+    )
+
+    def test_the_four_sustained_signals_are_named_with_their_numbers(self) -> None:
+        self.assertIn("average CPU >= 60 %", FLAT_PROMPT)
+        self.assertIn("average memory >= 85 %", FLAT_PROMPT)
+        self.assertIn("disk from the latest sample >= 85 %", FLAT_PROMPT)
+        self.assertIn(
+            "load peak >= twice that host's own core count", FLAT_PROMPT
+        )
+
+    def test_no_old_cpu_peak_threshold_survives(self) -> None:
+        self.assertNotRegex(FLAT_PROMPT, r"CPU peak[^)]{0,40}>=")
+        self.assertNotIn("CPU peak 90", FLAT_PROMPT)
+        self.assertNotIn("CPU peak 117.0% >= 90%", FLAT_PROMPT)
+
+    def test_no_absolute_load_peak_threshold_survives(self) -> None:
+        # `load peak 8.74 >= 2x2 cores` is allowed; a bare `>= 8` is not.
+        self.assertNotRegex(
+            FLAT_PROMPT, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
+        )
+
+    def test_no_flag_reason_is_a_peak_alone(self) -> None:
+        reasons = self.FLAG_REASON.findall(PROMPT)
+        self.assertTrue(reasons)
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertRegex(reason, self.ALLOWED_REASON)
+        self.assertNotIn("(CPU peak", FLAT_PROMPT)
+
+    def test_flag_reasons_are_the_documented_examples(self) -> None:
+        for reason in (
+            "(CPU avg 76.7% >= 60%)",
+            "(memory 88.0% >= 85%)",
+            "(disk 85.4% >= 85%)",
+            "(load peak 8.74 >= 2x2 cores)",
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, FLAT_PROMPT)
+
+    def test_the_load_test_uses_the_host_core_count(self) -> None:
+        self.assertIn("twice the host's own core count", FLAT_PROMPT)
+        self.assertIn("reads that core count from `cpu_cores`", FLAT_PROMPT)
+        self.assertIn(
+            "when the core count is null the load rule cannot apply", FLAT_PROMPT
+        )
+        self.assertIn(
+            "never flagged on load \u2014 do not guess or invent a core count",
+            FLAT_PROMPT,
+        )
+
+    def test_peaks_are_context_only(self) -> None:
+        self.assertIn(
+            "CPU peak and load peak are context, never a flag on their own",
+            FLAT_PROMPT,
+        )
+        self.assertIn("a CPU peak never flags a host", FLAT_PROMPT)
+
+    def test_reason_order_is_stale_cpu_memory_disk_load(self) -> None:
+        self.assertIn(
+            "STALE, then average CPU, memory, disk, load", FLAT_PROMPT
+        )
+        self.assertNotIn("STALE, then CPU, memory, load, disk", FLAT_PROMPT)
+
+    def test_worked_example_does_not_flag_a_cpu_peak(self) -> None:
+        self.assertNotIn("(CPU peak", FLAT_PROMPT)
+        self.assertIn("(load peak 4.90 >= 2x2 cores)", FLAT_PROMPT)
 
 
 class OpenCodeConfigTests(unittest.TestCase):
