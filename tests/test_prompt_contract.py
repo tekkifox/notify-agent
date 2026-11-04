@@ -268,8 +268,8 @@ class PromptContractTests(unittest.TestCase):
 
     def test_old_report_format_is_pinned(self) -> None:
         self.assertIn(
-            "sample count, last-seen age, CPU average and peak, memory "
-            "average, load average and peak",
+            "sample count, last-seen age, the CPU core count, CPU average and "
+            "peak, memory average, load average and peak",
             FLAT_PROMPT,
         )
         self.assertIn("memory is average only, disk is latest only", FLAT_PROMPT)
@@ -285,6 +285,51 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn(
             "\u2026 truncated: N host line(s) not shown", FLAT_PROMPT
         )
+
+    def test_view_columns_include_cpu_cores_and_failed_logins(self) -> None:
+        # The column list must carry all three, each with what it means, so the
+        # model knows it can read them rather than reporting them as missing.
+        self.assertIn(
+            "`cpu_percent`, `cpu_cores` (the cores the host reported with the "
+            "sample; stable per host but may be null on an old sample)",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`failed_logins` (failed SSH password attempts in the hour before "
+            "the sample, an integer or null)",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "`failed_login_users` (the per-user breakdown behind those "
+            "failures, as a JSON array of `{\"user\", \"count\"}` or null)",
+            FLAT_PROMPT,
+        )
+
+    def test_render_order_names_the_core_count(self) -> None:
+        self.assertIn(
+            "Render one line per host in this order: sample count, last-seen "
+            "age, the CPU core count, CPU average and peak",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Write the core count as `2 cores` or `1 core`, taken from the "
+            "newest sample that has a value",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "when the count is null write `cores n/a`, and never invent or "
+            "round a number",
+            FLAT_PROMPT,
+        )
+
+    def test_worked_example_shows_the_core_count(self) -> None:
+        self.assertIn("last-seen 4m ago; 2 cores; CPU 44.8% avg", FLAT_PROMPT)
+
+    def test_aggregate_query_selects_the_core_count(self) -> None:
+        self.assertIn(
+            "`last_seen`, `cpu_cores`, `cpu_avg`, `cpu_peak`", FLAT_PROMPT
+        )
+        self.assertIn("MAX(cpu_cores) AS cpu_cores,", PROMPT)
 
 
 class OpenCodeConfigTests(unittest.TestCase):
@@ -422,7 +467,11 @@ class PreflightScriptTests(unittest.TestCase):
 
 
 class FleetDigestScheduleTests(unittest.TestCase):
-    """The two fleet-wide digest prompts must ask for failed logins per user."""
+    """The two fleet-wide digest prompts must ask for per-host detail.
+
+    That is failed logins per user and the host's own CPU core count, because
+    the load threshold is stated in terms of that core count.
+    """
 
     def _schedule_line(self, name: str, schedule: str, target: str) -> str:
         for line in CRONTABS[name].splitlines():
@@ -466,14 +515,30 @@ class FleetDigestScheduleTests(unittest.TestCase):
                 )
                 self.assertIn("those figures come from the supplied statistics", line)
 
+    def test_core_count_is_asked_for_on_every_host_line(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn("CPU core count", line)
+                self.assertIn("'2 cores'", line)
+                self.assertIn("'1 core'", line)
+                self.assertIn("'cores n/a'", line)
+                self.assertIn("Never invent a username or a number", line)
+
     def test_sustained_signal_rule_is_unchanged(self) -> None:
         for label, line in self._digest_lines():
             with self.subTest(schedule=label):
                 self.assertIn("average CPU >= 60", line)
                 self.assertIn("average memory >= 85", line)
                 self.assertIn("disk >= 85", line)
-                self.assertIn("load peak >= twice the host's core count", line)
                 self.assertIn("never flag on a peak alone", line)
+
+    def test_load_rule_uses_the_hosts_own_core_count(self) -> None:
+        for label, line in self._digest_lines():
+            with self.subTest(schedule=label):
+                self.assertIn(
+                    "load peak >= twice that host's own core count", line
+                )
+                self.assertNotIn("twice the host's core count", line)
 
     def test_morning_digest_keeps_its_character_limit(self) -> None:
         line = self._schedule_line("crontab", "0 9 * * * ", "automations")

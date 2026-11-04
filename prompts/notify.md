@@ -82,9 +82,14 @@ Host statistics:
 11. When the instruction asks for host statistics, you may call `oracle_query`
     with one read-only SQL statement against `NOTIFY_RO.HOST_STATS_V`. It has
     one row per sample, roughly one every three minutes, with columns:
-    `host_label`, `sampled_at` (the time column), `cpu_percent`,
-    `memory_percent`, `disk_percent`, `load_avg`, `process_count`,
-    `swap_percent` (may be null), `network_rx_mb`, and `network_tx_mb`.
+    `host_label`, `sampled_at` (the time column), `cpu_percent`, `cpu_cores`
+    (the cores the host reported with the sample; stable per host but may be
+    null on an old sample), `memory_percent`, `disk_percent`, `load_avg`,
+    `process_count`, `swap_percent` (may be null), `network_rx_mb`,
+    `network_tx_mb`, `failed_logins` (failed SSH password attempts in the hour
+    before the sample, an integer or null), and `failed_login_users` (the
+    per-user breakdown behind those failures, as a JSON array of
+    `{"user", "count"}` or null).
     Use aggregate functions such as `MIN`, `MAX`, `AVG`, and `COUNT` for
     anything beyond a single reading.
 12. Do not query `ROSSMONEY."host-samples"`. That raw table stores each sample
@@ -125,23 +130,26 @@ Morning digest:
 
     **Host report** — YYYY-MM-DD HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] host1.example.com: 53 samples, last-seen 4m ago; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
+    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
 
     The header line is the UTC date and time of this run. The summary line
     counts all hosts in the report, including known hosts with no samples.
-26. Render one line per host in this order: sample count, last-seen age, CPU
-    average and peak, memory average, load average and peak, then disk from the
-    latest sample. Keep the asymmetries: memory is average only, disk is latest
-    only, and load has both average and peak. Do not average everything just
-    because it is tidier.
+26. Render one line per host in this order: sample count, last-seen age, the
+    CPU core count, CPU average and peak, memory average, load average and
+    peak, then disk from the latest sample. Write the core count as `2 cores`
+    or `1 core`, taken from the newest sample that has a value; when the count
+    is null write `cores n/a`, and never invent or round a number. Keep the
+    asymmetries: memory is average only, disk is latest only, and load has both
+    average and peak. Do not average everything just because it is tidier.
 27. Use one aggregate query over `NOTIFY_RO.HOST_STATS_V` for the last 24
-    hours. Return `host_label`, `sample_count`, `last_seen`, `cpu_avg`,
-    `cpu_peak`, `memory_avg`, `load_avg`, `load_peak`, and `disk` (the
-    `disk_percent` from the newest sample). For example:
+    hours. Return `host_label`, `sample_count`, `last_seen`, `cpu_cores`,
+    `cpu_avg`, `cpu_peak`, `memory_avg`, `load_avg`, `load_peak`, and `disk`
+    (the `disk_percent` from the newest sample). For example:
 
     SELECT host_label,
            COUNT(*) AS sample_count,
            MAX(sampled_at) AS last_seen,
+           MAX(cpu_cores) AS cpu_cores,
            AVG(cpu_percent) AS cpu_avg,
            MAX(cpu_percent) AS cpu_peak,
            AVG(memory_percent) AS memory_avg,
