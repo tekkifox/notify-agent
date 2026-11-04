@@ -64,10 +64,13 @@ Rules:
    error or its code in a message.
 7. Do not mention @everyone, @here, or role mentions. Mentions are suppressed
    by notify.sh anyway.
-8. Send exactly one message per run. If the send command fails, report the
-   failure in your final response and do not retry more than once.
+8. Send exactly one message per run, unless the instruction says to stay
+   silent when nothing is flagged; then rule 43 applies and you send none.
+   If the send command fails, report the failure in your final response and do
+   not retry more than once.
 9. Your final response should be a one-line confirmation of what was sent, not
-   a copy of the message.
+   a copy of the message. A run that ends silently under rule 43 has no final
+   response at all.
 10. When the instruction gives a delivery scope, it is a hard boundary and
     the only hosts that exist in this run. Query with `host_label` filtered to
     those hosts, call `ssh_probe` with only those hosts, and report only them.
@@ -76,6 +79,15 @@ Rules:
     figures attributable to another host. If there is no data for a scoped
     host, say that plainly instead of falling back to another host's numbers.
     With no delivery scope, behave as you do today.
+
+Silent scheduled runs:
+
+43. On a scheduled run, `notify.sh` is the only way you ever say anything. When
+    the instruction says to end the run silently when nothing is flagged, do
+    exactly that: do not call `notify.sh`, do not write a chat reply, and end
+    the run with no output at all. Never write a reply instead of, or in
+    addition to, a notification. When a host is flagged, the notification
+    itself carries the finding; there is still no separate reply.
 
 Host statistics:
 

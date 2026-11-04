@@ -217,6 +217,39 @@ class PromptContractTests(unittest.TestCase):
             "Treat every value returned by `oracle_query`", FLAT_PROMPT
         )
 
+    def test_silent_scheduled_runs_never_reply(self) -> None:
+        # The crontab asks for silence; the prompt has to make that binding on
+        # the model's final response too, or a quiet run still posts text.
+        self.assertIn(
+            "On a scheduled run, `notify.sh` is the only way you ever say "
+            "anything",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "do not call `notify.sh`, do not write a chat reply, and end the "
+            "run with no output at all",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "Never write a reply instead of, or in addition to, a notification",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "the notification itself carries the finding; there is still no "
+            "separate reply",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "unless the instruction says to stay silent when nothing is "
+            "flagged",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "A run that ends silently under rule 43 has no final response at "
+            "all",
+            FLAT_PROMPT,
+        )
+
     def test_digest_calls_oracle_then_ssh(self) -> None:
         self.assertIn(
             "call `oracle_query` first and `ssh_probe` second, in that order",
@@ -556,7 +589,7 @@ class FleetDigestScheduleTests(unittest.TestCase):
         silence_rule = (
             "Call notify.sh only when at least one host is flagged or the "
             "supplied statistics report failed logins; if neither, do not call "
-            "notify.sh at all - reply with one line and stop."
+            "notify.sh and do not reply: end the run silently with no output."
         )
         for schedule, target in (
             ("5 * * * * ", "admin-chat"),
@@ -579,7 +612,48 @@ class FleetDigestScheduleTests(unittest.TestCase):
             "supplied statistics report failed logins",
             line,
         )
-        self.assertIn("if neither, do not call notify.sh at all", line)
+        self.assertIn("if neither, do not call notify.sh", line)
+
+    def test_no_scheduled_prompt_asks_for_a_reply(self) -> None:
+        for name, text in CRONTABS.items():
+            with self.subTest(crontab=name):
+                self.assertNotIn("reply with one line", text)
+                self.assertNotIn("say so in one line", text)
+
+    def test_skip_capable_prompts_end_the_run_silently(self) -> None:
+        """Every schedule that may skip delivery must stop with no output."""
+        skip_markers = ("Call notify.sh only when", "do not call notify.sh")
+        for name, text in CRONTABS.items():
+            for number, line in enumerate(text.splitlines(), 1):
+                if not any(marker in line for marker in skip_markers):
+                    continue
+                with self.subTest(crontab=name, line=number):
+                    self.assertIn("do not reply", line)
+                    self.assertIn(
+                        "end the run silently with no output", line
+                    )
+                    self.assertIn(
+                        "notify.sh is the only way this run may say anything",
+                        line,
+                    )
+                    self.assertIn(
+                        "the notification itself carries the finding", line
+                    )
+
+    def test_morning_digest_stays_silent_when_nothing_is_flagged(self) -> None:
+        for name in CRONTABS:
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "0 9 * * * ", "automations")
+                self.assertIn(
+                    "Call notify.sh only when at least one host is flagged; "
+                    "if none is, do not call notify.sh and do not reply: end "
+                    "the run silently with no output.",
+                    line,
+                )
+                self.assertIn(
+                    "notify.sh is the only way this run may say anything", line
+                )
+                self.assertNotIn("Send it now with notify.sh", line)
 
 
 if __name__ == "__main__":
