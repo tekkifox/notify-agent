@@ -627,21 +627,24 @@ class FleetDigestScheduleTests(unittest.TestCase):
                     line,
                 )
 
-    def test_sustained_signal_rule_is_unchanged(self) -> None:
+    def test_sustained_signal_rule_is_averages_only(self) -> None:
         for label, line in self._digest_lines():
             with self.subTest(schedule=label):
                 self.assertIn("average CPU >= 60", line)
                 self.assertIn("average memory >= 85", line)
                 self.assertIn("disk >= 85", line)
-                self.assertIn("never flag on a peak alone", line)
-
-    def test_load_rule_uses_the_hosts_own_core_count(self) -> None:
-        for label, line in self._digest_lines():
-            with self.subTest(schedule=label):
+                self.assertIn("Decide every flag from the averages", line)
                 self.assertIn(
-                    "load peak >= twice that host's own core count", line
+                    "never flag a host because of a peak", line
                 )
-                self.assertNotIn("twice the host's core count", line)
+
+    def test_no_crontab_rule_flags_on_a_peak(self) -> None:
+        """A peak may be context, never a flag condition or an old rule."""
+        for name, text in CRONTABS.items():
+            for number, line in enumerate(text.splitlines(), 1):
+                with self.subTest(crontab=name, line=number):
+                    self.assertNotIn("peak >=", line)
+                    self.assertNotIn("never flag on a peak alone", line)
 
     def test_morning_digest_keeps_its_character_limit(self) -> None:
         line = self._schedule_line("crontab", "0 9 * * * ", "automations")
