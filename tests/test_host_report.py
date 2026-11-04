@@ -19,6 +19,9 @@ from datetime import datetime, timedelta, timezone
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE = ROOT / "mcp" / "host_report.py"
+README = (ROOT / "README.md").read_text(encoding="utf-8")
+# Prose assertions ignore line wrapping; the rendered example stays verbatim.
+FLAT_README = " ".join(README.split())
 
 spec = importlib.util.spec_from_file_location("host_report", MODULE)
 host_report = importlib.util.module_from_spec(spec)
@@ -37,6 +40,7 @@ def row(
     *,
     samples: int = 10,
     age: int = 4,
+    cpu_cores: int | None = 2,
     cpu_avg: float | None = 20.0,
     cpu_peak: float | None = 40.0,
     memory_avg: float | None = 30.0,
@@ -48,6 +52,7 @@ def row(
         "host_label": host,
         "sample_count": samples,
         "last_seen": at(age) if samples else None,
+        "cpu_cores": cpu_cores,
         "cpu_avg": cpu_avg,
         "cpu_peak": cpu_peak,
         "memory_avg": memory_avg,
@@ -65,11 +70,23 @@ class ShapeTests(unittest.TestCase):
             known_hosts=("host1.example.com",),
         )
         self.assertIn(
-            "- host1.example.com: 10 samples, last-seen 4m ago; "
+            "- host1.example.com: 10 samples, last-seen 4m ago; 2 cores; "
             "CPU 20.0% avg / 40.0% peak; mem 30.0% avg; "
             "load 1.00 avg / 2.00 peak; disk 50.0%",
             text,
         )
+
+    def test_core_count_reads_singular_and_unknown(self) -> None:
+        text = host_report.build_report(
+            [
+                row("host1.example.com", cpu_cores=1, load_peak=1.5),
+                row("host2.example.com", cpu_cores=None),
+            ],
+            now=NOW,
+            known_hosts=("host1.example.com", "host2.example.com"),
+        )
+        self.assertIn("last-seen 4m ago; 1 core; CPU 20.0% avg", text)
+        self.assertIn("last-seen 4m ago; cores n/a; CPU 20.0% avg", text)
 
     def test_header_and_summary(self) -> None:
         text = host_report.build_report(
@@ -151,6 +168,9 @@ class StaleTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
+    """Only sustained signals flag a host; a peak never does, except load
+    measured against the host's own core count."""
+
     def assert_flagged(self, **values) -> str:
         text = host_report.build_report(
             [row("host1.example.com", **values)],
@@ -159,31 +179,83 @@ class ThresholdTests(unittest.TestCase):
         )
         return text
 
-    def test_cpu_peak_boundary(self) -> None:
-        self.assertIn("CPU peak 90.0% >= 90%", self.assert_flagged(cpu_peak=90.0))
-        self.assertNotIn("CPU peak", self.assert_flagged(cpu_peak=89.9))
+    def test_cpu_average_boundary(self) -> None:
+        self.assertIn(
+            "CPU avg 60.0% >= 60%", self.assert_flagged(cpu_avg=60.0)
+        )
+        text = self.assert_flagged(cpu_avg=59.9)
+        self.assertNotIn("CPU avg 59.9% >=", text)
+        self.assertNotIn("[!]", text)
 
     def test_memory_average_boundary(self) -> None:
-        self.assertIn("memory 90.0% >= 90%", self.assert_flagged(memory_avg=90.0))
-        self.assertNotIn("memory 90", self.assert_flagged(memory_avg=89.9))
-
-    def test_load_peak_boundary(self) -> None:
-        self.assertIn("load peak 8.00 >= 8", self.assert_flagged(load_peak=8.0))
-        self.assertNotIn("load peak", self.assert_flagged(load_peak=7.99))
+        self.assertIn(
+            "memory 85.0% >= 85%", self.assert_flagged(memory_avg=85.0)
+        )
+        text = self.assert_flagged(memory_avg=84.9)
+        self.assertNotIn("memory 84.9% >=", text)
+        self.assertNotIn("[!]", text)
 
     def test_disk_boundary(self) -> None:
-        self.assertIn("disk 90.0% >= 90%", self.assert_flagged(disk=90.0))
-        self.assertNotIn("disk 90.0% >= 90%", self.assert_flagged(disk=89.9))
+        self.assertIn("disk 85.0% >= 85%", self.assert_flagged(disk=85.0))
+        text = self.assert_flagged(disk=84.9)
+        self.assertNotIn("disk 84.9% >=", text)
+        self.assertNotIn("[!]", text)
+
+    def test_load_peak_boundary_is_twice_the_core_count(self) -> None:
+        text = self.assert_flagged(cpu_cores=2, load_peak=4.0)
+        self.assertIn("load peak 4.00 >= 2x2 cores", text)
+        below = self.assert_flagged(cpu_cores=2, load_peak=3.99)
+        self.assertNotIn("load peak 3.99 >=", below)
+        self.assertNotIn("[!]", below)
+
+    def test_a_bigger_host_gets_a_bigger_load_threshold(self) -> None:
+        # The same load peak is fine on 4 cores and a flag on 2.
+        self.assertNotIn("[!]", self.assert_flagged(cpu_cores=4, load_peak=7.0))
+        self.assertIn(
+            "load peak 8.00 >= 2x4 cores",
+            self.assert_flagged(cpu_cores=4, load_peak=8.0),
+        )
+
+    def test_load_never_flags_without_a_core_count(self) -> None:
+        text = self.assert_flagged(cpu_cores=None, load_peak=99.0)
+        self.assertNotIn("load peak 99.00 >=", text)
+        self.assertNotIn("[!]", text)
+
+    def test_cpu_peak_is_context_and_never_flags(self) -> None:
+        text = self.assert_flagged(cpu_avg=10.0, cpu_peak=437.0)
+        self.assertNotIn("[!]", text)
+        self.assertNotIn("CPU peak 437.0% >=", text)
+        self.assertIn("CPU 10.0% avg / 437.0% peak", text)
+
+    def test_reason_text_matches_the_prompt_examples(self) -> None:
+        # prompts/notify.md rule 29 names these exact strings.
+        for values, reason in (
+            ({"cpu_avg": 76.7}, "(CPU avg 76.7% >= 60%)"),
+            ({"memory_avg": 88.0}, "(memory 88.0% >= 85%)"),
+            ({"disk": 85.4}, "(disk 85.4% >= 85%)"),
+            ({"cpu_cores": 2, "load_peak": 8.74}, "(load peak 8.74 >= 2x2 cores)"),
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, self.assert_flagged(**values))
 
     def test_flags_are_inline_and_marker_is_present(self) -> None:
         text = self.assert_flagged(
-            cpu_peak=91.0, memory_avg=92.0, load_peak=9.0, disk=93.0
+            cpu_avg=61.0,
+            memory_avg=86.0,
+            load_peak=4.5,
+            disk=86.0,
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
-            "(CPU peak 91.0% >= 90%; memory 92.0% >= 90%; "
-            "load peak 9.00 >= 8; disk 93.0% >= 90%)",
+            "(CPU avg 61.0% >= 60%; memory 86.0% >= 85%; "
+            "disk 86.0% >= 85%; load peak 4.50 >= 2x2 cores)",
             text,
+        )
+
+    def test_stale_still_comes_first(self) -> None:
+        text = self.assert_flagged(age=30, cpu_avg=99.0)
+        self.assertIn(
+            "(STALE: no sample in the last 20m; CPU avg 99.0% >= 60%)", text
         )
 
 
@@ -266,6 +338,82 @@ class DigestTests(unittest.TestCase):
             text.count("SSH not configured; no SSH health was checked."), 1
         )
         self.assertNotIn("SSH ok", text)
+
+
+class ReadmeTests(unittest.TestCase):
+    """The README example and threshold paragraph are part of the contract."""
+
+    def test_the_readme_example_is_what_the_formatter_renders(self) -> None:
+        rows = [
+            row(
+                "host1.example.com",
+                samples=53,
+                age=4,
+                cpu_cores=2,
+                cpu_avg=44.8,
+                cpu_peak=117.0,
+                memory_avg=22.6,
+                load_avg=2.31,
+                load_peak=4.90,
+                disk=30.9,
+            ),
+            row(
+                "host2.example.com",
+                samples=46,
+                age=3,
+                cpu_cores=2,
+                cpu_avg=22.8,
+                cpu_peak=28.0,
+                memory_avg=30.6,
+                load_avg=0.23,
+                load_peak=0.28,
+                disk=80.3,
+            ),
+            row(
+                "host3.example.com",
+                samples=49,
+                age=3,
+                cpu_cores=4,
+                cpu_avg=17.9,
+                cpu_peak=25.2,
+                memory_avg=75.7,
+                load_avg=3.57,
+                load_peak=5.04,
+                disk=71.2,
+            ),
+        ]
+        text = host_report.build_digest(
+            rows,
+            ssh_results=[
+                {"host": "host1.example.com", "status": "ok", "latency_ms": 42},
+                {
+                    "host": "host2.example.com",
+                    "status": "auth_refused",
+                    "message": "authentication refused",
+                },
+                {"host": "host3.example.com", "status": "ok", "latency_ms": 61},
+            ],
+            now=NOW,
+            known_hosts=(
+                "host1.example.com",
+                "host2.example.com",
+                "host3.example.com",
+            ),
+        )
+        self.assertIn(text, README)
+
+    def test_the_readme_states_the_sustained_rule(self) -> None:
+        self.assertIn("average CPU at or above 60 %", FLAT_README)
+        self.assertIn("average memory at or above 85 %", FLAT_README)
+        self.assertIn("disk from the latest sample at or above 85 %", FLAT_README)
+        self.assertIn("twice that host's own core count", FLAT_README)
+        self.assertIn("CPU peak is context and never flags a host", FLAT_README)
+        # The old rule must not creep back into the prose.
+        self.assertNotIn("The inclusive thresholds are CPU peak 90", FLAT_README)
+        self.assertNotIn("(CPU peak 117.0% >= 90%)", FLAT_README)
+        self.assertNotRegex(
+            FLAT_README, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
+        )
 
 
 if __name__ == "__main__":

@@ -13,10 +13,16 @@ are rendered:
 
 * ``sample_count`` — number of samples in the 24-hour window
 * ``last_seen`` — the newest ``sampled_at`` in that window
+* ``cpu_cores`` — the cores the host reported; the load threshold is relative
+  to this, so a null count means the load rule cannot apply
 * ``cpu_avg`` / ``cpu_peak`` — average and maximum ``cpu_percent``
 * ``memory_avg`` — average ``memory_percent`` (average only, deliberately)
 * ``load_avg`` / ``load_peak`` — average and maximum ``load_avg``
 * ``disk`` — ``disk_percent`` from the newest sample (latest only, deliberately)
+
+A host is flagged only on a sustained signal: average CPU, average memory, the
+latest disk reading, or a load peak at least twice the host's own core count.
+A CPU peak is context and never flags a host.
 
 The prompt asks the agent to run one aggregate SQL query and then render the
 result with these rules. ``build_report`` and ``build_digest`` are the
@@ -45,11 +51,16 @@ STALE_MINUTES = 20
 #: How much history the report covers.
 WINDOW_HOURS = 24
 
-#: Inclusive thresholds. Exactly 90% is a problem, just like 90.1%.
-CPU_PEAK_PERCENT = 90.0
-MEMORY_PERCENT = 90.0
-LOAD_PEAK = 8.0
-DISK_PERCENT = 90.0
+#: Inclusive thresholds for sustained signals. Exactly 60% is a problem, just
+#: like 60.1%. CPU peaks are context and are deliberately not a threshold.
+CPU_AVG_PERCENT = 60.0
+MEMORY_PERCENT = 85.0
+DISK_PERCENT = 85.0
+
+#: The load peak flags a host only at or above this multiple of its own core
+#: count. An absolute figure would flag every host that spikes. A null core
+#: count makes the rule inapplicable — the formatter never guesses one.
+LOAD_CORES_MULTIPLIER = 2
 
 #: Mirrors the old ``HOST_REPORT_HOSTS`` default. Override in the prompt
 #: instruction / environment; this is only the fallback.
@@ -119,6 +130,16 @@ def _as_int(value: Any) -> int:
     return max(0, number)
 
 
+def _as_cores(value: Any) -> int | None:
+    """Return a positive core count, or ``None`` when it is unknown."""
+
+    number = _as_float(value)
+    if number is None:
+        return None
+    cores = int(number)
+    return cores if cores >= 1 else None
+
+
 def _record(row: Mapping[str, Any] | Sequence[Any], columns: Sequence[str] | None) -> dict[str, Any]:
     """Normalise one row to lower-case keys.
 
@@ -151,6 +172,7 @@ class HostSummary:
     host: str
     samples: int
     last_seen: datetime | None
+    cpu_cores: int | None = None
     cpu_avg: float | None = None
     cpu_peak: float | None = None
     memory_avg: float | None = None
@@ -171,6 +193,7 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
             last_seen=parse_timestamp(
                 record.get("last_seen", record.get("sampled_at"))
             ),
+            cpu_cores=_as_cores(record.get("cpu_cores")),
             cpu_avg=_as_float(record.get("cpu_avg")),
             cpu_peak=_as_float(record.get("cpu_peak")),
             memory_avg=_as_float(record.get("memory_avg")),
@@ -184,22 +207,25 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
 
     if summary.stale:
         summary.flags.append(f"STALE: no sample in the last {stale_minutes}m")
-    if summary.cpu_peak is not None and summary.cpu_peak >= CPU_PEAK_PERCENT:
+    if summary.cpu_avg is not None and summary.cpu_avg >= CPU_AVG_PERCENT:
         summary.flags.append(
-            f"CPU peak {summary.cpu_peak:.1f}% >= {CPU_PEAK_PERCENT:.0f}%"
+            f"CPU avg {summary.cpu_avg:.1f}% >= {CPU_AVG_PERCENT:.0f}%"
         )
     if summary.memory_avg is not None and summary.memory_avg >= MEMORY_PERCENT:
         summary.flags.append(
             f"memory {summary.memory_avg:.1f}% >= {MEMORY_PERCENT:.0f}%"
         )
-    if summary.load_peak is not None and summary.load_peak >= LOAD_PEAK:
-        summary.flags.append(
-            f"load peak {summary.load_peak:.2f} >= {LOAD_PEAK:.0f}"
-        )
     if summary.disk is not None and summary.disk >= DISK_PERCENT:
         summary.flags.append(
             f"disk {summary.disk:.1f}% >= {DISK_PERCENT:.0f}%"
         )
+    if summary.cpu_cores is not None and summary.load_peak is not None:
+        cores = summary.cpu_cores
+        if summary.load_peak >= LOAD_CORES_MULTIPLIER * cores:
+            summary.flags.append(
+                f"load peak {summary.load_peak:.2f} >= "
+                f"{LOAD_CORES_MULTIPLIER}x{cores} {_cores_noun(cores)}"
+            )
     return summary
 
 
@@ -227,6 +253,14 @@ def _percent(value: float | None) -> str:
 
 def _number(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2f}"
+
+
+def _cores_noun(cores: int) -> str:
+    return "core" if cores == 1 else "cores"
+
+
+def _cores_text(cores: int | None) -> str:
+    return "cores n/a" if cores is None else f"{cores} {_cores_noun(cores)}"
 
 
 def _ssh_text(result: Mapping[str, Any] | None) -> str:
@@ -258,6 +292,7 @@ def _host_line(summary: HostSummary, now: datetime, ssh: Mapping[str, Any] | Non
         noun = "sample" if summary.samples == 1 else "samples"
         body = (
             f"{summary.samples} {noun}, last-seen {_age(summary.last_seen, now)}"
+            f"; {_cores_text(summary.cpu_cores)}"
             f"; CPU {_percent(summary.cpu_avg)} avg / {_percent(summary.cpu_peak)} peak"
             f"; mem {_percent(summary.memory_avg)} avg"
             f"; load {_number(summary.load_avg)} avg / {_number(summary.load_peak)} peak"
