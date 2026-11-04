@@ -434,7 +434,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         r"^(?:"
         r"CPU avg \d+(?:\.\d+)?% >= 60%"
         r"|memory \d+(?:\.\d+)?% >= 85%"
-        r"|disk \d+(?:\.\d+)?% >= 85%"
+        r"|disk \d+(?:\.\d+)?% >= 95%"
         r"|load avg \d+(?:\.\d+)? >= 2x\d+ cores"
         r")$"
     )
@@ -442,7 +442,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
     def test_the_four_sustained_signals_are_named_with_their_numbers(self) -> None:
         self.assertIn("average CPU >= 60 %", FLAT_PROMPT)
         self.assertIn("average memory >= 85 %", FLAT_PROMPT)
-        self.assertIn("disk from the latest sample >= 85 %", FLAT_PROMPT)
+        self.assertIn("disk from the latest sample >= 95 %", FLAT_PROMPT)
         self.assertIn(
             "average load >= twice that host's own core count", FLAT_PROMPT
         )
@@ -474,7 +474,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         for reason in (
             "(CPU avg 76.7% >= 60%)",
             "(memory 88.0% >= 85%)",
-            "(disk 85.4% >= 85%)",
+            "(disk 95.4% >= 95%)",
             "(load avg 8.74 >= 2x2 cores)",
         ):
             with self.subTest(reason=reason):
@@ -727,7 +727,7 @@ class FleetDigestScheduleTests(unittest.TestCase):
             with self.subTest(schedule=label):
                 self.assertIn("average CPU >= 60", line)
                 self.assertIn("average memory >= 85", line)
-                self.assertIn("disk >= 85", line)
+                self.assertIn("disk >= 95", line)
                 self.assertIn(
                     "average load >= twice that host's own core count", line
                 )

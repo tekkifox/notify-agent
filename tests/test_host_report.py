@@ -196,9 +196,13 @@ class ThresholdTests(unittest.TestCase):
         self.assertNotIn("[!]", text)
 
     def test_disk_boundary(self) -> None:
-        self.assertIn("disk 85.0% >= 85%", self.assert_flagged(disk=85.0))
-        text = self.assert_flagged(disk=84.9)
-        self.assertNotIn("disk 84.9% >=", text)
+        self.assertIn("disk 95.0% >= 95%", self.assert_flagged(disk=95.0))
+        text = self.assert_flagged(disk=94.9)
+        self.assertNotIn("disk 94.9% >=", text)
+        self.assertNotIn("[!]", text)
+        # photos sat at 84.8%; a host there must not be flagged.
+        text = self.assert_flagged(disk=84.8)
+        self.assertNotIn("disk 84.8% >=", text)
         self.assertNotIn("[!]", text)
 
     def test_load_average_boundary_is_twice_the_core_count(self) -> None:
@@ -245,7 +249,7 @@ class ThresholdTests(unittest.TestCase):
         for values, reason in (
             ({"cpu_avg": 76.7}, "(CPU avg 76.7% >= 60%)"),
             ({"memory_avg": 88.0}, "(memory 88.0% >= 85%)"),
-            ({"disk": 85.4}, "(disk 85.4% >= 85%)"),
+            ({"disk": 95.4}, "(disk 95.4% >= 95%)"),
             ({"cpu_cores": 2, "load_avg": 8.74}, "(load avg 8.74 >= 2x2 cores)"),
         ):
             with self.subTest(reason=reason):
@@ -256,12 +260,12 @@ class ThresholdTests(unittest.TestCase):
             cpu_avg=61.0,
             memory_avg=86.0,
             load_avg=4.5,
-            disk=86.0,
+            disk=96.0,
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
             "(CPU avg 61.0% >= 60%; memory 86.0% >= 85%; "
-            "disk 86.0% >= 85%; load avg 4.50 >= 2x2 cores)",
+            "disk 96.0% >= 95%; load avg 4.50 >= 2x2 cores)",
             text,
         )
 
@@ -418,7 +422,7 @@ class ReadmeTests(unittest.TestCase):
     def test_the_readme_states_the_sustained_rule(self) -> None:
         self.assertIn("average CPU at or above 60 %", FLAT_README)
         self.assertIn("average memory at or above 85 %", FLAT_README)
-        self.assertIn("disk from the latest sample at or above 85 %", FLAT_README)
+        self.assertIn("disk from the latest sample at or above 95 %", FLAT_README)
         self.assertIn("average load at or above twice that host's own core count", FLAT_README)
         self.assertIn("CPU peak and load peak are context and never flag a host", FLAT_README)
         # The old rule must not creep back into the prose.

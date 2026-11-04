@@ -203,11 +203,11 @@ Morning digest:
     exactly 20 minutes old is still fresh; stale means older than 20 minutes.
 29. Thresholds are inclusive and exact, and every one of them is a sustained
     signal: average CPU >= 60 %, average memory >= 85 %, disk from the latest
-    sample >= 85 %, or average load >= twice that host's own core count, judged
+    sample >= 95 %, or average load >= twice that host's own core count, judged
     from the average load over the window. A host at or above any of them gets
     a `[!]` marker and an inline reason naming the signal and the value, for
     example `(CPU avg 76.7% >= 60%)`, `(memory 88.0% >= 85%)`,
-    `(disk 85.4% >= 85%)`, or `(load avg 8.74 >= 2x2 cores)`. CPU peak and load
+    `(disk 95.4% >= 95%)`, or `(load avg 8.74 >= 2x2 cores)`. CPU peak and load
     peak are context, never a flag on their own: a CPU peak never flags a host,
     and a load peak never flags one either. The load test compares the average
     load with twice the core count from `cpu_cores`, rendered as `2x2 cores`
