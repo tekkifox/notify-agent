@@ -168,8 +168,8 @@ class StaleTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
-    """Only sustained signals flag a host; a peak never does, except load
-    measured against the host's own core count."""
+    """Only sustained signals flag a host; a peak never does, including the
+    load peak, which is compared as an average against the host's own cores."""
 
     def assert_flagged(self, **values) -> str:
         text = host_report.build_report(
@@ -201,24 +201,37 @@ class ThresholdTests(unittest.TestCase):
         self.assertNotIn("disk 84.9% >=", text)
         self.assertNotIn("[!]", text)
 
-    def test_load_peak_boundary_is_twice_the_core_count(self) -> None:
-        text = self.assert_flagged(cpu_cores=2, load_peak=4.0)
-        self.assertIn("load peak 4.00 >= 2x2 cores", text)
-        below = self.assert_flagged(cpu_cores=2, load_peak=3.99)
-        self.assertNotIn("load peak 3.99 >=", below)
+    def test_load_average_boundary_is_twice_the_core_count(self) -> None:
+        text = self.assert_flagged(cpu_cores=2, load_avg=4.0)
+        self.assertIn("load avg 4.00 >= 2x2 cores", text)
+        below = self.assert_flagged(cpu_cores=2, load_avg=3.99)
+        self.assertNotIn("load avg 3.99 >=", below)
         self.assertNotIn("[!]", below)
 
     def test_a_bigger_host_gets_a_bigger_load_threshold(self) -> None:
-        # The same load peak is fine on 4 cores and a flag on 2.
-        self.assertNotIn("[!]", self.assert_flagged(cpu_cores=4, load_peak=7.0))
+        # The same average load is a flag on 2 cores and fine on 4.
         self.assertIn(
-            "load peak 8.00 >= 2x4 cores",
-            self.assert_flagged(cpu_cores=4, load_peak=8.0),
+            "load avg 7.00 >= 2x2 cores",
+            self.assert_flagged(cpu_cores=2, load_avg=7.0),
+        )
+        self.assertNotIn("[!]", self.assert_flagged(cpu_cores=4, load_avg=7.0))
+        self.assertIn(
+            "load avg 8.00 >= 2x4 cores",
+            self.assert_flagged(cpu_cores=4, load_avg=8.0),
         )
 
+    def test_a_huge_load_peak_with_a_modest_average_never_flags(self) -> None:
+        # The reboot burst that started this rule: 27.18 on 8 cores was a peak.
+        text = self.assert_flagged(
+            cpu_cores=8, load_avg=1.5, load_peak=27.18
+        )
+        self.assertNotIn("[!]", text)
+        self.assertNotIn("load avg 1.50 >=", text)
+        self.assertIn("load 1.50 avg / 27.18 peak", text)
+
     def test_load_never_flags_without_a_core_count(self) -> None:
-        text = self.assert_flagged(cpu_cores=None, load_peak=99.0)
-        self.assertNotIn("load peak 99.00 >=", text)
+        text = self.assert_flagged(cpu_cores=None, load_avg=99.0)
+        self.assertNotIn("load avg 99.00 >=", text)
         self.assertNotIn("[!]", text)
 
     def test_cpu_peak_is_context_and_never_flags(self) -> None:
@@ -233,7 +246,7 @@ class ThresholdTests(unittest.TestCase):
             ({"cpu_avg": 76.7}, "(CPU avg 76.7% >= 60%)"),
             ({"memory_avg": 88.0}, "(memory 88.0% >= 85%)"),
             ({"disk": 85.4}, "(disk 85.4% >= 85%)"),
-            ({"cpu_cores": 2, "load_peak": 8.74}, "(load peak 8.74 >= 2x2 cores)"),
+            ({"cpu_cores": 2, "load_avg": 8.74}, "(load avg 8.74 >= 2x2 cores)"),
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, self.assert_flagged(**values))
@@ -242,13 +255,13 @@ class ThresholdTests(unittest.TestCase):
         text = self.assert_flagged(
             cpu_avg=61.0,
             memory_avg=86.0,
-            load_peak=4.5,
+            load_avg=4.5,
             disk=86.0,
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
             "(CPU avg 61.0% >= 60%; memory 86.0% >= 85%; "
-            "disk 86.0% >= 85%; load peak 4.50 >= 2x2 cores)",
+            "disk 86.0% >= 85%; load avg 4.50 >= 2x2 cores)",
             text,
         )
 
@@ -353,8 +366,8 @@ class ReadmeTests(unittest.TestCase):
                 cpu_avg=44.8,
                 cpu_peak=117.0,
                 memory_avg=22.6,
-                load_avg=2.31,
-                load_peak=4.90,
+                load_avg=8.74,
+                load_peak=9.50,
                 disk=30.9,
             ),
             row(
@@ -406,14 +419,15 @@ class ReadmeTests(unittest.TestCase):
         self.assertIn("average CPU at or above 60 %", FLAT_README)
         self.assertIn("average memory at or above 85 %", FLAT_README)
         self.assertIn("disk from the latest sample at or above 85 %", FLAT_README)
-        self.assertIn("twice that host's own core count", FLAT_README)
-        self.assertIn("CPU peak is context and never flags a host", FLAT_README)
+        self.assertIn("average load at or above twice that host's own core count", FLAT_README)
+        self.assertIn("CPU peak and load peak are context and never flag a host", FLAT_README)
         # The old rule must not creep back into the prose.
         self.assertNotIn("The inclusive thresholds are CPU peak 90", FLAT_README)
         self.assertNotIn("(CPU peak 117.0% >= 90%)", FLAT_README)
         self.assertNotRegex(
             FLAT_README, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
         )
+        self.assertNotIn("(load peak", FLAT_README)
 
 
 if __name__ == "__main__":

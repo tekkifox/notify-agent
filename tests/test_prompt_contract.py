@@ -423,8 +423,8 @@ class SustainedSignalRuleTests(unittest.TestCase):
     The old rule flagged a host on a 90 % CPU peak, a 90 % memory average, an
     absolute load peak of 8 and a 90 % disk reading. Those thresholds fired on
     every host that spiked, so the rule now matches the crontab prompts:
-    average CPU, average memory, the latest disk reading, and load measured
-    against the host's own core count.
+    average CPU, average memory, the latest disk reading, and average load
+    measured against the host's own core count.
     """
 
     #: Every parenthesised threshold in the prompt must be one of the four
@@ -435,7 +435,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         r"CPU avg \d+(?:\.\d+)?% >= 60%"
         r"|memory \d+(?:\.\d+)?% >= 85%"
         r"|disk \d+(?:\.\d+)?% >= 85%"
-        r"|load peak \d+(?:\.\d+)? >= 2x\d+ cores"
+        r"|load avg \d+(?:\.\d+)? >= 2x\d+ cores"
         r")$"
     )
 
@@ -444,7 +444,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         self.assertIn("average memory >= 85 %", FLAT_PROMPT)
         self.assertIn("disk from the latest sample >= 85 %", FLAT_PROMPT)
         self.assertIn(
-            "load peak >= twice that host's own core count", FLAT_PROMPT
+            "average load >= twice that host's own core count", FLAT_PROMPT
         )
 
     def test_no_old_cpu_peak_threshold_survives(self) -> None:
@@ -453,9 +453,12 @@ class SustainedSignalRuleTests(unittest.TestCase):
         self.assertNotIn("CPU peak 117.0% >= 90%", FLAT_PROMPT)
 
     def test_no_absolute_load_peak_threshold_survives(self) -> None:
-        # `load peak 8.74 >= 2x2 cores` is allowed; a bare `>= 8` is not.
+        # `load avg 8.74 >= 2x2 cores` is allowed; a bare `>= 8` is not.
         self.assertNotRegex(
             FLAT_PROMPT, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
+        )
+        self.assertNotRegex(
+            FLAT_PROMPT, r"load avg [\d.]+ >= [\d.]+(?![x\d])"
         )
 
     def test_no_flag_reason_is_a_peak_alone(self) -> None:
@@ -465,20 +468,24 @@ class SustainedSignalRuleTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertRegex(reason, self.ALLOWED_REASON)
         self.assertNotIn("(CPU peak", FLAT_PROMPT)
+        self.assertNotIn("(load peak", FLAT_PROMPT)
 
     def test_flag_reasons_are_the_documented_examples(self) -> None:
         for reason in (
             "(CPU avg 76.7% >= 60%)",
             "(memory 88.0% >= 85%)",
             "(disk 85.4% >= 85%)",
-            "(load peak 8.74 >= 2x2 cores)",
+            "(load avg 8.74 >= 2x2 cores)",
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, FLAT_PROMPT)
 
     def test_the_load_test_uses_the_host_core_count(self) -> None:
-        self.assertIn("twice the host's own core count", FLAT_PROMPT)
-        self.assertIn("reads that core count from `cpu_cores`", FLAT_PROMPT)
+        self.assertIn("average load >= twice that host's own core count", FLAT_PROMPT)
+        self.assertIn(
+            "compares the average load with twice the core count from `cpu_cores`",
+            FLAT_PROMPT,
+        )
         self.assertIn(
             "when the core count is null the load rule cannot apply", FLAT_PROMPT
         )
@@ -493,6 +500,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
             FLAT_PROMPT,
         )
         self.assertIn("a CPU peak never flags a host", FLAT_PROMPT)
+        self.assertIn("a load peak never flags one either", FLAT_PROMPT)
 
     def test_reason_order_is_stale_cpu_memory_disk_load(self) -> None:
         self.assertIn(
@@ -500,9 +508,11 @@ class SustainedSignalRuleTests(unittest.TestCase):
         )
         self.assertNotIn("STALE, then CPU, memory, load, disk", FLAT_PROMPT)
 
-    def test_worked_example_does_not_flag_a_cpu_peak(self) -> None:
+    def test_worked_example_flags_the_average_not_the_peak(self) -> None:
+        self.assertIn("(load avg 8.74 >= 2x2 cores)", FLAT_PROMPT)
+        self.assertIn("load 8.74 avg / 9.50 peak", FLAT_PROMPT)
+        self.assertNotIn("(load peak", FLAT_PROMPT)
         self.assertNotIn("(CPU peak", FLAT_PROMPT)
-        self.assertIn("(load peak 4.90 >= 2x2 cores)", FLAT_PROMPT)
 
 
 class OpenCodeConfigTests(unittest.TestCase):
@@ -718,10 +728,14 @@ class FleetDigestScheduleTests(unittest.TestCase):
                 self.assertIn("average CPU >= 60", line)
                 self.assertIn("average memory >= 85", line)
                 self.assertIn("disk >= 85", line)
+                self.assertIn(
+                    "average load >= twice that host's own core count", line
+                )
                 self.assertIn("Decide every flag from the averages", line)
                 self.assertIn(
                     "never flag a host because of a peak", line
                 )
+                self.assertNotIn("load peak >=", line)
 
     def test_no_crontab_rule_flags_on_a_peak(self) -> None:
         """A peak may be context, never a flag condition or an old rule."""
@@ -812,6 +826,46 @@ class FleetDigestScheduleTests(unittest.TestCase):
                     "notify.sh is the only way this run may say anything", line
                 )
                 self.assertNotIn("Send it now with notify.sh", line)
+
+
+class FlagGuardScheduleTests(unittest.TestCase):
+    """The two fleet-wide digests set the hard silence guard, and nothing else
+    does. The guard is the code-level floor under the prompt's silence rule."""
+
+    def _schedule_line(self, name: str, schedule: str, target: str) -> str:
+        for line in CRONTABS[name].splitlines():
+            stripped = line.lstrip("# ")
+            if stripped.startswith(schedule) and f"-t {target} " in stripped:
+                return stripped
+        self.fail(f"{name}: no {schedule!r} line for target {target!r}")
+
+    def test_both_fleet_wide_lines_require_a_flag(self) -> None:
+        for name in CRONTABS:
+            for schedule in ("0 9 * * * ", "15 * * * * "):
+                with self.subTest(crontab=name, schedule=schedule):
+                    line = self._schedule_line(name, schedule, "automations")
+                    self.assertIn("NOTIFY_REQUIRE_FLAG=1", line)
+                    self.assertIn("NOTIFY_PREFETCH=host_stats", line)
+
+    def test_the_admin_chat_hourly_job_does_not_require_a_flag(self) -> None:
+        for name in CRONTABS:
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "5 * * * * ", "admin-chat")
+                self.assertNotIn("NOTIFY_REQUIRE_FLAG", line)
+
+    def test_the_prompt_says_the_boundary_refuses_a_message_with_no_flag(
+        self,
+    ) -> None:
+        self.assertIn(
+            "when a run is configured to require a flag, `notify.sh` reads the "
+            "message before any delivery and refuses to send one that carries "
+            "no `[!]` marker",
+            FLAT_PROMPT,
+        )
+        self.assertIn("A refused send is a silent skip, not a failure", FLAT_PROMPT)
+        self.assertIn(
+            "`[!]` is the only marker the boundary checks", FLAT_PROMPT
+        )
 
 
 if __name__ == "__main__":
