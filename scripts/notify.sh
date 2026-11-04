@@ -78,7 +78,11 @@ usage_fail() {
 # delivered message into a failed one (the exit status must not change).
 mark_sent() {
     [ -n "${NOTIFY_SEND_MARKER:-}" ] || return 0
-    if ! : > "$NOTIFY_SEND_MARKER" 2>/dev/null; then
+    # `printf`, not `:`, because a redirection error on a POSIX special builtin
+    # aborts a non-interactive shell under dash, which would turn a delivered
+    # message into a failed one. stderr goes first so the shell's own "cannot
+    # create" line is suppressed too.
+    if ! printf '' 2>/dev/null > "$NOTIFY_SEND_MARKER"; then
         printf '%s: warning: could not record the send marker\n' "$PROG" >&2
     fi
     return 0

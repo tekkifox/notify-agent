@@ -153,6 +153,11 @@ for line in sys.stdin:
     columns.append("disk_latest")
     columns.append("failed_logins_latest")
     columns.append("failed_login_users_latest")
+    columns.append("ssh_logins_latest")
+    columns.append("ssh_login_users_latest")
+    columns.append("ssh_logins_today_latest")
+    columns.append("ssh_login_users_today_latest")
+    columns.append("ssh_logins_today_since_latest")
     extra = os.environ.get("PREFETCH_EXTRA_COLUMN")
     if extra:
         columns.append(extra)
@@ -189,6 +194,23 @@ for line in sys.stdin:
                 "failed_login_users",
                 '[{"user":"root","count":9},{"user":"admin","count":3}]',
             )
+        )
+        row.append(latest_with_value("ssh_logins", 12))
+        row.append(
+            latest_with_value(
+                "ssh_login_users",
+                '[{"user":"root","count":9},{"user":"ross","count":3}]',
+            )
+        )
+        row.append(latest_with_value("ssh_logins_today", 497))
+        row.append(
+            latest_with_value(
+                "ssh_login_users_today",
+                '[{"user":"root","count":300},{"user":"ross","count":197}]',
+            )
+        )
+        row.append(
+            latest_with_value("ssh_logins_today_since", "2026-11-03T00:00:00+00:00")
         )
         if extra:
             row.append("passthrough-value")
@@ -432,9 +454,41 @@ else
     pass "the parser passes unknown columns through unchanged"
 fi
 
-# 9. A second, older writer inserts samples without the failed-login columns,
-#    interleaved with the good three-minute samples. A newer null sample must
-#    not hide the latest value, and a window of all nulls must stay null.
+# 9. The accepted-login columns use the same null-skipping idiom as the
+#    failed-login columns, and the parser passes every value through unchanged.
+run_case logins automations NOTIFY_PREFETCH=host_stats
+prompt=$(cat "$tmp/logins" 2>/dev/null || true)
+err=$(cat "$tmp/logins.stderr" 2>/dev/null || true)
+missing=
+for column in ssh_logins ssh_login_users ssh_logins_today \
+    ssh_login_users_today ssh_logins_today_since; do
+    grep -q "MAX($column) KEEP (DENSE_RANK LAST ORDER BY CASE WHEN $column IS NOT NULL THEN sampled_at END NULLS FIRST) AS ${column}_latest" \
+        "$tmp/logins.sql" 2>/dev/null || missing="$missing $column"
+done
+if [ "$rc" -ne 0 ]; then
+    no "logins: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "logins: instruction did not carry the statistics section"
+elif [ -n "$missing" ]; then
+    no "logins: the query does not take the latest value of$missing with the null-skipping idiom"
+elif ! grep -Fq '"ssh_logins_latest":12' "$tmp/logins"; then
+    no "logins: instruction lost the last-hour login count"
+elif ! grep -Fq '"ssh_login_users_latest":"[{\"user\":\"root\",\"count\":9},{\"user\":\"ross\",\"count\":3}]"' "$tmp/logins"; then
+    no "logins: instruction lost the last-hour login users"
+elif ! grep -Fq '"ssh_logins_today_latest":497' "$tmp/logins"; then
+    no "logins: instruction lost the day's login total"
+elif ! grep -Fq '"ssh_login_users_today_latest":"[{\"user\":\"root\",\"count\":300},{\"user\":\"ross\",\"count\":197}]"' "$tmp/logins"; then
+    no "logins: instruction lost the day's login users"
+elif ! grep -Fq '"ssh_logins_today_since_latest":"2026-11-03T00:00:00+00:00"' "$tmp/logins"; then
+    no "logins: instruction lost the day's start time"
+else
+    pass "accepted logins are pre-fetched for every host with the null-skipping idiom"
+fi
+
+# 10. A second, older writer inserts samples without the failed-login or
+#     accepted-login columns, interleaved with the good three-minute samples. A
+#     newer null sample must not hide the latest value, and a window of all
+#     nulls must stay null.
 run_case null_newer automations NOTIFY_PREFETCH=host_stats \
     PREFETCH_FAILED_LOGIN_WINDOW=null-newer
 prompt=$(cat "$tmp/null_newer" 2>/dev/null || true)
@@ -451,6 +505,10 @@ elif ! grep -q "CASE WHEN failed_logins IS NOT NULL THEN sampled_at END NULLS FI
     no "null newer: the query does not order null samples before the good ones"
 elif ! grep -q "CASE WHEN failed_login_users IS NOT NULL THEN sampled_at END NULLS FIRST" "$tmp/null_newer.sql" 2>/dev/null; then
     no "null newer: the users column does not order null samples first"
+elif ! grep -Fq '"ssh_logins_latest":12' "$tmp/null_newer"; then
+    no "null newer: a newer null sample hid the last-hour login count"
+elif ! grep -Fq '"ssh_logins_today_latest":497' "$tmp/null_newer"; then
+    no "null newer: a newer null sample hid the day's login total"
 else
     pass "a null sample newer than the latest good one does not hide it"
 fi
@@ -467,6 +525,16 @@ elif ! grep -Fq '"failed_logins_latest":null' "$tmp/all_null"; then
     no "all null: the failed-login count was not null"
 elif ! grep -Fq '"failed_login_users_latest":null' "$tmp/all_null"; then
     no "all null: the failed-login users were not null"
+elif ! grep -Fq '"ssh_logins_latest":null' "$tmp/all_null"; then
+    no "all null: the last-hour login count was not null"
+elif ! grep -Fq '"ssh_login_users_latest":null' "$tmp/all_null"; then
+    no "all null: the last-hour login users were not null"
+elif ! grep -Fq '"ssh_logins_today_latest":null' "$tmp/all_null"; then
+    no "all null: the day's login total was not null"
+elif ! grep -Fq '"ssh_login_users_today_latest":null' "$tmp/all_null"; then
+    no "all null: the day's login users were not null"
+elif ! grep -Fq '"ssh_logins_today_since_latest":null' "$tmp/all_null"; then
+    no "all null: the day's start time was not null"
 else
     pass "a window of all nulls stays null"
 fi
