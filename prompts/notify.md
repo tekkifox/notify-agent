@@ -149,7 +149,7 @@ Morning digest:
 
     **Host report** — YYYY-MM-DD HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 0.44 avg / 1.17 peak; disk 30.9%; SSH ok (42 ms) (CPU peak 117.0% >= 90%)
+    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 2.31 avg / 4.90 peak; disk 30.9%; SSH ok (42 ms) (load peak 4.90 >= 2x2 cores)
 
     The header line is the UTC date and time of this run. The summary line
     counts all hosts in the report, including known hosts with no samples.
@@ -196,13 +196,20 @@ Morning digest:
     nothing in the whole 24-hour window is stale too; render it as
     `no samples in the last 24h; last-seen unknown` and flag it. A sample
     exactly 20 minutes old is still fresh; stale means older than 20 minutes.
-29. Thresholds are inclusive and exact: CPU peak 90%, memory average 90%, load
-    peak 8, disk latest 90%. A host at or above any of them gets a `[!]` marker
-    and an inline reason naming the signal and value, for example
-    `(CPU peak 117.0% >= 90%)`, `(memory 91.2% >= 90%)`,
-    `(load peak 8.00 >= 8)`, or `(disk 90.0% >= 90%)`. Put reasons after the
-    SSH text, oldest flag first (STALE, then CPU, memory, load, disk). One below
-    the threshold is not flagged.
+29. Thresholds are inclusive and exact, and every one of them is a sustained
+    signal: average CPU >= 60 %, average memory >= 85 %, disk from the latest
+    sample >= 85 %, or load peak >= twice that host's own core count. A host at
+    or above any of them gets a `[!]` marker and an inline reason naming the
+    signal and the value, for example `(CPU avg 76.7% >= 60%)`,
+    `(memory 88.0% >= 85%)`, `(disk 85.4% >= 85%)`, or
+    `(load peak 8.74 >= 2x2 cores)`. CPU peak and load peak are context, never
+    a flag on their own: a CPU peak never flags a host, and a load peak flags
+    it only when it reaches twice the host's own core count. The load test
+    reads that core count from `cpu_cores`, rendered as `2x2 cores` for a
+    2-core host; when the core count is null the load rule cannot apply, so
+    the host is never flagged on load — do not guess or invent a core count.
+    Put the reasons after the SSH text in this order: STALE, then average CPU,
+    memory, disk, load. A value one below a threshold is not flagged.
 30. Order known hosts first, in the order the instruction lists them, then any
     other hosts found in the data in name order. Never rely on the query's row
     order. Include a line for every known host, even one with no samples.
