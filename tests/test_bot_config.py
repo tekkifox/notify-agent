@@ -748,12 +748,17 @@ class InboundWiringTests(unittest.TestCase):
             json.loads(child_env["NOTIFY_HOST_PORTS"]),
             {"host1.example.com": 2222, "host2.example.com": 2200},
         )
+        self.assertEqual(
+            json.loads(child_env["NOTIFY_HOST_TAILNET"]),
+            {"host1.example.com": "203.0.113.10"},
+        )
 
     def test_agent_child_does_not_inherit_a_stale_host_port_map(self) -> None:
         with StubServer(200, encode(document(hosts=None))) as server:
             env = dict(self.env)
             env["BOT_SETTINGS_URL"] = server.url
             env["NOTIFY_HOST_PORTS"] = '{"stale.example":2222}'
+            env["NOTIFY_HOST_TAILNET"] = '{"stale.example":"203.0.113.99"}'
             config = discord_inbound.load_config(
                 discord_inbound.resolve_environment(env)
             )
@@ -766,6 +771,32 @@ class InboundWiringTests(unittest.TestCase):
 
         child_env = popen.call_args.kwargs["env"]
         self.assertNotIn("NOTIFY_HOST_PORTS", child_env)
+        self.assertNotIn("NOTIFY_HOST_TAILNET", child_env)
+
+    def test_resolved_environment_carries_the_cms_tailnet_map(self) -> None:
+        with StubServer(200, encode(document())) as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            env["NOTIFY_HOST_TAILNET"] = '{"stale.example":"203.0.113.99"}'
+            resolved = discord_inbound.resolve_environment(env)
+
+        self.assertEqual(
+            json.loads(resolved["NOTIFY_HOST_PORTS"]),
+            {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+        self.assertEqual(
+            json.loads(resolved["NOTIFY_HOST_TAILNET"]),
+            {"host1.example.com": "203.0.113.10"},
+        )
+
+    def test_resolved_environment_clears_a_stale_tailnet_map(self) -> None:
+        with StubServer(200, encode(document(hosts=None))) as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            env["NOTIFY_HOST_TAILNET"] = '{"stale.example":"203.0.113.99"}'
+            resolved = discord_inbound.resolve_environment(env)
+
+        self.assertNotIn("NOTIFY_HOST_TAILNET", resolved)
 
     def test_listener_falls_back_to_env_without_a_cache(self) -> None:
         with StubServer(401, b"denied") as server:

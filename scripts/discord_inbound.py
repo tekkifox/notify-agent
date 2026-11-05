@@ -261,6 +261,7 @@ class Config:
     targets_json: str = ""
     sources_json: str = ""
     host_ports_json: str = ""
+    host_tailnets_json: str = ""
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -895,6 +896,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         targets_json=env.get("NOTIFY_TARGETS") or "",
         sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
         host_ports_json=env.get("NOTIFY_HOST_PORTS") or "",
+        host_tailnets_json=env.get("NOTIFY_HOST_TAILNET") or "",
     )
 
 
@@ -922,6 +924,12 @@ def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
         # global SSH_PORT in charge and do not let a stale inherited map leak
         # into the agent run.
         env.pop("NOTIFY_HOST_PORTS", None)
+    # The tailnet map travels with the port map: a host that has one always has
+    # a port, and neither may leak into the run from an earlier source.
+    if resolution.host_tailnets_json:
+        env["NOTIFY_HOST_TAILNET"] = resolution.host_tailnets_json
+    else:
+        env.pop("NOTIFY_HOST_TAILNET", None)
     return env
 
 
@@ -1701,6 +1709,11 @@ def _agent_environment(config: Config, chosen: InboundSource) -> dict[str, str]:
     environment.pop("NOTIFY_HOST_PORTS", None)
     if config.host_ports_json:
         environment["NOTIFY_HOST_PORTS"] = config.host_ports_json
+    # The tailnet map is optional for the same reason and travels with the
+    # port map, so an inherited value never survives a run that has none.
+    environment.pop("NOTIFY_HOST_TAILNET", None)
+    if config.host_tailnets_json:
+        environment["NOTIFY_HOST_TAILNET"] = config.host_tailnets_json
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"
