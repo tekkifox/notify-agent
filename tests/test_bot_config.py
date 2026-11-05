@@ -71,7 +71,7 @@ CMS_SOURCES = [
 ]
 
 CMS_HOSTS = [
-    {"name": "host1.example.com", "sshPort": 2222},
+    {"name": "host1.example.com", "sshPort": 2222, "tailnet": "203.0.113.10"},
     {"name": "host2.example.com", "sshPort": 2200},
 ]
 
@@ -226,6 +226,10 @@ class ResolverTests(unittest.TestCase):
                 json.loads(resolution.host_ports_json),
                 {"host1.example.com": 2222, "host2.example.com": 2200},
             )
+            self.assertEqual(
+                json.loads(resolution.host_tailnets_json),
+                {"host1.example.com": "203.0.113.10"},
+            )
             self.assertEqual(len(server.requests), 1)
             self.assertEqual(server.requests[0]["path"], "/api/bot-settings")
             self.assertEqual(
@@ -245,6 +249,7 @@ class ResolverTests(unittest.TestCase):
 
         self.assertEqual(resolution.source, "cms")
         self.assertEqual(resolution.host_ports_json, "")
+        self.assertEqual(resolution.host_tailnets_json, "")
         self.assertEqual(
             resolution.log_line, "config source=cms hosts=0 ssh_ports=0"
         )
@@ -273,15 +278,64 @@ class ResolverTests(unittest.TestCase):
             "config source=cms hosts=6 ssh_ports=2 dropped=4",
         )
 
+    def test_malformed_tailnet_values_are_dropped_but_keep_the_port(self) -> None:
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222, "tailnet": "203.0.113.10"},
+            {"name": "host2.example.com", "sshPort": 2200, "tailnet": "999.1.1.1"},
+            {"name": "host3.example.com", "sshPort": 2201, "tailnet": "203.0.113.300"},
+            {"name": "host4.example.com", "sshPort": 2202, "tailnet": "203.0.113"},
+            {"name": "host5.example.com", "sshPort": 2203, "tailnet": "203.0.113.11.1"},
+            {"name": "host6.example.com", "sshPort": 2204, "tailnet": 112},
+            {"name": "host7.example.com", "sshPort": 2205, "tailnet": ""},
+            {"name": "host8.example.com", "sshPort": 2206, "tailnet": " 203.0.113.12 "},
+            {"name": "host9.example.com", "sshPort": 0, "tailnet": "203.0.113.13"},
+        ]
+        with StubServer(
+            200, encode(document(hosts=hosts, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cms")
+        self.assertEqual(
+            json.loads(resolution.host_ports_json),
+            {
+                "host1.example.com": 2222,
+                "host2.example.com": 2200,
+                "host3.example.com": 2201,
+                "host4.example.com": 2202,
+                "host5.example.com": 2203,
+                "host6.example.com": 2204,
+                "host7.example.com": 2205,
+                "host8.example.com": 2206,
+            },
+        )
+        # A malformed optional address drops only itself, never the port; a
+        # bad port drops the whole entry, as it did before.
+        self.assertEqual(
+            json.loads(resolution.host_tailnets_json),
+            {
+                "host1.example.com": "203.0.113.10",
+                "host8.example.com": "203.0.113.12",
+            },
+        )
+        self.assertEqual(
+            resolution.log_line,
+            "config source=cms hosts=9 ssh_ports=8 dropped=1",
+        )
+
     def test_host_ports_fall_back_to_the_environment(self) -> None:
         inherited = '{"env.example.com":2200}'
+        inherited_tailnets = '{"env.example.com":"203.0.113.10"}'
         with StubServer(401, b"denied") as server:
             resolution = self.resolve(
-                server.url, NOTIFY_HOST_PORTS=inherited
+                server.url,
+                NOTIFY_HOST_PORTS=inherited,
+                NOTIFY_HOST_TAILNET=inherited_tailnets,
             )
 
         self.assertEqual(resolution.source, "env")
         self.assertEqual(resolution.host_ports_json, inherited)
+        self.assertEqual(resolution.host_tailnets_json, inherited_tailnets)
         self.assertEqual(
             resolution.log_line,
             "config source=env hosts=1 ssh_ports=1 reason=cms 401",
@@ -289,13 +343,16 @@ class ResolverTests(unittest.TestCase):
 
     def test_unset_url_keeps_the_environment_map_verbatim(self) -> None:
         inherited = '{ "env.example.com" : 2200 }'
+        inherited_tailnets = '{ "env.example.com" : "203.0.113.10" }'
         env = dict(self.env)
         env["NOTIFY_HOST_PORTS"] = inherited
+        env["NOTIFY_HOST_TAILNET"] = inherited_tailnets
 
         resolution = bot_config.resolve(env)
 
         self.assertEqual(resolution.source, "env")
         self.assertEqual(resolution.host_ports_json, inherited)
+        self.assertEqual(resolution.host_tailnets_json, inherited_tailnets)
         self.assertFalse(resolution.log_required)
 
     def test_non_array_hosts_falls_through_to_the_cache(self) -> None:
@@ -332,6 +389,10 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(
             json.loads(resolution.host_ports_json),
             {"host1.example.com": 2222, "host2.example.com": 2200},
+        )
+        self.assertEqual(
+            json.loads(resolution.host_tailnets_json),
+            {"host1.example.com": "203.0.113.10"},
         )
         self.assertNotIn(API_KEY, resolution.log_line)
 
@@ -557,6 +618,7 @@ class CommandLineTests(unittest.TestCase):
     def test_cli_prints_host_ports_and_escaped_json(self) -> None:
         with StubServer(200, encode(document())) as server:
             host_ports = self.run_cli(server.url, "--host-ports")
+            host_tailnets = self.run_cli(server.url, "--host-tailnets")
             combined = self.run_cli(server.url, "--json")
 
         self.assertEqual(host_ports.returncode, 0)
@@ -567,6 +629,14 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(
             host_ports.stderr, "config source=cms hosts=2 ssh_ports=2\n"
         )
+        self.assertEqual(host_tailnets.returncode, 0)
+        self.assertEqual(
+            json.loads(host_tailnets.stdout),
+            {"host1.example.com": "203.0.113.10"},
+        )
+        self.assertEqual(
+            host_tailnets.stderr, "config source=cms hosts=2 ssh_ports=2\n"
+        )
         self.assertEqual(combined.returncode, 0)
         payload = json.loads(combined.stdout)
         self.assertEqual(json.loads(payload["targets"]), CMS_TARGETS)
@@ -576,15 +646,25 @@ class CommandLineTests(unittest.TestCase):
             {"host1.example.com": 2222, "host2.example.com": 2200},
         )
         self.assertEqual(
+            json.loads(payload["host_tailnets"]),
+            {"host1.example.com": "203.0.113.10"},
+        )
+        self.assertEqual(
             combined.stderr, "config source=cms hosts=2 ssh_ports=2\n"
         )
 
     def test_cli_host_ports_absent_is_empty_and_still_logs_counts(self) -> None:
         with StubServer(200, encode(document(hosts=None))) as server:
             result = self.run_cli(server.url, "--host-ports")
+            tailnets = self.run_cli(server.url, "--host-tailnets")
+            combined = self.run_cli(server.url, "--json")
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+        self.assertEqual(tailnets.returncode, 0)
+        self.assertEqual(tailnets.stdout, "")
+        self.assertEqual(combined.returncode, 0)
+        self.assertEqual(json.loads(combined.stdout)["host_tailnets"], "")
         self.assertEqual(
             result.stderr, "config source=cms hosts=0 ssh_ports=0\n"
         )

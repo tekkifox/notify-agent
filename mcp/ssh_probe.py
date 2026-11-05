@@ -44,7 +44,7 @@ Credentials are a single unprivileged key, mounted read-only like the Oracle
 wallet. Configuration comes from the environment and is never echoed:
 
     SSH_USER, SSH_KEY_PATH, SSH_TIMEOUT_SECONDS, SSH_TOTAL_TIMEOUT_SECONDS,
-    SSH_PORT, NOTIFY_HOST_PORTS, SSH_ALLOWED_HOSTS
+    SSH_PORT, NOTIFY_HOST_PORTS, NOTIFY_HOST_TAILNET, SSH_ALLOWED_HOSTS
 
 ``NOTIFY_HOST_PORTS`` is an optional JSON object of ``{"host": port}`` set by
 the run from the CMS. Port resolution for each host is the map entry, then
@@ -52,6 +52,15 @@ the run from the CMS. Port resolution for each host is the map entry, then
 startup: a malformed map fails loudly while naming the variable, and no value
 is echoed. A map entry never widens the allowlist or the run scope: the port
 decides where to dial, never which hosts are permitted.
+
+``NOTIFY_HOST_TAILNET`` is an optional JSON object of ``{"host": "<ipv4>"}``
+set by the run from the CMS. When a host has an entry there, the probe dials
+that address instead of the panel name; the panel name is still the only thing
+the allowlist and run scope are matched against, and it is still the name a
+result reports. A host without an entry is dialled by name exactly as before.
+The address decides where to dial, never which hosts are permitted. The map is
+validated strictly at startup like the port map, naming only the variable.
+Preference order is the tailnet address, then the panel name.
 
 ``SSH_USER`` and ``SSH_KEY_PATH`` are required to probe. If either is absent,
 or the key file is not readable, the tool returns ``configured: false`` with a
@@ -118,6 +127,11 @@ HOST_SCOPE_ENV = "NOTIFY_HOST_SCOPE"
 # object of host to port. Optional: without it every host uses SSH_PORT.
 HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
 
+# Set by run-prompt.sh / discord_inbound.py from the CMS hosts array. JSON
+# object of host to IPv4 address. Optional: without an entry a host is dialled
+# by its panel name. Keys are always panel names, never addresses.
+HOST_TAILNET_ENV = "NOTIFY_HOST_TAILNET"
+
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TIMEOUT_SECONDS = 30.0
 DEFAULT_TOTAL_TIMEOUT_SECONDS = 20.0
@@ -161,6 +175,13 @@ MAX_MESSAGE_CHARS = 200
 HOST_PATTERN = re.compile(
     r"^(?=.{1,%d}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
     % MAX_HOST_CHARS
+)
+
+# A tailnet target must be an IPv4 dotted quad.  Leading zeros and
+# out-of-range octets are refused rather than guessed at.
+IPV4_PATTERN = re.compile(
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}"
+    r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 )
 
 TOOL = {
@@ -270,6 +291,9 @@ class Settings(NamedTuple):
     allowed_hosts: tuple[str, ...]
     # Validated (host, port) pairs. Empty means every host uses ``port``.
     host_ports: tuple[tuple[str, int], ...] = ()
+    # Validated (panel name, IPv4 address) pairs. Empty means every host is
+    # dialled by its panel name; the name stays the policy and result key.
+    host_tailnets: tuple[tuple[str, str], ...] = ()
 
 
 class Outcome(NamedTuple):
@@ -372,6 +396,65 @@ def _port_for(host: str, settings: Settings) -> int:
     return settings.port
 
 
+def _host_tailnets() -> tuple[tuple[str, str], ...]:
+    """Parse NOTIFY_HOST_TAILNET strictly, naming the variable only.
+
+    The map is keyed by panel name and valued by IPv4 address. A malformed map
+    or address is a configuration error, not something to half-apply: a wrong
+    destination is invisible until a probe fails, so refusing to start beats
+    guessing. No host or address value is echoed in the message.
+    """
+
+    raw = _env(HOST_TAILNET_ENV)
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"{HOST_TAILNET_ENV} must be a JSON object of host to IPv4 address",
+            not_configured=False,
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ConfigError(
+            f"{HOST_TAILNET_ENV} must be a JSON object of host to IPv4 address",
+            not_configured=False,
+        )
+
+    entries: dict[str, str] = {}
+    for name, address in parsed.items():
+        host = _canonical(name) if isinstance(name, str) else ""
+        if not host or not HOST_PATTERN.match(host):
+            raise ConfigError(
+                f"{HOST_TAILNET_ENV} contains an invalid host name",
+                not_configured=False,
+            )
+        if not isinstance(address, str) or not IPV4_PATTERN.match(
+            address.strip()
+        ):
+            raise ConfigError(
+                f"{HOST_TAILNET_ENV} addresses must be IPv4 dotted quads",
+                not_configured=False,
+            )
+        entries[host] = address.strip()
+    return tuple(entries.items())
+
+
+def _dial_for(host: str, settings: Settings) -> str:
+    """Return the tailnet address for a panel name, or the name itself.
+
+    Only the destination changes. ``host`` remains the policy key and the name
+    a result reports, so an address can never widen the allowlist or the run
+    scope.
+    """
+
+    canonical = _canonical(host)
+    for name, address in settings.host_tailnets:
+        if _canonical(name) == canonical:
+            return address
+    return host
+
+
 def parse_allowed_hosts(value: str | None = None) -> tuple[str, ...]:
     """Return the normalised allowlist, falling back to the defaults.
 
@@ -469,6 +552,7 @@ def load_settings() -> Settings:
         port=_port(),
         allowed_hosts=parse_allowed_hosts(),
         host_ports=_host_ports(),
+        host_tailnets=_host_tailnets(),
     )
 
 
@@ -689,13 +773,16 @@ def _probe_with_paramiko(
     """Open one key-authenticated session, then run the fixed journal command.
 
     A completed handshake plus public-key authentication is the health signal.
-    Once the session is open, exactly one read-only command -- the module's
-    fixed ``FAILED_LOGIN_COMMAND``, never caller or model text -- reads the SSH
-    journal for the last hour. The journal read has its own short timeout, kept
-    inside the host's remaining budget, and any failure there leaves the probe
-    ``ok`` with ``failed_logins: null`` and a reason. The client is always
-    closed, and no exception text, journal line or command text leaves this
-    function, because it could name the key path, a user or a source address.
+    The destination is the host's tailnet address when the map has one, and
+    its panel name otherwise; the panel name remains the policy key and the
+    name the result reports. Once the session is open, exactly one read-only
+    command -- the module's fixed ``FAILED_LOGIN_COMMAND``, never caller or
+    model text -- reads the SSH journal for the last hour. The journal read has
+    its own short timeout, kept inside the host's remaining budget, and any
+    failure there leaves the probe ``ok`` with ``failed_logins: null`` and a
+    reason. The client is always closed, and no exception text, journal line or
+    command text leaves this function, because it could name the key path, a
+    user or a source address.
     """
 
     import paramiko
@@ -709,7 +796,7 @@ def _probe_with_paramiko(
     try:
         try:
             client.connect(
-                hostname=host,
+                hostname=_dial_for(host, settings),
                 port=settings.port,
                 username=settings.user,
                 key_filename=settings.key_path,
@@ -873,6 +960,8 @@ def selftest() -> int:
     if settings.host_ports:
         # Count only: the map itself is configuration, not log material.
         detail += f"; per-host ports {len(settings.host_ports)}"
+    if settings.host_tailnets:
+        detail += f"; per-host tailnets {len(settings.host_tailnets)}"
     if scope:
         detail += f"; run scope {len(scope)} host(s)"
     print(f"selftest: ssh configured: {detail}")
