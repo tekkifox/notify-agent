@@ -305,6 +305,115 @@ class HostPortTests(unittest.TestCase):
                     self.assertNotIn(raw, message)
 
 
+class TailnetTests(unittest.TestCase):
+    def test_host_with_a_tailnet_address_is_dialled_there(self) -> None:
+        settings = SETTINGS._replace(
+            host_ports=(("host1.example.com", 2222),),
+            host_tailnets=(("host1.example.com", "203.0.113.10"),),
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host1.example.com"], settings)
+
+        self.assertEqual(payload["results"][0]["status"], "ok")
+        # The panel name is still what the result reports ...
+        self.assertEqual(payload["results"][0]["host"], "host1.example.com")
+        # ... but the socket target is the tailnet address, on its own port.
+        self.assertEqual(client.connect_kwargs["hostname"], "203.0.113.10")
+        self.assertEqual(client.connect_kwargs["port"], 2222)
+
+    def test_host_without_a_tailnet_address_is_dialled_by_name(self) -> None:
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host1.example.com"], SETTINGS)
+
+        self.assertEqual(payload["results"][0]["status"], "ok")
+        self.assertEqual(client.connect_kwargs["hostname"], "host1.example.com")
+
+    def test_tailnet_keys_are_matched_after_normalisation(self) -> None:
+        settings = SETTINGS._replace(
+            host_tailnets=(("HOST1.Example.COM.", "203.0.113.10"),)
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            ssh_probe.probe(["host1.example.com"], settings)
+
+        self.assertEqual(client.connect_kwargs["hostname"], "203.0.113.10")
+
+    def test_refused_host_with_an_address_is_still_refused_before_dialling(self) -> None:
+        settings = SETTINGS._replace(
+            host_tailnets=(
+                ("evil.example", "203.0.113.10"),
+                ("host2.example.com", "203.0.113.11"),
+            )
+        )
+        connector = Connector()
+        payload = ssh_probe.probe(
+            ["evil.example", "host2.example.com"],
+            settings,
+            scope=["host1.example.com"],
+            connector=connector,
+        )
+        self.assertEqual(connector.calls, [])
+        self.assertEqual(connector.ports, [])
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["not_allowed", "out_of_scope"],
+        )
+
+    def test_load_settings_reads_and_normalises_the_tailnet_map(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "NOTIFY_HOST_TAILNET": (
+                    '{"HOST1.Example.COM.":"203.0.113.10",'
+                    '"host2.example.com":" 203.0.113.11 "}'
+                ),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                settings = ssh_probe.load_settings()
+        self.assertEqual(
+            settings.host_tailnets,
+            (
+                ("host1.example.com", "203.0.113.10"),
+                ("host2.example.com", "203.0.113.11"),
+            ),
+        )
+
+    def test_malformed_tailnet_map_fails_naming_the_variable_only(self) -> None:
+        cases = (
+            "not json",
+            "[]",
+            '"host1.example.com"',
+            '{"host1.example.com":"not-an-ip"}',
+            '{"host1.example.com":"999.1.1.1"}',
+            '{"host1.example.com":"203.0.113"}',
+            '{"host1.example.com":"203.0.113.10.1"}',
+            '{"host1.example.com":"01.2.3.4"}',
+            '{"host1.example.com":112}',
+            '{"host1.example.com":null}',
+            '{"bad host":"203.0.113.10"}',
+            '{"host1.example.com":"203.0.113.10","bad host":"203.0.113.11"}',
+        )
+        with tempfile.NamedTemporaryFile() as key:
+            for raw in cases:
+                with self.subTest(raw=raw):
+                    env = {
+                        "SSH_USER": "agent",
+                        "SSH_KEY_PATH": key.name,
+                        "NOTIFY_HOST_TAILNET": raw,
+                    }
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        with self.assertRaises(ssh_probe.ConfigError) as raised:
+                            ssh_probe.load_settings()
+                    message = str(raised.exception)
+                    self.assertIn("NOTIFY_HOST_TAILNET", message)
+                    self.assertNotIn("bad host", message)
+                    self.assertNotIn(raw, message)
+                    self.assertNotIn("203.0.113.10", message)
+
+
 class FailureTests(unittest.TestCase):
     def test_each_failure_class_survives_the_tool(self) -> None:
         for status, message in (
@@ -636,6 +745,9 @@ class ConfigurationTests(unittest.TestCase):
                 "SSH_TOTAL_TIMEOUT_SECONDS": "20",
                 "SSH_ALLOWED_HOSTS": "host1.example.com,host3.example.com",
                 "NOTIFY_HOST_PORTS": '{"host1.example.com":2222}',
+                "NOTIFY_HOST_TAILNET": (
+                    '{"host1.example.com":"203.0.113.10"}'
+                ),
             }
             boom = mock.Mock(side_effect=AssertionError("must not connect"))
             stdout = io.StringIO()
@@ -648,9 +760,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("ssh configured", output)
         self.assertIn("SSH_KEY_PATH readable", output)
         self.assertIn("per-host ports 1", output)
+        self.assertIn("per-host tailnets 1", output)
         self.assertNotIn(key.name, output)
         self.assertNotIn("agent", output)
         self.assertNotIn("2222", output)
+        self.assertNotIn("203.0.113.10", output)
         boom.assert_not_called()
 
     def test_selftest_without_configuration_is_successful_and_plain(self) -> None:

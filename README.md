@@ -412,6 +412,18 @@ number from 1 to 65535. A malformed map fails startup with a message naming
 port is dialled; `SSH_ALLOWED_HOSTS` and `NOTIFY_HOST_SCOPE` are still checked
 first and are unchanged.
 
+A host may also carry a tailnet address in `NOTIFY_HOST_TAILNET`, a JSON object
+of `{"host": "<ipv4>"}` resolved from the same CMS `hosts` array. When a host
+has an entry there, the probe dials that address instead of the panel name; when
+it does not, the panel name is dialled exactly as before. The address is only a
+destination: `SSH_ALLOWED_HOSTS` and `NOTIFY_HOST_SCOPE` are still matched
+against the panel name, and a result still reports that name, so an address can
+never widen a boundary. The resolver drops a malformed address (keeping the
+host's port entry) rather than failing the run; a hand-set `NOTIFY_HOST_TAILNET`
+that reaches the probe is validated strictly like `NOTIFY_HOST_PORTS`, naming
+only the variable and never a value. The preference order is the tailnet
+address, then the panel name.
+
 ### Two host boundaries, enforced in code
 
 Before any connection is attempted, the tool applies two checks:
@@ -453,6 +465,7 @@ container itself runs no command.
 | `SSH_TOTAL_TIMEOUT_SECONDS` | no | Whole-call deadline, default 20; capped at 60 |
 | `SSH_PORT` | no | Default SSH port for hosts without an entry in `NOTIFY_HOST_PORTS`; default 22 |
 | `NOTIFY_HOST_PORTS` | no | Optional JSON object of `{"host": port}` set by the run from the CMS `hosts` array; a per-host port overrides `SSH_PORT` |
+| `NOTIFY_HOST_TAILNET` | no | Optional JSON object of `{"host": "<ipv4>"}` set by the run from the CMS `hosts` array; a host with an entry is dialled at that address instead of its panel name |
 | `SSH_KEY_HOST_FILE` | compose only | Host path bind-mounted read-only at `/ssh/id_ed25519`; set in `.env` or the shell, not `stack.env` |
 | `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `host1.example.com,host2.example.com,host3.example.com` |
 
@@ -1122,11 +1135,16 @@ The panel returns `{version, targets, sources, hosts}`. `targets` has the same
 shape as `NOTIFY_TARGETS`; `sources` has the same shape as
 `NOTIFY_INBOUND_SOURCES` (an empty array leaves inbound in its
 environment-configured single-channel mode). `hosts` is an optional array of
-`{"name": "<host>", "sshPort": <1-65535>}`; it becomes `NOTIFY_HOST_PORTS` for
-the run, so `mcp/ssh_probe.py` dials each host on its own port. An entry with
+`{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<ipv4>"}`; `tailnet` is
+optional. The array becomes `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` for
+the run, so `mcp/ssh_probe.py` dials each host on its own port and, when one is
+recorded, at its tailnet address instead of its public panel name. An entry with
 no usable `name` or `sshPort` is dropped and counted in the source log, never
-passed through. Nothing else moves: Composio credentials, author allowlists,
-state paths and model settings stay in `stack.env`.
+passed through; a malformed `tailnet` value drops only that address and keeps
+the entry's port. The address never changes which host is permitted: the
+allowlist and run scope are matched against the panel name. Nothing else moves:
+Composio credentials, author allowlists, state paths and model settings stay in
+`stack.env`.
 
 Resolution order, for every scheduled prompt and every inbound reply:
 
@@ -1142,9 +1160,9 @@ Resolution order, for every scheduled prompt and every inbound reply:
    (network error, timeout, non-200, malformed JSON, failed validation) the
    last good copy is used, including its `hosts` map.
 3. **Environment.** If there is no usable cache, `NOTIFY_TARGETS`,
-   `NOTIFY_INBOUND_SOURCES` and `NOTIFY_HOST_PORTS` are used exactly as before.
-   When the environment has no map, it stays unset and the global `SSH_PORT`
-   governs.
+   `NOTIFY_INBOUND_SOURCES`, `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` are
+   used exactly as before. When the environment has no map, it stays unset and
+   the global `SSH_PORT` or the panel name governs.
 
 The timeout is 5 seconds by default and capped at 30; a malformed value falls
 back to 5 rather than failing a run. The cache is internal configuration, not a
@@ -1612,8 +1630,8 @@ Verified while building this branch:
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
 - `tests/test_notify_guard.py` covers the `NOTIFY_REQUIRE_FLAG=1` delivery guard with a fake `curl` that records what it would have sent: a message without `[!]` writes no request, writes no send marker and exits 0; a message with `[!]` is delivered; a refused send makes no request even with a webhook configured, proving the guard runs before any delivery; unset, `0`, `true` and empty keep the old behaviour for both flagged and unflagged messages; and a `[!]` that only appears beyond the 2,000-character truncation point does not count, because the guard inspects the message that would be sent.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **452 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
-- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The failed-login tests cover a successful count over the one fixed command on the session the probe opened, a readable journal with zero failures reported as `0`, an unreadable journal and a missing `journalctl` yielding `null` with a reason, a command read timeout and a command that never finishes, a truncated journal refused rather than undercounted, a failed connect running no command, and a result that contains neither journal text nor the command. No live SSH connection was made.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **459 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
+- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; a host in `NOTIFY_HOST_TAILNET` dialled at that address while an absent host is dialled by name and the result still reports the panel name; a refused host with an address still refused before any connection; tailnet map keys normalised; a malformed tailnet map failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The failed-login tests cover a successful count over the one fixed command on the session the probe opened, a readable journal with zero failures reported as `0`, an unreadable journal and a missing `journalctl` yielding `null` with a reason, a command read timeout and a command that never finishes, a truncated journal refused rather than undercounted, a failed connect running no command, and a result that contains neither journal text nor the command. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order including the CPU core count, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each sustained threshold at the boundary and one below (average CPU 60, average memory 85, latest disk 95, average load at twice the core count), the load rule on the average with a known count and never with a null one, a huge load peak with a modest average flagging nothing, the same absolute average being fine on a 4-core host, the absence of any CPU-peak or load-peak flag, the inline flag text and its order, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-preflight.sh` passes against a stub MCP server and the real `notify.sh` with a stubbed `curl`: a transient self-test failure is logged with its safe reason, retried once and the run continues to `opencode`; a persistent failure runs exactly two preflights, does not start `opencode`, and sends exactly one message to the configured target through `notify.sh`, with no statistics and no environment leak; host-like wallet filenames are masked so the target's `host_scope` guard still allows the failure message; and the healthy path keeps one handshake and one self-test.
 - `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The CMS case resolves `NOTIFY_HOST_PORTS` from the panel `hosts` array, and a panel without it clears an inherited map while an unset URL keeps the environment map verbatim. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.

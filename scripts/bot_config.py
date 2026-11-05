@@ -8,7 +8,9 @@ module is the single resolver both delivery paths use:
 * ``scripts/discord_inbound.py`` needs ``NOTIFY_TARGETS`` and
   ``NOTIFY_INBOUND_SOURCES`` for inbound replies.
 * both need ``NOTIFY_HOST_PORTS`` so ``mcp/ssh_probe.py`` dials a host's own
-  SSH port instead of the single global one.
+  SSH port instead of the single global one, and ``NOTIFY_HOST_TAILNET`` so a
+  host recorded with a tailnet address is dialled there instead of by its
+  public panel name.
 
 Precedence is CMS, then the last good cached copy, then the environment.  The
 resolver never raises for a CMS problem: a website outage must not silence the
@@ -16,9 +18,13 @@ resolver never raises for a CMS problem: a website outage must not silence the
 values unchanged, so the feature is enabled and disabled by one variable.
 
 The CMS ``hosts`` array is optional so an older panel still works.  Each entry
-is ``{"name": "<host>", "sshPort": <1-65535>}``.  A malformed entry is dropped
-individually and counted in the one-line source log; it never invalidates the
-rest of the document and never changes which hosts are permitted.
+is ``{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<ipv4>"}``; ``tailnet``
+is optional too.  A malformed entry is dropped individually and counted in the
+one-line source log; a malformed optional tailnet address is dropped without
+discarding the host's port, and never invalidates the rest of the document or
+changes which hosts are permitted.  The tailnet map is emitted as
+``NOTIFY_HOST_TAILNET`` and is consulted only after the allowlist and run scope
+have been checked against the panel name.
 
 Security boundaries:
 
@@ -39,11 +45,12 @@ Command line, for ``run-prompt.sh``::
     python3 scripts/bot_config.py --targets
     python3 scripts/bot_config.py --sources
     python3 scripts/bot_config.py --host-ports
+    python3 scripts/bot_config.py --host-tailnets
     python3 scripts/bot_config.py --json
 
-``--json`` resolves once and prints the three values as escaped JSON strings, so
-a caller that needs more than one does not fetch the panel twice.  The resolved
-JSON is printed to stdout; the single source log line goes to stderr.
+``--json`` resolves once and prints the resolved values as escaped JSON strings,
+so a caller that needs more than one does not fetch the panel twice.  The
+resolved JSON is printed to stdout; the single source log line goes to stderr.
 """
 
 from __future__ import annotations
@@ -68,6 +75,7 @@ CACHE_FILE_NAME = "bot-settings-cache.json"
 LOG_PREFIX = "config"
 
 HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
+HOST_TAILNET_ENV = "NOTIFY_HOST_TAILNET"
 MAX_HOST_CHARS = 253
 MIN_PORT = 1
 MAX_PORT = 65535
@@ -77,6 +85,13 @@ MAX_PORT = 65535
 _HOST_NAME = re.compile(
     r"^(?=.{1,%d}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
     % MAX_HOST_CHARS
+)
+
+# A tailnet address is an IPv4 dotted quad.  Leading zeros and out-of-range
+# octets are refused rather than guessed at.
+_IPV4 = re.compile(
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}"
+    r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 )
 
 TARGETS_SHAPE_ERROR = (
@@ -120,6 +135,7 @@ class Resolution:
     source: str
     reason: str = ""
     host_ports_json: str = ""
+    host_tailnets_json: str = ""
     hosts_total: int = 0
     host_ports_count: int = 0
     hosts_dropped: int = 0
@@ -200,6 +216,16 @@ def _env_host_ports(environ: Mapping[str, str]) -> tuple[str, int]:
     return raw, count
 
 
+def _env_host_tailnets(environ: Mapping[str, str]) -> str:
+    """Return the inherited tailnet map verbatim.
+
+    Like the port map, the environment value is passed through unchanged;
+    ``ssh_probe.py`` owns its validation and never echoes a value.
+    """
+
+    return environ.get(HOST_TAILNET_ENV) or ""
+
+
 def _env_resolution(
     environ: Mapping[str, str], reason: str = ""
 ) -> Resolution:
@@ -210,6 +236,7 @@ def _env_resolution(
         source="env",
         reason=reason,
         host_ports_json=host_ports_json,
+        host_tailnets_json=_env_host_tailnets(environ),
         hosts_total=host_ports_count,
         host_ports_count=host_ports_count,
     )
@@ -340,23 +367,47 @@ def _usable_host_port(entry: object) -> tuple[str, int] | None:
     return host, port
 
 
+def _usable_tailnet(entry: object) -> str | None:
+    """Return one validated IPv4 tailnet address, or None to drop it.
+
+    ``tailnet`` is optional.  A value that is not an IPv4 dotted quad is
+    dropped without discarding the host's port entry; a missing value is not
+    an error either.  The address is kept verbatim apart from surrounding
+    whitespace.
+    """
+
+    if not isinstance(entry, dict):
+        return None
+    address = entry.get("tailnet")
+    if not isinstance(address, str):
+        return None
+    address = address.strip()
+    if not _IPV4.match(address):
+        return None
+    return address
+
+
 def _validate_hosts(
     hosts: object,
-) -> tuple[dict[str, int], int, int]:
-    """Return the per-host map, the array length and the dropped count.
+) -> tuple[dict[str, int], dict[str, str], int, int]:
+    """Return the per-host maps, the array length and the dropped count.
 
     ``hosts`` is optional: a panel that predates the per-host ports change
     simply leaves the global ``SSH_PORT`` in charge.  A non-array value is a
     document problem so the cache can be preferred, but a bad entry is dropped
-    on its own so one typo does not discard every other host.
+    on its own so one typo does not discard every other host.  A host with a
+    bad port is dropped from both maps, exactly as before; a host with a good
+    port and a malformed optional tailnet keeps its port and is absent from
+    the tailnet map.
     """
 
     if hosts is None:
-        return {}, 0, 0
+        return {}, {}, 0, 0
     if not isinstance(hosts, list):
         raise DocumentProblem("document hosts must be a JSON array")
 
     mapping: dict[str, int] = {}
+    tailnets: dict[str, str] = {}
     dropped = 0
     for entry in hosts:
         pair = _usable_host_port(entry)
@@ -365,13 +416,16 @@ def _validate_hosts(
             continue
         host, port = pair
         mapping[host] = port
-    return mapping, len(hosts), dropped
+        address = _usable_tailnet(entry)
+        if address is not None:
+            tailnets[host] = address
+    return mapping, tailnets, len(hosts), dropped
 
 
 def validate_document(
     document: object, environ: Mapping[str, str]
-) -> tuple[object, object, dict[str, int], int, int]:
-    """Validate a CMS document and return targets, sources and host ports."""
+) -> tuple[object, object, dict[str, int], dict[str, str], int, int]:
+    """Validate a CMS document and return targets, sources and host maps."""
 
     if not isinstance(document, dict):
         raise DocumentProblem("document is not a JSON object")
@@ -390,8 +444,10 @@ def validate_document(
         raise DocumentProblem("document sources must be a JSON array")
     _validate_targets(targets)
     _validate_sources(environ, targets, sources)
-    host_ports, hosts_total, dropped = _validate_hosts(document.get("hosts"))
-    return targets, sources, host_ports, hosts_total, dropped
+    host_ports, host_tailnets, hosts_total, dropped = _validate_hosts(
+        document.get("hosts")
+    )
+    return targets, sources, host_ports, host_tailnets, hosts_total, dropped
 
 
 def _encode(value: object) -> str:
@@ -490,6 +546,7 @@ def _document_resolution(
     targets: object,
     sources: object,
     host_ports: Mapping[str, int],
+    host_tailnets: Mapping[str, str],
     hosts_total: int,
     dropped: int,
     reason: str = "",
@@ -500,6 +557,9 @@ def _document_resolution(
         source=source,
         reason=reason,
         host_ports_json="" if not host_ports else _encode(host_ports),
+        host_tailnets_json=(
+            "" if not host_tailnets else _encode(host_tailnets)
+        ),
         hosts_total=hosts_total,
         host_ports_count=len(host_ports),
         hosts_dropped=dropped,
@@ -521,9 +581,14 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
 
     try:
         raw = _fetch(url, api_key, timeout)
-        targets, sources, host_ports, hosts_total, dropped = validate_document(
-            _parse_document(raw), env
-        )
+        (
+            targets,
+            sources,
+            host_ports,
+            host_tailnets,
+            hosts_total,
+            dropped,
+        ) = validate_document(_parse_document(raw), env)
     except DocumentProblem as error:
         reason = f"cms {_safe_reason(error.reason)}"
         try:
@@ -539,6 +604,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
                 targets,
                 sources,
                 host_ports,
+                host_tailnets,
                 hosts_total,
                 dropped,
             ) = validate_document(_parse_document(cached_raw), env)
@@ -551,6 +617,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
             targets,
             sources,
             host_ports,
+            host_tailnets,
             hosts_total,
             dropped,
             reason=reason,
@@ -564,16 +631,29 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
         pass
 
     return _document_resolution(
-        "cms", targets, sources, host_ports, hosts_total, dropped
+        "cms",
+        targets,
+        sources,
+        host_ports,
+        host_tailnets,
+        hosts_total,
+        dropped,
     )
 
 
 def _main(argv: list[str]) -> int:
     mode = argv[1] if len(argv) > 1 else "--targets"
-    if mode not in ("--targets", "--sources", "--host-ports", "--json", "--log"):
+    if mode not in (
+        "--targets",
+        "--sources",
+        "--host-ports",
+        "--host-tailnets",
+        "--json",
+        "--log",
+    ):
         sys.stderr.write(
             "usage: bot_config.py "
-            "[--targets|--sources|--host-ports|--json|--log]\n"
+            "[--targets|--sources|--host-ports|--host-tailnets|--json|--log]\n"
         )
         return 64
     resolution = resolve()
@@ -583,15 +663,18 @@ def _main(argv: list[str]) -> int:
         sys.stdout.write(resolution.sources_json)
     elif mode == "--host-ports":
         sys.stdout.write(resolution.host_ports_json)
+    elif mode == "--host-tailnets":
+        sys.stdout.write(resolution.host_tailnets_json)
     elif mode == "--json":
-        # One resolve, three values.  Escaped strings keep an environment
-        # value byte-for-byte when the panel is not the source.
+        # One resolve, all values.  Escaped strings keep an environment value
+        # byte-for-byte when the panel is not the source.
         sys.stdout.write(
             _encode(
                 {
                     "targets": resolution.targets_json,
                     "sources": resolution.sources_json,
                     "host_ports": resolution.host_ports_json,
+                    "host_tailnets": resolution.host_tailnets_json,
                 }
             )
         )
