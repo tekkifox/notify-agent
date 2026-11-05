@@ -601,9 +601,14 @@ if [ -n "${BOT_SETTINGS_URL:-}" ]; then
                 printf 'run-prompt: could not read resolved SSH ports; using the environment\n' >&2
                 resolved_host_ports=${NOTIFY_HOST_PORTS:-}
             }
+            resolved_host_tailnets=$(printf '%s' "$resolved_config" | json_value host_tailnets) || {
+                printf 'run-prompt: could not read resolved tailnet addresses; using the environment\n' >&2
+                resolved_host_tailnets=${NOTIFY_HOST_TAILNET:-}
+            }
         else
             resolved_targets=${NOTIFY_TARGETS:-}
             resolved_host_ports=${NOTIFY_HOST_PORTS:-}
+            resolved_host_tailnets=${NOTIFY_HOST_TAILNET:-}
         fi
         NOTIFY_TARGETS=$resolved_targets
         export NOTIFY_TARGETS
@@ -615,6 +620,14 @@ if [ -n "${BOT_SETTINGS_URL:-}" ]; then
             export NOTIFY_HOST_PORTS
         else
             unset NOTIFY_HOST_PORTS
+        fi
+        # The tailnet map travels with the port map and is cleared on the same
+        # terms, so a host is never dialled at an inherited address.
+        if [ -n "$resolved_host_tailnets" ]; then
+            NOTIFY_HOST_TAILNET=$resolved_host_tailnets
+            export NOTIFY_HOST_TAILNET
+        else
+            unset NOTIFY_HOST_TAILNET
         fi
     else
         printf 'run-prompt: python3 is not installed; using NOTIFY_TARGETS from the environment\n' >&2

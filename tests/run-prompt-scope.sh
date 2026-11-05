@@ -57,6 +57,9 @@ fi
 if [ -n "${CAPTURE_HOST_PORTS:-}" ]; then
     printf '%s' "${NOTIFY_HOST_PORTS-}" > "$CAPTURE_HOST_PORTS"
 fi
+if [ -n "${CAPTURE_HOST_TAILNET:-}" ]; then
+    printf '%s' "${NOTIFY_HOST_TAILNET-}" > "$CAPTURE_HOST_TAILNET"
+fi
 if [ -n "${CAPTURE_OUTPUT:-}" ]; then
     printf 'agent stdout line\n'
     printf 'agent stderr line\n' >&2
@@ -175,7 +178,7 @@ capture() {
     rm -f "$out" "$out.env" "$out.scope" "$out.runbooks" \
         "$out.bookstack-url" "$out.bookstack-books" \
         "$out.bookstack-token-id" "$out.bookstack-token-secret" \
-        "$out.host-ports"
+        "$out.host-ports" "$out.host-tailnet"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
@@ -194,6 +197,7 @@ capture() {
         CAPTURE_BOOKSTACK_TOKEN_ID="$out.bookstack-token-id" \
         CAPTURE_BOOKSTACK_TOKEN_SECRET="$out.bookstack-token-secret" \
         CAPTURE_HOST_PORTS="$out.host-ports" \
+        CAPTURE_HOST_TAILNET="$out.host-tailnet" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -803,7 +807,7 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
 server.serve_forever()
 PY
 
-cms_doc='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[],"hosts":[{"name":"cms.example","sshPort":2222},{"name":"other.example","sshPort":2200}]}'
+cms_doc='{"version":1,"targets":{"cms-target":{"channel_id":"555555555555555555","host_scope":"cms.example"}},"sources":[],"hosts":[{"name":"cms.example","sshPort":2222,"tailnet":"203.0.113.10"},{"name":"other.example","sshPort":2200}]}'
 start_cms() {
     printf '%s' "$1" > "$tmp/cms-body.json"
     rm -f "$tmp/cms-port"
@@ -844,10 +848,12 @@ else
         no "CMS source: log did not name the CMS and host-port counts"
     elif [ "$(cat "$tmp/cms.host-ports" 2>/dev/null)" != '{"cms.example":2222,"other.example":2200}' ]; then
         no "CMS source: NOTIFY_HOST_PORTS was not exported from the panel"
+    elif [ "$(cat "$tmp/cms.host-tailnet" 2>/dev/null)" != '{"cms.example":"203.0.113.10"}' ]; then
+        no "CMS source: NOTIFY_HOST_TAILNET was not exported from the panel"
     elif [ "$(stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null)" != "600" ]; then
         no "CMS source: cache file is not 0600"
     else
-        pass "run-prompt resolves targets and host ports through the CMS and caches them"
+        pass "run-prompt resolves targets, host ports and tailnets through the CMS and caches them"
     fi
 fi
 
@@ -867,6 +873,7 @@ else
         BOT_SETTINGS_API_KEY="cms-test-key" \
         XDG_STATE_HOME="$tmp/state-no-ports" \
         NOTIFY_HOST_PORTS='{"stale.example":2222}' \
+        NOTIFY_HOST_TAILNET='{"stale.example":"203.0.113.99"}' \
         "$run_prompt" -t cms-target "Compose a status message." 2>/dev/null
     rc=$?
     set -e
@@ -874,10 +881,12 @@ else
         no "CMS no hosts: run-prompt.sh failed: $(cat "$tmp/cms-no-ports.stderr")"
     elif [ -n "$(cat "$tmp/cms-no-ports.host-ports" 2>/dev/null)" ]; then
         no "CMS no hosts: an inherited NOTIFY_HOST_PORTS leaked into the run"
+    elif [ -n "$(cat "$tmp/cms-no-ports.host-tailnet" 2>/dev/null)" ]; then
+        no "CMS no hosts: an inherited NOTIFY_HOST_TAILNET leaked into the run"
     elif ! contains "$(cat "$tmp/cms-no-ports.stderr")" "config source=cms hosts=0 ssh_ports=0"; then
         no "CMS no hosts: log did not report zero host ports"
     else
-        pass "a panel without hosts clears an inherited NOTIFY_HOST_PORTS"
+        pass "a panel without hosts clears an inherited NOTIFY_HOST_PORTS and NOTIFY_HOST_TAILNET"
     fi
 fi
 
@@ -886,6 +895,7 @@ fi
 set +e
 capture "$tmp/url-unset" NOTIFY_TARGETS="$targets" \
     NOTIFY_HOST_PORTS='{"host1.example.com":2222}' \
+    NOTIFY_HOST_TAILNET='{"host1.example.com":"203.0.113.10"}' \
     "$run_prompt" -t general "Compose a status message." 2>/dev/null
 rc=$?
 set -e
@@ -895,6 +905,8 @@ elif [ "$(cat "$tmp/url-unset")" != "$expected_unscoped" ]; then
     no "unset URL: instruction changed"
 elif [ "$(cat "$tmp/url-unset.host-ports" 2>/dev/null)" != '{"host1.example.com":2222}' ]; then
     no "unset URL: inherited NOTIFY_HOST_PORTS was not preserved"
+elif [ "$(cat "$tmp/url-unset.host-tailnet" 2>/dev/null)" != '{"host1.example.com":"203.0.113.10"}' ]; then
+    no "unset URL: inherited NOTIFY_HOST_TAILNET was not preserved"
 elif contains "$(cat "$tmp/url-unset.stderr")" "config source="; then
     no "unset URL: a config source line was logged"
 else
