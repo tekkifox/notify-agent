@@ -26,11 +26,11 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `opencode.json` | `notify` agent definition: only `notify.sh` and the read-only Oracle, SSH and BookStack MCP tools may be used. |
 | `prompts/notify.md` | System prompt for the `notify` agent. |
 | `mcp/oracle_query.py` | Single-file read-only Oracle MCP server (Python 3, `oracledb` thin mode) exposing `query` and `search_content`. |
-| `mcp/ssh_probe.py` | Single-file read-only SSH MCP server (Python 3, `paramiko`) exposing `probe` as `ssh_probe`, with host-scope refusal before any connection and one fixed journal command for the failed-login count. |
+| `mcp/ssh_probe.py` | Single-file read-only SSH MCP server (Python 3, `paramiko`) exposing `probe` as `ssh_probe`, with host-scope refusal before any connection and one parsed status line (failed logins, accepted logins, key hash change, reboot, outdated images) from the host's forced command. |
 | `mcp/host_report.py` | Pure digest formatter: deterministic ordering, stale rule, sustained-signal thresholds, SSH lines and 2,000-character truncation. |
 | `mcp/bookstack.py` | Single-file read-only BookStack MCP server (Python 3, standard library) exposing `search` and `read` as `bookstack_search` and `bookstack_read`, restricted to an allowlist of books. |
 | `tests/test_oracle_guard.py` | SQL-guard and input-handling tests; no database or driver required. |
-| `tests/test_ssh_probe.py` | SSH policy, scope, per-host port, failure-class, timeout, failed-login, selftest and protocol tests; no live connection. |
+| `tests/test_ssh_probe.py` | SSH policy, scope, per-host port, failure-class, timeout, status-line parsing, keyhash-state, selftest and protocol tests; no live connection. |
 | `tests/test_bookstack.py` | BookStack allowlist, scope-gate, token-leak, configuration, timeout and protocol tests against a loopback stub; no live wiki. |
 | `tests/test_host_report.py` | Digest formatting tests: ordering, the 20-minute stale boundary, every sustained threshold including the core-relative load rule, SSH lines and truncation. |
 | `tests/test_discord_inbound.py` | Inbound transport, per-source allowlist, cursor/dedupe isolation, reply routing, transcript framing, unsent retry, debug-flag, length, queue, refusal-path, single-flight lock, busy-line and timeout tests; no network or model required. |
@@ -360,40 +360,59 @@ password, DSN and wallet path is reduced to `oracle error ORA-01017`.
 
 ## SSH health (MCP)
 
-The `notify` agent can check SSH reachability, key authentication and recent
-failed logins per host. It calls a second local MCP server, `mcp/ssh_probe.py`.
-OpenCode names an MCP tool `<server>_<tool>`, so the server's `probe` tool is
-reached as `ssh_probe`.
+The `notify` agent can check SSH reachability, key authentication and per-host
+status. It calls a second local MCP server, `mcp/ssh_probe.py`. OpenCode names
+an MCP tool `<server>_<tool>`, so the server's `probe` tool is reached as
+`ssh_probe`.
 
 The tool takes `{"hosts": ["a.example", "b.example"]}` or a single
 `{"host": "a.example"}`. Every requested host gets one result:
 
-- `status: "ok"` with `latency_ms`, `message: "connected"` and
-  `failed_logins`;
+- `status: "ok"` with `latency_ms`, `message: "connected"` and the fields from
+  the host's status line: `failed_logins`, `logins`, `keyhash`, `keys_changed`,
+  `reboot_required` and `outdated_images`;
 - `status: "timeout"`, `"refused"`, `"unreachable"` (including DNS),
   `"auth_refused"` or `"error"`, with a short secret-free message;
 - `status: "not_allowed"` or `"out_of_scope"` when policy refuses the host
   before any socket is opened;
 - `status: "not_configured"` when SSH is not configured.
 
-The failed-login count comes from exactly one fixed, read-only command, defined
-as a constant in the module and never built from tool arguments or model text:
+On every host the probe key is forced, by sshd, to
+`/usr/local/bin/ssh-status.sh`. A forced command replaces the command the client
+asks for, so the probe's fixed `STATUS_COMMAND` is never executed there; the
+forced script runs and prints exactly one line:
 
-```sh
-journalctl --unit=ssh --unit=sshd --since=-1h --no-pager --output=cat
+```
+fails|logins|keyhash|reboot|images
 ```
 
-The count of lines containing `Failed password` is made locally from that
-output, so `journalctl`'s exit status still distinguishes a readable journal
-from a refused one. The command runs over the same authenticated session the
-probe already opened and has its own short timeout (3 seconds), kept inside the
-host's probe budget. The probe key is unprivileged, so on a host where the
-journal is not readable the command fails and the result carries
-`failed_logins: null` with `failed_logins_reason: "unreadable"`; a command
-timeout gives `"timeout"`, and a missing `journalctl` or output too large to
-count gives `"unavailable"`. A null count is never reported as `0`. The command
-is code, so the tool still runs no caller-supplied command, and a model error
-or prompt injection cannot turn a refused host into a connection attempt.
+`fails` is the failed-password count for the day, `logins` is the
+accepted-login breakdown such as `media(71),root(10),ross(48)`, `keyhash` is a
+12-character hash of every `authorized_keys`, `reboot` is `yes`/`no`, and
+`images` is either `not-checked` or a count and the stale image names such as
+`2 gluetun storage-watchtower`. The probe parses that one line over the same
+authenticated session it already opened, after a short timeout (3 seconds)
+kept inside the host's probe budget. The agent can therefore produce its own
+08:00 SSH daily from `ssh_probe` alone, with no shell script reaching into the
+fleet.
+
+`failed_logins` is the first field as an integer. A missing or unparseable line
+leaves the status fields `null` with `failed_logins_reason` set to one of
+`unreadable` (non-zero command status), `timeout`, `unavailable` (the status
+script is missing, or the output is too large to read) or `malformed` (not
+exactly the five-field line). A null count is never reported as `0`, and a
+genuine zero is reported as `0`. The requested command is code and accepts no
+caller text, so a model error or prompt injection cannot turn a refused host
+into a connection attempt and cannot choose the remote command.
+
+`keys_changed` compares `keyhash` with the last hash seen for that host in
+`$XDG_STATE_HOME/notify-agent/ssh_host_keys.json` (the image sets
+`XDG_STATE_HOME` to `/home/agent/.local/state`; an unset value falls back to
+`~/.local/state`). The directory is created `0700` and the file `0600`, and the
+file is replaced atomically. A first sighting is `false` and a different hash is
+`true`. A missing, corrupt or unreadable state file is treated as a first
+sighting and never fails the probe; the state directory is ephemeral, so a
+recreated container starts fresh. `keyhash` is a hash, never key material.
 
 A failure for one host never fails the call or hides the others. Each host has
 a timeout (`SSH_TIMEOUT_SECONDS`, default 5) and the whole call has a deadline
@@ -468,9 +487,9 @@ user, key path or key material.
 
 The image has no `openssh-client`. The probe uses **paramiko**, pinned with its
 direct dependencies in the `Dockerfile`, so SSH stays in Python and no local
-shell or subprocess is involved. The one journal command is sent as a fixed
-string over the authenticated channel and executed by the remote server; the
-container itself runs no command.
+shell or subprocess is involved. The one status command is sent as a fixed
+string over the authenticated channel and is then replaced by the host's forced
+`ssh-status.sh`; the container itself runs no command.
 
 ### SSH environment
 
@@ -1547,7 +1566,7 @@ These are enforced in `compose.yaml`, not conventions:
 | Secrets | `env_file: stack.env` only, mode 0600 on the host, gitignored; wallet and SSH key live on the host and are mounted `:ro` |
 | Agent tools | deny-by-default; only `/app/scripts/notify.sh -m ...`, `/app/scripts/notify.sh -t ... -m ...`, one `/bin/sleep 5` retry pause, and the MCP tools `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read` are allowed |
 | Oracle access | read-only database user; `query` allows one `SELECT`/`WITH` and `search_content` runs one fixed indexed query; both cap rows/chunks and response size, and apply a 15-second timeout |
-| SSH access | key-authenticated, read-only probe; two host boundaries (global allowlist and run scope) are applied before any socket; policy refusals name the host and never connect; exactly one fixed read-only journal command runs, never caller-supplied text |
+| SSH access | key-authenticated, read-only probe; two host boundaries (global allowlist and run scope) are applied before any socket; policy refusals name the host and never connect; exactly one fixed read-only command is requested and the host's forced `ssh-status.sh` answers with one status line, never caller-supplied text |
 | Runbook access | read-only BookStack API, one dedicated token per instance; per-target instances: a target needs `allow_runbooks: true`, a `bookstack` object (`https` url, books and a token suffix), and a configured `BOOKSTACK_TOKEN_ID_<SUFFIX>` / `BOOKSTACK_TOKEN_SECRET_<SUFFIX>` pair; only that target's URL, books and resolved pair are exported for the run; `admin-chat` points at the Vortex instance with all six of its books and the `vortex` credential, `automations` at the operator's instance with `runbooks` and the `operator` credential, and neither can reach the other's instance or borrow its token; a target without a grant, an instance or a resolvable pair refuses both tools before any request; exactly the books in that target's list can be searched or read, and per-book search means another book is never even fetched; a missing slug is skipped, not fatal; a forbidden page and a missing page share one refusal; redirects refused; token never in a URL, log or error; `allow_content: false` still gates the operator's CMS, not the target's own runbooks |
 | Delivery guard | `notify.sh` refuses a scoped target's message when it names a host outside that target's `host_scope`, before any request |
 | OpenCode sharing | disabled; snapshots and autoupdate disabled |
@@ -1575,7 +1594,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Call the shell only through the two allowed forms `/app/scripts/notify.sh -m ...` and `/app/scripts/notify.sh -t ... -m ...`, plus one `/bin/sleep 5` between a failed `oracle_query` call and its retry.
 - Call `oracle_query` with a single read-only `SELECT`/`WITH` statement against the host-statistics objects.
 - Call `search_content` to read short chunks from the published-content index.
-- Call `ssh_probe` with hosts that are both in `SSH_ALLOWED_HOSTS` and inside the run's delivery scope. The probe opens a key-authenticated SSH session, runs exactly one fixed read-only journal command for the failed-login count, and closes it. It never runs caller-supplied text. A host outside either boundary is refused before a socket is opened.
+- Call `ssh_probe` with hosts that are both in `SSH_ALLOWED_HOSTS` and inside the run's delivery scope. The probe opens a key-authenticated SSH session, requests exactly one fixed read-only command that the host's forced `ssh-status.sh` replaces with the status line, parses that line, and closes the session. It never runs caller-supplied text. A host outside either boundary is refused before a socket is opened.
 - Call `bookstack_search` and `bookstack_read` against exactly the books in the target's `bookstack.books` list, and only when the run was explicitly granted that target's instance. A page outside that list, a missing page and an ambiguous slug are refused with the same message. Every other run refuses both tools before any request.
 - Write only to the named volume and tmpfs.
 - When the inbound listener is enabled, read the configured channels through Composio tool execution (`DISCORDBOT_LIST_MESSAGES`) using each source's bot connection. The listener itself never gives the agent an arbitrary command: it only invokes the fixed `opencode run --agent notify` command with a filtered instruction.
@@ -1590,7 +1609,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 - Write the schedule file: it is bind-mounted read-only.
 - Gain capabilities or new privileges.
 - Browse the web, read repository files, spawn subagents, or run arbitrary shell commands: the `notify` agent denies every tool except the two `notify.sh` forms, the two Oracle tools and `ssh_probe`.
-- Use the SSH key outside the probe: the key is invoked only by `ssh_probe`, with a fixed user and port, and the probe runs only its fixed journal command. It cannot probe a host outside the global allowlist or the selected target's scope.
+- Use the SSH key outside the probe: the key is invoked only by `ssh_probe`, with a fixed user and port, and the probe requests only its fixed status command, which the host's forced command replaces. It cannot probe a host outside the global allowlist or the selected target's scope, and the probe cannot run a command of its choosing.
 - Send a message to a scoped target if it names a host outside that target's `host_scope`: `notify.sh` refuses before any request. The guard is exact-name based, so figures without a hostname are a prompt-level risk, not a code-level one.
 - Read published content when the selected target sets `allow_content: false`: `run-prompt.sh` exports `NOTIFY_CONTENT_DISABLED=1` and the MCP server refuses `search_content` before it connects.
 - Read a wiki page outside the target's `bookstack.books` list, including the deployment inventory: the server checks the page's book before returning text, searches per allowed book, and answers a forbidden page and a missing page identically. It cannot discover that another book or page exists. A run cannot reach another target's instance at all: only that target's URL is exported.
@@ -1601,7 +1620,7 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 
 - **Prompt injection.** The operator prompt is trusted, but text pasted into it may not be. A manipulated model can still send a misleading message and can echo content present in its prompt. It cannot read files, browse, or run arbitrary commands. Do not put secrets in schedule prompts. The same applies to every value returned by `oracle_query`, `oracle_search_content` or `ssh_probe`: the prompt tells the model to treat those values as data, never as instructions.
 - **Destination leak.** A rossmoney host must not reach the Vortex `admin-chat`. The hard guard is in `notify.sh`: a scoped target refuses a message that names a host outside its `host_scope`, before any request. `ssh_probe` also refuses out-of-scope hosts, so the model cannot receive a rossmoney result in an admin-chat run. The exact-name guard does not catch a figure without a hostname, an IP address, a bare label, or an obfuscated name; those remain prompt-level risks. The guard is intentionally strict and also refuses unrelated domains in a scoped message.
-- **SSH access.** The probe uses one unprivileged key, mounted read-only, and authenticates only to allowlisted hosts within the run scope. It runs only one fixed read-only journal command, so a compromised model cannot use it as a shell. Host keys are not pinned (`AutoAddPolicy`), so the probe reports reachability, not host identity; an on-path attacker could answer the handshake, but cannot recover the private key.
+- **SSH access.** The probe uses one unprivileged key, mounted read-only, and authenticates only to allowlisted hosts within the run scope. The key is forced to `ssh-status.sh` on every host, so the probe receives one status line and cannot use it as a shell. Host keys are not pinned (`AutoAddPolicy`), so the probe reports reachability, not host identity; an on-path attacker could answer the handshake, but cannot recover the private key.
 - **Inbound message injection.** An allowlisted human's reply becomes an instruction to an agent with database access. The allowlist is the boundary: a non-allowlisted author, a bot, a webhook, a different channel, a duplicate, an over-long message or a mentions-only message never reaches the agent. An allowlisted human can still phrase a request that produces a bad answer or a wide read, exactly as they could by editing a schedule. The agent remains read-only and can still only send through `notify.sh`. The listener never passes the raw Discord payload: it strips mentions, caps length, and wraps the text in a fixed instruction. If the allowlist is too broad, the exposure is too broad.
 - **Database access.** The Oracle user is read-only and limited to host statistics plus the published-content index. A compromised model can read those and cannot write. It cannot read arbitrary CMS tables. The wallet is mounted read-only, so the process cannot modify it.
 - **Content retrieval.** The index contains published material and short chunks of it leave the host for the model provider during a content question, exactly as host statistics do for a metrics question. Retrieved chunks are untrusted data and are truncated, but they are still readable by the provider.
@@ -1650,8 +1669,8 @@ Verified while building this branch:
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
 - `tests/test_notify_guard.py` covers the `NOTIFY_REQUIRE_FLAG=1` delivery guard with a fake `curl` that records what it would have sent: a message without `[!]` writes no request, writes no send marker and exits 0; a message with `[!]` is delivered; a refused send makes no request even with a webhook configured, proving the guard runs before any delivery; unset, `0`, `true` and empty keep the old behaviour for both flagged and unflagged messages; and a `[!]` that only appears beyond the 2,000-character truncation point does not count, because the guard inspects the message that would be sent.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **461 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
-- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; a host in `NOTIFY_HOST_TAILNET` dialled at that address while an absent host is dialled by name and the result still reports the panel name; a hostname target dialled the same way; a refused host with an address still refused before any connection; tailnet map keys normalised; a malformed tailnet map, including a malformed hostname target, failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The failed-login tests cover a successful count over the one fixed command on the session the probe opened, a readable journal with zero failures reported as `0`, an unreadable journal and a missing `journalctl` yielding `null` with a reason, a command read timeout and a command that never finishes, a truncated journal refused rather than undercounted, a failed connect running no command, and a result that contains neither journal text nor the command. No live SSH connection was made.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **490 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
+- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; a host in `NOTIFY_HOST_TAILNET` dialled at that address while an absent host is dialled by name and the result still reports the panel name; a hostname target dialled the same way; a refused host with an address still refused before any connection; tailnet map keys normalised; a malformed tailnet map, including a malformed hostname target, failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The status-line tests cover a good line parsed into every field, a `yes` reboot and `not-checked` images, a short or empty line refused without inventing values, a malformed line refused as a whole, the last non-empty line winning over a banner, absent optional fields staying null, an invalid keyhash not becoming a baseline, and a result carrying the whole line alongside the existing fields. The keyhash-state tests cover first sighting `false`, the same hash `false`, a changed hash `true` and the new baseline, a per-host baseline, a `0600` file under `0700` in `XDG_STATE_HOME`, a corrupt state file treated as a first sighting and rewritten, bad entries cleaned, a missing hash giving `keys_changed: null`, and an unwritable state directory never failing the probe. The read tests cover the fixed command and its own timeout on the session the probe opened, a readable zero, an unreadable line, a read timeout and a command that never finishes, a missing status script, oversized output refused rather than truncated, non-status output reported as `malformed`, no key path or command text in the result, a connector unable to smuggle text into the count fields, and a failed connect running no command. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order including the CPU core count, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each sustained threshold at the boundary and one below (average CPU 60, average memory 85, latest disk 95, average load at twice the core count), the load rule on the average with a known count and never with a null one, a huge load peak with a modest average flagging nothing, the same absolute average being fine on a 4-core host, the absence of any CPU-peak or load-peak flag, the inline flag text and its order, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-preflight.sh` passes against a stub MCP server and the real `notify.sh` with a stubbed `curl`: a transient self-test failure is logged with its safe reason, retried once and the run continues to `opencode`; a persistent failure runs exactly two preflights, does not start `opencode`, and sends exactly one message to the configured target through `notify.sh`, with no statistics and no environment leak; host-like wallet filenames are masked so the target's `host_scope` guard still allows the failure message; and the healthy path keeps one handshake and one self-test.
 - `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The CMS case resolves `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` from the panel `hosts` array, and a panel without hosts clears an inherited map of each while an unset URL keeps the environment maps verbatim. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
