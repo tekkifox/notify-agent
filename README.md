@@ -425,6 +425,23 @@ probe is validated strictly like `NOTIFY_HOST_PORTS`, naming only the variable
 and never a value. The preference order is the tailnet target, then the panel
 name.
 
+A deployment that runs the agent on one of the hosts it probes can set
+`NOTIFY_LOCAL_HOST` to that host's panel name. When the marker is set and the
+requested host equals it, the probe dials the container's default gateway
+instead of the tailnet target: inside a Docker bridge network the default
+gateway is the host, and it is read from `/proc/net/route` rather than
+hard-coded because the bridge subnet changes when the stack is recreated. The
+host keeps its own port from `NOTIFY_HOST_PORTS`, and the result still reports
+the host's own name, so the digest shape is unchanged. This is what makes the
+agent's own host probe succeed: a host cannot reach its own tailnet address
+from inside its container (a hairpin), even though every other host can. The
+marker is matched after normalisation and only changes the destination for
+that one host; a host that is not the marker is never dialled at the gateway.
+When the marker is unset, behaviour is exactly as before. A malformed marker
+fails startup naming only the variable. The deployment must set the variable
+on the notify-agent stack; it is not derived from the hostname, because the
+container hostname and compose service name do not carry the panel name.
+
 ### Two host boundaries, enforced in code
 
 Before any connection is attempted, the tool applies two checks:
@@ -467,6 +484,7 @@ container itself runs no command.
 | `SSH_PORT` | no | Default SSH port for hosts without an entry in `NOTIFY_HOST_PORTS`; default 22 |
 | `NOTIFY_HOST_PORTS` | no | Optional JSON object of `{"host": port}` set by the run from the CMS `hosts` array; a per-host port overrides `SSH_PORT` |
 | `NOTIFY_HOST_TAILNET` | no | Optional JSON object of `{"host": "<ipv4-or-hostname>"}` set by the run from the CMS `hosts` array; a host with an entry is dialled at that target instead of its panel name |
+| `NOTIFY_LOCAL_HOST` | no | Panel name of the host the agent runs on; that exact host is dialled at the container's default gateway (derived from `/proc/net/route`) instead of its tailnet target, with its own port from `NOTIFY_HOST_PORTS` |
 | `SSH_KEY_HOST_FILE` | compose only | Host path bind-mounted read-only at `/ssh/id_ed25519`; set in `.env` or the shell, not `stack.env` |
 | `HOST_REPORT_HOSTS` | no | Ordered known-host list for the digest; default `host1.example.com,host2.example.com,host3.example.com` |
 
