@@ -322,6 +322,20 @@ class TailnetTests(unittest.TestCase):
         self.assertEqual(client.connect_kwargs["hostname"], "203.0.113.10")
         self.assertEqual(client.connect_kwargs["port"], 2222)
 
+    def test_host_with_a_tailnet_hostname_is_dialled_there(self) -> None:
+        settings = SETTINGS._replace(
+            host_tailnets=(("host1.example.com", "host.example.ts.net"),),
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host1.example.com"], settings)
+
+        self.assertEqual(payload["results"][0]["status"], "ok")
+        self.assertEqual(payload["results"][0]["host"], "host1.example.com")
+        self.assertEqual(
+            client.connect_kwargs["hostname"], "host.example.ts.net"
+        )
+
     def test_host_without_a_tailnet_address_is_dialled_by_name(self) -> None:
         client = ParamikoClient()
         with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
@@ -368,7 +382,8 @@ class TailnetTests(unittest.TestCase):
                 "SSH_KEY_PATH": key.name,
                 "NOTIFY_HOST_TAILNET": (
                     '{"HOST1.Example.COM.":"203.0.113.10",'
-                    '"host2.example.com":" 203.0.113.11 "}'
+                    '"host2.example.com":" 203.0.113.11 ",'
+                    '"host3.example.com":"HOST.example.ts.net"}'
                 ),
             }
             with mock.patch.dict(os.environ, env, clear=True):
@@ -378,15 +393,17 @@ class TailnetTests(unittest.TestCase):
             (
                 ("host1.example.com", "203.0.113.10"),
                 ("host2.example.com", "203.0.113.11"),
+                ("host3.example.com", "HOST.example.ts.net"),
             ),
         )
 
     def test_malformed_tailnet_map_fails_naming_the_variable_only(self) -> None:
+        long_label = "a" * 64
+        long_name = ".".join(["a" * 63] * 4)  # 255 characters
         cases = (
             "not json",
             "[]",
             '"host1.example.com"',
-            '{"host1.example.com":"not-an-ip"}',
             '{"host1.example.com":"999.1.1.1"}',
             '{"host1.example.com":"203.0.113"}',
             '{"host1.example.com":"203.0.113.10.1"}',
@@ -395,6 +412,15 @@ class TailnetTests(unittest.TestCase):
             '{"host1.example.com":null}',
             '{"bad host":"203.0.113.10"}',
             '{"host1.example.com":"203.0.113.10","bad host":"203.0.113.11"}',
+            '{"host1.example.com":"-bad.example.ts.net"}',
+            '{"host1.example.com":"bad-.example.ts.net"}',
+            '{"host1.example.com":"bad..example.ts.net"}',
+            '{"host1.example.com":"bad_host.example.ts.net"}',
+            '{"host1.example.com":"host.example.ts.net."}',
+            '{"host1.example.com":"host.example.ts.net:22"}',
+            '{"host1.example.com":"https://host.example.ts.net"}',
+            f'{{"host1.example.com":"{long_label}.example.ts.net"}}',
+            f'{{"host1.example.com":"{long_name}"}}',
         )
         with tempfile.NamedTemporaryFile() as key:
             for raw in cases:

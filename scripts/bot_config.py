@@ -9,8 +9,8 @@ module is the single resolver both delivery paths use:
   ``NOTIFY_INBOUND_SOURCES`` for inbound replies.
 * both need ``NOTIFY_HOST_PORTS`` so ``mcp/ssh_probe.py`` dials a host's own
   SSH port instead of the single global one, and ``NOTIFY_HOST_TAILNET`` so a
-  host recorded with a tailnet address is dialled there instead of by its
-  public panel name.
+  host recorded with a tailnet target (an address or a MagicDNS name) is
+  dialled there instead of by its public panel name.
 
 Precedence is CMS, then the last good cached copy, then the environment.  The
 resolver never raises for a CMS problem: a website outage must not silence the
@@ -18,9 +18,10 @@ resolver never raises for a CMS problem: a website outage must not silence the
 values unchanged, so the feature is enabled and disabled by one variable.
 
 The CMS ``hosts`` array is optional so an older panel still works.  Each entry
-is ``{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<ipv4>"}``; ``tailnet``
-is optional too.  A malformed entry is dropped individually and counted in the
-one-line source log; a malformed optional tailnet address is dropped without
+is ``{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<target>"}``;
+``tailnet`` is optional too, and its target is an IPv4 dotted quad or a
+hostname.  A malformed entry is dropped individually and counted in the
+one-line source log; a malformed optional tailnet target is dropped without
 discarding the host's port, and never invalidates the rest of the document or
 changes which hosts are permitted.  The tailnet map is emitted as
 ``NOTIFY_HOST_TAILNET`` and is consulted only after the allowlist and run scope
@@ -93,6 +94,32 @@ _IPV4 = re.compile(
     r"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}"
     r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 )
+
+# A tailnet target may also be a hostname (a MagicDNS name).  Each dot-separated
+# label is letters, digits and hyphens, 1-63 characters, with no leading or
+# trailing hyphen; the whole name is at most 253 characters.  A trailing dot,
+# a scheme or a port is not a dial target and is refused rather than guessed at.
+_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME = re.compile(
+    r"^(?=.{1,%d}$)%s(?:\.%s)*$"
+    % (MAX_HOST_CHARS, _HOST_LABEL, _HOST_LABEL)
+)
+
+# A value made only of digits and dots is an address candidate, not a name.
+# If it is not a valid dotted quad it is refused rather than reinterpreted as
+# a hostname, so a mistyped address is never quietly dialled as a name.
+_NUMERIC_ADDRESS = re.compile(r"^[0-9.]+$")
+
+
+def _is_tailnet_target(value: str) -> bool:
+    """True when ``value`` is an IPv4 dotted quad or a hostname."""
+
+    if _IPV4.match(value):
+        return True
+    if _NUMERIC_ADDRESS.match(value):
+        return False
+    return bool(_HOSTNAME.match(value))
+
 
 TARGETS_SHAPE_ERROR = (
     "NOTIFY_TARGETS must be a JSON object mapping names to objects with a "
@@ -368,23 +395,23 @@ def _usable_host_port(entry: object) -> tuple[str, int] | None:
 
 
 def _usable_tailnet(entry: object) -> str | None:
-    """Return one validated IPv4 tailnet address, or None to drop it.
+    """Return one validated tailnet target, or None to drop it.
 
-    ``tailnet`` is optional.  A value that is not an IPv4 dotted quad is
-    dropped without discarding the host's port entry; a missing value is not
-    an error either.  The address is kept verbatim apart from surrounding
-    whitespace.
+    ``tailnet`` is optional.  A value is usable when it is either an IPv4
+    dotted quad or a hostname; anything else is dropped without discarding the
+    host's port entry, and a missing value is not an error either.  The target
+    is kept verbatim apart from surrounding whitespace.
     """
 
     if not isinstance(entry, dict):
         return None
-    address = entry.get("tailnet")
-    if not isinstance(address, str):
+    target = entry.get("tailnet")
+    if not isinstance(target, str):
         return None
-    address = address.strip()
-    if not _IPV4.match(address):
+    target = target.strip()
+    if not _is_tailnet_target(target):
         return None
-    return address
+    return target
 
 
 def _validate_hosts(
@@ -416,9 +443,9 @@ def _validate_hosts(
             continue
         host, port = pair
         mapping[host] = port
-        address = _usable_tailnet(entry)
-        if address is not None:
-            tailnets[host] = address
+        target = _usable_tailnet(entry)
+        if target is not None:
+            tailnets[host] = target
     return mapping, tailnets, len(hosts), dropped
 
 

@@ -53,14 +53,15 @@ startup: a malformed map fails loudly while naming the variable, and no value
 is echoed. A map entry never widens the allowlist or the run scope: the port
 decides where to dial, never which hosts are permitted.
 
-``NOTIFY_HOST_TAILNET`` is an optional JSON object of ``{"host": "<ipv4>"}``
-set by the run from the CMS. When a host has an entry there, the probe dials
-that address instead of the panel name; the panel name is still the only thing
-the allowlist and run scope are matched against, and it is still the name a
-result reports. A host without an entry is dialled by name exactly as before.
-The address decides where to dial, never which hosts are permitted. The map is
-validated strictly at startup like the port map, naming only the variable.
-Preference order is the tailnet address, then the panel name.
+``NOTIFY_HOST_TAILNET`` is an optional JSON object of
+``{"host": "<ipv4-or-hostname>"}`` set by the run from the CMS. When a host has
+an entry there, the probe dials that target instead of the panel name; the
+panel name is still the only thing the allowlist and run scope are matched
+against, and it is still the name a result reports. A host without an entry is
+dialled by name exactly as before. The target decides where to dial, never
+which hosts are permitted. The map is validated strictly at startup like the
+port map, naming only the variable. Preference order is the tailnet target,
+then the panel name.
 
 ``SSH_USER`` and ``SSH_KEY_PATH`` are required to probe. If either is absent,
 or the key file is not readable, the tool returns ``configured: false`` with a
@@ -128,8 +129,9 @@ HOST_SCOPE_ENV = "NOTIFY_HOST_SCOPE"
 HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
 
 # Set by run-prompt.sh / discord_inbound.py from the CMS hosts array. JSON
-# object of host to IPv4 address. Optional: without an entry a host is dialled
-# by its panel name. Keys are always panel names, never addresses.
+# object of host to a tailnet target (an IPv4 address or a MagicDNS hostname).
+# Optional: without an entry a host is dialled by its panel name. Keys are
+# always panel names, never addresses.
 HOST_TAILNET_ENV = "NOTIFY_HOST_TAILNET"
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
@@ -177,12 +179,38 @@ HOST_PATTERN = re.compile(
     % MAX_HOST_CHARS
 )
 
-# A tailnet target must be an IPv4 dotted quad.  Leading zeros and
-# out-of-range octets are refused rather than guessed at.
+# A tailnet target must be an IPv4 dotted quad or a hostname.  Leading zeros
+# and out-of-range octets are refused rather than guessed at.
 IPV4_PATTERN = re.compile(
     r"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}"
     r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 )
+
+# A hostname target is dot-separated labels of letters, digits and hyphens,
+# 1-63 characters each, with no leading or trailing hyphen, and at most 253
+# characters overall.  A trailing dot, a scheme or a port is refused: none of
+# them is a dial target.
+HOST_LABEL_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+HOSTNAME_PATTERN = re.compile(
+    r"^(?=.{1,%d}$)%s(?:\.%s)*$"
+    % (MAX_HOST_CHARS, HOST_LABEL_PATTERN, HOST_LABEL_PATTERN)
+)
+
+# A value made only of digits and dots is an address candidate, not a name.
+# If it is not a valid dotted quad it is refused rather than reinterpreted as
+# a hostname, so a mistyped address is never quietly dialled as a name.
+NUMERIC_ADDRESS_PATTERN = re.compile(r"^[0-9.]+$")
+
+
+def _is_tailnet_target(value: str) -> bool:
+    """True when ``value`` is an IPv4 dotted quad or a hostname."""
+
+    if IPV4_PATTERN.match(value):
+        return True
+    if NUMERIC_ADDRESS_PATTERN.match(value):
+        return False
+    return bool(HOSTNAME_PATTERN.match(value))
+
 
 TOOL = {
     "name": "probe",
@@ -291,8 +319,9 @@ class Settings(NamedTuple):
     allowed_hosts: tuple[str, ...]
     # Validated (host, port) pairs. Empty means every host uses ``port``.
     host_ports: tuple[tuple[str, int], ...] = ()
-    # Validated (panel name, IPv4 address) pairs. Empty means every host is
-    # dialled by its panel name; the name stays the policy and result key.
+    # Validated (panel name, tailnet target) pairs. Empty means every host is
+    # dialled by its panel name; the name stays the policy and result key. A
+    # target is an IPv4 address or a hostname.
     host_tailnets: tuple[tuple[str, str], ...] = ()
 
 
@@ -399,10 +428,11 @@ def _port_for(host: str, settings: Settings) -> int:
 def _host_tailnets() -> tuple[tuple[str, str], ...]:
     """Parse NOTIFY_HOST_TAILNET strictly, naming the variable only.
 
-    The map is keyed by panel name and valued by IPv4 address. A malformed map
-    or address is a configuration error, not something to half-apply: a wrong
-    destination is invisible until a probe fails, so refusing to start beats
-    guessing. No host or address value is echoed in the message.
+    The map is keyed by panel name and valued by an IPv4 address or a
+    hostname. A malformed map or target is a configuration error, not
+    something to half-apply: a wrong destination is invisible until a probe
+    fails, so refusing to start beats guessing. No host or target value is
+    echoed in the message.
     """
 
     raw = _env(HOST_TAILNET_ENV)
@@ -412,46 +442,50 @@ def _host_tailnets() -> tuple[tuple[str, str], ...]:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
         raise ConfigError(
-            f"{HOST_TAILNET_ENV} must be a JSON object of host to IPv4 address",
+            f"{HOST_TAILNET_ENV} must be a JSON object of host to tailnet target",
             not_configured=False,
         ) from None
     if not isinstance(parsed, dict):
         raise ConfigError(
-            f"{HOST_TAILNET_ENV} must be a JSON object of host to IPv4 address",
+            f"{HOST_TAILNET_ENV} must be a JSON object of host to tailnet target",
             not_configured=False,
         )
 
     entries: dict[str, str] = {}
-    for name, address in parsed.items():
+    for name, target in parsed.items():
         host = _canonical(name) if isinstance(name, str) else ""
         if not host or not HOST_PATTERN.match(host):
             raise ConfigError(
                 f"{HOST_TAILNET_ENV} contains an invalid host name",
                 not_configured=False,
             )
-        if not isinstance(address, str) or not IPV4_PATTERN.match(
-            address.strip()
-        ):
+        if not isinstance(target, str):
             raise ConfigError(
-                f"{HOST_TAILNET_ENV} addresses must be IPv4 dotted quads",
+                f"{HOST_TAILNET_ENV} targets must be IPv4 addresses or hostnames",
                 not_configured=False,
             )
-        entries[host] = address.strip()
+        target = target.strip()
+        if not _is_tailnet_target(target):
+            raise ConfigError(
+                f"{HOST_TAILNET_ENV} targets must be IPv4 addresses or hostnames",
+                not_configured=False,
+            )
+        entries[host] = target
     return tuple(entries.items())
 
 
 def _dial_for(host: str, settings: Settings) -> str:
-    """Return the tailnet address for a panel name, or the name itself.
+    """Return the tailnet target for a panel name, or the name itself.
 
     Only the destination changes. ``host`` remains the policy key and the name
-    a result reports, so an address can never widen the allowlist or the run
+    a result reports, so a target can never widen the allowlist or the run
     scope.
     """
 
     canonical = _canonical(host)
-    for name, address in settings.host_tailnets:
+    for name, target in settings.host_tailnets:
         if _canonical(name) == canonical:
-            return address
+            return target
     return host
 
 
@@ -773,9 +807,9 @@ def _probe_with_paramiko(
     """Open one key-authenticated session, then run the fixed journal command.
 
     A completed handshake plus public-key authentication is the health signal.
-    The destination is the host's tailnet address when the map has one, and
-    its panel name otherwise; the panel name remains the policy key and the
-    name the result reports. Once the session is open, exactly one read-only
+    The destination is the host's tailnet target when the map has one, and its
+    panel name otherwise; the panel name remains the policy key and the name
+    the result reports. Once the session is open, exactly one read-only
     command -- the module's fixed ``FAILED_LOGIN_COMMAND``, never caller or
     model text -- reads the SSH journal for the last hour. The journal read has
     its own short timeout, kept inside the host's remaining budget, and any
