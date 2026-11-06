@@ -323,6 +323,44 @@ class ResolverTests(unittest.TestCase):
             "config source=cms hosts=9 ssh_ports=8 dropped=1",
         )
 
+    def test_tailnet_hostnames_are_kept_and_malformed_ones_dropped(self) -> None:
+        long_label = "a" * 64
+        long_name = ".".join(["a" * 63] * 4)  # 255 characters
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222, "tailnet": "host.example.ts.net"},
+            {"name": "host2.example.com", "sshPort": 2200, "tailnet": "my-host.example.ts.net"},
+            {"name": "host3.example.com", "sshPort": 2201, "tailnet": "203.0.113.10"},
+            {"name": "host4.example.com", "sshPort": 2202, "tailnet": "-bad.example.ts.net"},
+            {"name": "host5.example.com", "sshPort": 2203, "tailnet": "bad-.example.ts.net"},
+            {"name": "host6.example.com", "sshPort": 2204, "tailnet": "bad..example.ts.net"},
+            {"name": "host7.example.com", "sshPort": 2205, "tailnet": "bad_host.example.ts.net"},
+            {"name": "host8.example.com", "sshPort": 2206, "tailnet": "host.example.ts.net."},
+            {"name": "host9.example.com", "sshPort": 2207, "tailnet": "host.example.ts.net:22"},
+            {"name": "host10.example.com", "sshPort": 2208, "tailnet": "https://host.example.ts.net"},
+            {"name": "host11.example.com", "sshPort": 2209, "tailnet": long_label + ".example.ts.net"},
+            {"name": "host12.example.com", "sshPort": 2210, "tailnet": long_name},
+        ]
+        with StubServer(
+            200, encode(document(hosts=hosts, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cms")
+        # A malformed name drops only itself: every host still keeps its port.
+        self.assertEqual(len(json.loads(resolution.host_ports_json)), 12)
+        self.assertEqual(
+            json.loads(resolution.host_tailnets_json),
+            {
+                "host1.example.com": "host.example.ts.net",
+                "host2.example.com": "my-host.example.ts.net",
+                "host3.example.com": "203.0.113.10",
+            },
+        )
+        self.assertEqual(
+            resolution.log_line,
+            "config source=cms hosts=12 ssh_ports=12",
+        )
+
     def test_host_ports_fall_back_to_the_environment(self) -> None:
         inherited = '{"env.example.com":2200}'
         inherited_tailnets = '{"env.example.com":"203.0.113.10"}'
