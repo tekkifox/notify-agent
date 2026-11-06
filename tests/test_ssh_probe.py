@@ -18,6 +18,7 @@ import json
 import os
 import pathlib
 import socket
+import stat
 import sys
 import tempfile
 import types
@@ -96,8 +97,8 @@ class _FakeStream:
         return self.payload[:size]
 
 
-class JournalClient:
-    """A fake SSH client whose only command is the fixed journal read."""
+class StatusClient:
+    """A fake SSH client whose only command is the fixed status read."""
 
     def __init__(self, payload=b"", exit_status=0, ready=True, read_error=None):
         self.channel = _FakeChannel(exit_status, ready)
@@ -109,7 +110,7 @@ class JournalClient:
         return io.BytesIO(), self.stream, io.BytesIO()
 
 
-class ParamikoClient(JournalClient):
+class ParamikoClient(StatusClient):
     """A fake paramiko SSHClient for the full _probe_with_paramiko path."""
 
     def __init__(self, connect_error=None, **kwargs):
@@ -650,113 +651,384 @@ class FailureTests(unittest.TestCase):
         self.assertNotIn("id_ed25519", text)
 
 
-class FailedLoginTests(unittest.TestCase):
-    def test_count_is_reported_alongside_the_existing_success_fields(self) -> None:
-        journal = (
-            b"Accepted publickey for agent from 203.0.113.10 port 51234 ssh2\n"
-            b"Failed password for invalid user admin from 203.0.113.10 port 51235 ssh2\n"
-            b"Failed password for root from 203.0.113.11 port 51236 ssh2\n"
-            b"Failed password for root from 203.0.113.12 port 51237 ssh2\n"
-        )
-        client = JournalClient(payload=journal)
-        count, reason = ssh_probe._read_failed_logins(client, 2.5)
-        self.assertEqual((count, reason), (3, None))
-        self.assertEqual(
-            client.commands, [(ssh_probe.FAILED_LOGIN_COMMAND, 2.5)]
-        )
-        self.assertEqual(client.channel.timeouts, [2.5])
-        self.assertEqual(client.channel.status_event.waits, [2.5])
+GOOD_LINE = (
+    "2|media(71),mgmt(24),notify-check(27),photos(73),portfolio(70),"
+    "root(10),ross(48),vortexservers(66)|59ba804d0837|no|"
+    "2 gluetun storage-watchtower"
+)
 
+
+class StateHomeMixin:
+    """Keep the keyhash state file inside a temporary XDG state home."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.state_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state_home.cleanup)
+        patcher = mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": self.state_home.name}, clear=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def state_path(self) -> str:
+        return ssh_probe._state_file_path()
+
+
+class StatusLineTests(StateHomeMixin, unittest.TestCase):
+    def test_a_good_line_is_parsed_into_every_field(self) -> None:
+        line = ssh_probe.parse_status_line(GOOD_LINE + "\n")
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 2)
+        self.assertEqual(
+            line.logins,
+            "media(71),mgmt(24),notify-check(27),photos(73),portfolio(70),"
+            "root(10),ross(48),vortexservers(66)",
+        )
+        self.assertEqual(line.keyhash, "59ba804d0837")
+        self.assertIs(line.reboot_required, False)
+        self.assertEqual(line.outdated_images, "2 gluetun storage-watchtower")
+
+    def test_not_checked_images_and_yes_reboot_are_kept(self) -> None:
+        line = ssh_probe.parse_status_line(
+            "0|notify-check(18),root(2),ross(79)|ccf7b3ebdad2|yes|not-checked"
+        )
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 0)
+        self.assertIs(line.reboot_required, True)
+        self.assertEqual(line.outdated_images, "not-checked")
+
+    def test_a_short_line_is_null_not_invented(self) -> None:
+        for text in (
+            "",
+            "\n\n",
+            "0|notify-check(22),root(18)",
+            "0|a|59ba804d0837|no",
+            "0",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ssh_probe.parse_status_line(text))
+
+    def test_a_malformed_line_is_refused_as_a_whole(self) -> None:
+        for text in (
+            "x|logins|59ba804d0837|no|not-checked",
+            "-1|logins|59ba804d0837|no|not-checked",
+            "1.5|logins|59ba804d0837|no|not-checked",
+            "0|logins|59ba804d0837|no|1 a|b",
+            "0|logins|59ba804d0837|no|1 a|b|c",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ssh_probe.parse_status_line(text))
+
+    def test_only_the_last_non_empty_line_is_used(self) -> None:
+        line = ssh_probe.parse_status_line(
+            "banner text\n" + GOOD_LINE + "\n\n"
+        )
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 2)
+
+    def test_absent_optional_fields_are_null(self) -> None:
+        line = ssh_probe.parse_status_line("0|||maybe|")
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 0)
+        self.assertIsNone(line.logins)
+        self.assertIsNone(line.keyhash)
+        self.assertIsNone(line.reboot_required)
+        self.assertIsNone(line.outdated_images)
+
+    def test_an_invalid_keyhash_is_not_a_comparison_baseline(self) -> None:
+        line = ssh_probe.parse_status_line(
+            "0|root(1)|NOT-A-HASH|no|not-checked"
+        )
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 0)
+        self.assertIsNone(line.keyhash)
+
+    def test_control_characters_cannot_reach_the_result(self) -> None:
+        line = ssh_probe.parse_status_line(
+            "0|root(1)\x1b[31m,ross(2)\x07|59ba804d0837|no|"
+            "1 bad\x00image\n"
+        )
+        self.assertIsNotNone(line)
+        self.assertEqual(line.logins, "root(1) [31m,ross(2)")
+        self.assertEqual(line.outdated_images, "1 bad image")
+
+    def test_an_overlong_status_field_is_refused(self) -> None:
+        line = ssh_probe.parse_status_line(
+            "0|root(1)|59ba804d0837|no|" + "x" * 600
+        )
+        self.assertIsNotNone(line)
+        self.assertIsNone(line.outdated_images)
+
+    def test_a_result_carries_the_whole_line_and_the_existing_fields(self) -> None:
+        line = ssh_probe.parse_status_line(GOOD_LINE)
         result = ssh_probe._outcome_result(
             "host1.example.com",
-            ssh_probe.Outcome("ok", 12, "connected", count, reason),
+            ssh_probe.Outcome(
+                "ok",
+                12,
+                "connected",
+                line.failed_logins,
+                None,
+                line.logins,
+                line.keyhash,
+                line.reboot_required,
+                line.outdated_images,
+            ),
             0.0,
         )
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["latency_ms"], 12)
         self.assertEqual(result["message"], "connected")
-        self.assertEqual(result["failed_logins"], 3)
+        self.assertEqual(result["failed_logins"], 2)
         self.assertNotIn("failed_logins_reason", result)
-
-    def test_a_readable_journal_with_no_failures_is_zero(self) -> None:
-        client = JournalClient(
-            payload=b"Accepted publickey for agent from 203.0.113.10 ssh2\n"
-        )
+        self.assertEqual(result["logins"], line.logins)
+        self.assertEqual(result["keyhash"], "59ba804d0837")
+        self.assertIs(result["keys_changed"], False)
+        self.assertIs(result["reboot_required"], False)
         self.assertEqual(
-            ssh_probe._read_failed_logins(client, 2.0), (0, None)
+            result["outdated_images"], "2 gluetun storage-watchtower"
         )
 
-    def test_unreadable_journal_is_null_with_a_reason(self) -> None:
-        client = JournalClient(payload=b"", exit_status=1)
-        self.assertEqual(
-            ssh_probe._read_failed_logins(client, 2.0),
-            (None, "unreadable"),
-        )
+    def test_a_malformed_line_leaves_the_count_null_with_a_reason(self) -> None:
         result = ssh_probe._outcome_result(
             "host1.example.com",
-            ssh_probe.Outcome("ok", 12, "connected", None, "unreadable"),
+            ssh_probe.Outcome("ok", 12, "connected", None, "malformed"),
             0.0,
         )
         self.assertEqual(result["status"], "ok")
         self.assertIsNone(result["failed_logins"])
-        self.assertEqual(result["failed_logins_reason"], "unreadable")
+        self.assertEqual(result["failed_logins_reason"], "malformed")
+        self.assertIsNone(result["logins"])
+        self.assertIsNone(result["keyhash"])
+        self.assertIsNone(result["keys_changed"])
+        self.assertIsNone(result["reboot_required"])
+        self.assertIsNone(result["outdated_images"])
 
-    def test_command_timeout_is_null_with_a_reason(self) -> None:
-        client = JournalClient(read_error=socket.timeout())
-        self.assertEqual(
-            ssh_probe._read_failed_logins(client, 2.0), (None, "timeout")
+    def test_a_failed_connection_has_no_status_fields(self) -> None:
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("timeout", None, "connection timed out", 3, None),
+            1.0,
+        )
+        for field in (
+            "failed_logins",
+            "failed_logins_reason",
+            "logins",
+            "keyhash",
+            "keys_changed",
+            "reboot_required",
+            "outdated_images",
+        ):
+            with self.subTest(field=field):
+                self.assertNotIn(field, result)
+
+
+class KeyHashStateTests(StateHomeMixin, unittest.TestCase):
+    def _result(self, host: str, keyhash: str) -> dict:
+        return ssh_probe._outcome_result(
+            host,
+            ssh_probe.Outcome(
+                "ok", 12, "connected", 0, None, "root(1)", keyhash, False,
+                "not-checked",
+            ),
+            0.0,
         )
 
-    def test_command_that_never_finishes_is_a_timeout(self) -> None:
-        client = JournalClient(payload=b"", ready=False)
-        self.assertEqual(
-            ssh_probe._read_failed_logins(client, 2.0), (None, "timeout")
+    def test_first_sighting_is_false_and_a_new_hash_is_true(self) -> None:
+        first = self._result("host1.example.com", "59ba804d0837")
+        self.assertIs(first["keys_changed"], False)
+        # The same hash on the next probe is not a change.
+        self.assertIs(
+            self._result("host1.example.com", "59ba804d0837")["keys_changed"],
+            False,
+        )
+        # A different hash is.
+        self.assertIs(
+            self._result("host1.example.com", "0e6fb55b3872")["keys_changed"],
+            True,
+        )
+        # ...and it becomes the new baseline.
+        self.assertIs(
+            self._result("host1.example.com", "0e6fb55b3872")["keys_changed"],
+            False,
         )
 
-    def test_missing_journalctl_is_unavailable_not_zero(self) -> None:
-        client = JournalClient(exit_status=127)
+    def test_each_host_has_its_own_baseline(self) -> None:
+        self.assertIs(
+            self._result("host1.example.com", "59ba804d0837")["keys_changed"],
+            False,
+        )
+        # A different host is a first sighting even with a different hash.
+        self.assertIs(
+            self._result("host2.example.com", "0e6fb55b3872")["keys_changed"],
+            False,
+        )
+        self.assertIs(
+            self._result("host1.example.com", "59ba804d0837")["keys_changed"],
+            False,
+        )
+
+    def test_the_state_file_is_private_and_under_xdg_state_home(self) -> None:
+        self._result("host1.example.com", "59ba804d0837")
+        self.assertTrue(os.path.isfile(self.state_path))
+        self.assertTrue(
+            self.state_path.startswith(os.path.join(self.state_home.name, ""))
+        )
         self.assertEqual(
-            ssh_probe._read_failed_logins(client, 2.0),
+            stat.S_IMODE(os.stat(self.state_path).st_mode), 0o600
+        )
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.dirname(self.state_path)).st_mode),
+            0o700,
+        )
+        saved = json.loads(pathlib.Path(self.state_path).read_text("utf-8"))
+        self.assertEqual(saved, {"host1.example.com": "59ba804d0837"})
+
+    def test_a_corrupt_state_file_is_a_first_sighting(self) -> None:
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        pathlib.Path(self.state_path).write_text("{not json", encoding="utf-8")
+        self.assertIs(
+            self._result("host1.example.com", "59ba804d0837")["keys_changed"],
+            False,
+        )
+        # The corrupt file was replaced, so the next sighting compares again.
+        self.assertIs(
+            self._result("host1.example.com", "0e6fb55b3872")["keys_changed"],
+            True,
+        )
+
+    def test_a_state_file_with_bad_entries_is_cleaned_not_trusted(self) -> None:
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        pathlib.Path(self.state_path).write_text(
+            json.dumps(
+                {
+                    "host1.example.com": "not-a-hash",
+                    "host2.example.com": 7,
+                    "host3.example.com": "59ba804d0837",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self._result("host1.example.com", "59ba804d0837")
+        self.assertIs(result["keys_changed"], False)
+        saved = json.loads(pathlib.Path(self.state_path).read_text("utf-8"))
+        self.assertEqual(saved["host1.example.com"], "59ba804d0837")
+        self.assertNotIn("host2.example.com", saved)
+
+    def test_a_missing_keyhash_has_no_keys_changed_answer(self) -> None:
+        result = ssh_probe._outcome_result(
+            "host1.example.com",
+            ssh_probe.Outcome("ok", 12, "connected", 0, None),
+            0.0,
+        )
+        self.assertIsNone(result["keyhash"])
+        self.assertIsNone(result["keys_changed"])
+
+    def test_an_unwritable_state_directory_never_fails_the_probe(self) -> None:
+        blocker = pathlib.Path(self.state_home.name) / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        with mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": str(blocker)}, clear=False
+        ):
+            result = self._result("host1.example.com", "59ba804d0837")
+        self.assertEqual(result["status"], "ok")
+        self.assertIs(result["keys_changed"], False)
+
+
+class StatusReadTests(StateHomeMixin, unittest.TestCase):
+    def test_the_fixed_command_is_the_only_one_and_uses_its_own_timeout(self) -> None:
+        client = StatusClient(payload=(GOOD_LINE + "\n").encode())
+        line, reason = ssh_probe._read_status_line(client, 2.5)
+        self.assertIsNone(reason)
+        self.assertIsNotNone(line)
+        self.assertEqual(line.failed_logins, 2)
+        self.assertEqual(client.commands, [(ssh_probe.STATUS_COMMAND, 2.5)])
+        self.assertEqual(client.channel.timeouts, [2.5])
+        self.assertEqual(client.channel.status_event.waits, [2.5])
+
+    def test_a_readable_line_with_no_failures_is_zero(self) -> None:
+        client = StatusClient(payload=b"0|root(1)|59ba804d0837|no|not-checked\n")
+        line, reason = ssh_probe._read_status_line(client, 2.0)
+        self.assertIsNone(reason)
+        self.assertEqual(line.failed_logins, 0)
+
+    def test_unreadable_line_is_null_with_a_reason(self) -> None:
+        client = StatusClient(payload=b"", exit_status=1)
+        self.assertEqual(
+            ssh_probe._read_status_line(client, 2.0),
+            (None, "unreadable"),
+        )
+
+    def test_a_read_timeout_is_null_with_a_reason(self) -> None:
+        client = StatusClient(read_error=socket.timeout())
+        self.assertEqual(
+            ssh_probe._read_status_line(client, 2.0), (None, "timeout")
+        )
+
+    def test_a_command_that_never_finishes_is_a_timeout(self) -> None:
+        client = StatusClient(payload=b"", ready=False)
+        self.assertEqual(
+            ssh_probe._read_status_line(client, 2.0), (None, "timeout")
+        )
+
+    def test_a_missing_status_command_is_unavailable_not_zero(self) -> None:
+        client = StatusClient(exit_status=127)
+        self.assertEqual(
+            ssh_probe._read_status_line(client, 2.0),
             (None, "unavailable"),
         )
 
-    def test_a_truncated_journal_is_null_not_an_undercount(self) -> None:
-        client = JournalClient(
-            payload=b"Failed password for root from 203.0.113.10 ssh2\n"
+    def test_oversized_output_is_unavailable_not_truncated(self) -> None:
+        client = StatusClient(
+            payload=b"0|root(1)|59ba804d0837|no|not-checked\n"
         )
-        with mock.patch.object(ssh_probe, "FAILED_LOGIN_MAX_BYTES", 16):
-            count, reason = ssh_probe._read_failed_logins(client, 2.0)
-        self.assertIsNone(count)
-        self.assertEqual(reason, "unavailable")
+        with mock.patch.object(ssh_probe, "STATUS_MAX_BYTES", 16):
+            self.assertEqual(
+                ssh_probe._read_status_line(client, 2.0),
+                (None, "unavailable"),
+            )
 
-    def test_the_count_never_leaks_journal_text_or_the_command(self) -> None:
-        journal = (
-            b"Failed password for root from 203.0.113.10 port 22 ssh2\n"
-            b"Failed password for admin from 203.0.113.11 port 22 ssh2\n"
-            b"Accepted key /run/secrets/id_ed25519 for agent\n"
-        )
-        client = JournalClient(payload=journal)
-        count, reason = ssh_probe._read_failed_logins(client, 2.0)
+    def test_output_that_is_not_the_status_line_is_malformed(self) -> None:
+        for payload in (b"hello\n", b"0|root(1)\n", b"\n"):
+            with self.subTest(payload=payload):
+                client = StatusClient(payload=payload)
+                self.assertEqual(
+                    ssh_probe._read_status_line(client, 2.0),
+                    (None, "malformed"),
+                )
+
+    def test_no_secret_or_command_text_reaches_the_result(self) -> None:
+        client = StatusClient(payload=(GOOD_LINE + "\n").encode())
+        line, reason = ssh_probe._read_status_line(client, 2.0)
         result = ssh_probe._outcome_result(
             "host1.example.com",
-            ssh_probe.Outcome("ok", 12, "connected", count, reason),
+            ssh_probe.Outcome(
+                "ok",
+                12,
+                "connected",
+                line.failed_logins,
+                reason,
+                line.logins,
+                line.keyhash,
+                line.reboot_required,
+                line.outdated_images,
+            ),
             0.0,
         )
-        self.assertEqual(result["failed_logins"], 2)
         text = json.dumps(result)
         for secret in (
-            "Failed password",
-            "203.0.113.10",
-            "203.0.113.11",
             "id_ed25519",
+            "/run/secrets",
+            "agent",
             "journalctl",
-            "--unit=ssh",
-            ssh_probe.FAILED_LOGIN_COMMAND,
+            ssh_probe.STATUS_COMMAND,
         ):
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, text)
 
-    def test_a_connector_cannot_smuggle_text_into_the_count_fields(self) -> None:
+    def test_a_connector_cannot_smuggle_text_into_the_status_fields(self) -> None:
         result = ssh_probe._outcome_result(
             "host1.example.com",
             ssh_probe.Outcome(
@@ -765,31 +1037,26 @@ class FailedLoginTests(unittest.TestCase):
                 "connected",
                 "Failed password for root from 203.0.113.10",
                 "journalctl --unit=ssh",
+                "root(1)\nsecond line",
+                "NOT-A-HASH",
+                "yes",
+                "x" * 4000,
             ),
             0.0,
         )
         self.assertIsNone(result["failed_logins"])
         self.assertEqual(result["failed_logins_reason"], "unavailable")
+        self.assertEqual(result["logins"], "root(1) second line")
+        self.assertIsNone(result["keyhash"])
+        self.assertIsNone(result["keys_changed"])
+        self.assertIsNone(result["reboot_required"])
+        self.assertIsNone(result["outdated_images"])
         text = json.dumps(result)
         self.assertNotIn("Failed password", text)
         self.assertNotIn("journalctl", text)
 
-    def test_a_failed_connection_has_no_count_field(self) -> None:
-        result = ssh_probe._outcome_result(
-            "host1.example.com",
-            ssh_probe.Outcome("timeout", None, "connection timed out", 3, None),
-            1.0,
-        )
-        self.assertNotIn("failed_logins", result)
-        self.assertNotIn("failed_logins_reason", result)
-
     def test_the_probe_runs_the_fixed_command_on_the_session_it_opened(self) -> None:
-        client = ParamikoClient(
-            payload=(
-                b"Failed password for root from 203.0.113.10 ssh2\n"
-                b"Failed password for admin from 203.0.113.11 ssh2\n"
-            )
-        )
+        client = ParamikoClient(payload=(GOOD_LINE + "\n").encode())
         with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
             outcome = ssh_probe._probe_with_paramiko(
                 "host1.example.com", SETTINGS, 5.0
@@ -797,17 +1064,22 @@ class FailedLoginTests(unittest.TestCase):
         self.assertEqual(outcome.status, "ok")
         self.assertEqual(outcome.failed_logins, 2)
         self.assertIsNone(outcome.failed_logins_reason)
+        self.assertEqual(outcome.keyhash, "59ba804d0837")
+        self.assertIs(outcome.reboot_required, False)
+        self.assertEqual(
+            outcome.outdated_images, "2 gluetun storage-watchtower"
+        )
         self.assertEqual(client.connect_kwargs["hostname"], "host1.example.com")
         self.assertEqual(
             [command for command, _timeout in client.commands],
-            [ssh_probe.FAILED_LOGIN_COMMAND],
+            [ssh_probe.STATUS_COMMAND],
         )
         self.assertEqual(
-            client.commands[0][1], ssh_probe.FAILED_LOGIN_TIMEOUT_SECONDS
+            client.commands[0][1], ssh_probe.STATUS_TIMEOUT_SECONDS
         )
         self.assertTrue(client.closed)
 
-    def test_unreadable_journal_keeps_the_probe_ok_but_null(self) -> None:
+    def test_an_unreadable_line_keeps_the_probe_ok_but_null(self) -> None:
         client = ParamikoClient(exit_status=1)
         with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
             outcome = ssh_probe._probe_with_paramiko(
@@ -827,6 +1099,7 @@ class FailedLoginTests(unittest.TestCase):
         self.assertEqual(outcome.status, "timeout")
         self.assertEqual(client.commands, [])
         self.assertTrue(client.closed)
+
 
 
 class ConfigurationTests(unittest.TestCase):

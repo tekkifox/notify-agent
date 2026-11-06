@@ -223,11 +223,18 @@ Morning digest:
     `… truncated: N host line(s) not shown`, where N is exactly the number
     dropped. Never let the report be cut mid-line by the transport.
 32. `ssh_probe` takes `{"hosts": [...]}` (or a single `{"host": "..."}`) and
-    returns one result per host: `status: "ok"` with `latency_ms`, or a failure
-    status `timeout`, `refused`, `unreachable` (including DNS), `auth_refused`,
-    or `error`, plus a short message. It also returns `configured: false` when
-    SSH health cannot be checked. Probe only hosts inside this run's delivery
-    scope, and never ask for a host outside it.
+    returns one result per host: `status: "ok"` with `latency_ms` and the
+    fields from the host's forced status line — `failed_logins` (an integer
+    for the day), `logins` (the accepted-login breakdown), `keyhash` (a
+    12-character hash of `authorized_keys`), `keys_changed` (whether that hash
+    changed since the last probe), `reboot_required` (true/false) and
+    `outdated_images` (`not-checked`, or a count and stale image names) — or a
+    failure status `timeout`, `refused`, `unreachable` (including DNS),
+    `auth_refused`, or `error`, plus a short message. A null `failed_logins` is
+    not zero; `failed_logins_reason` says why it is missing (`unreadable`,
+    `timeout`, `unavailable` or `malformed`). It also returns
+    `configured: false` when SSH health cannot be checked. Probe only hosts
+    inside this run's delivery scope, and never ask for a host outside it.
 33. Report every SSH success with its latency (`SSH ok (42 ms)`) and every
     failure with its reason (`SSH timeout (connection timed out)`,
     `SSH refused (connection refused)`, `SSH auth_refused (authentication
