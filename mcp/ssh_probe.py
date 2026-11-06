@@ -44,7 +44,8 @@ Credentials are a single unprivileged key, mounted read-only like the Oracle
 wallet. Configuration comes from the environment and is never echoed:
 
     SSH_USER, SSH_KEY_PATH, SSH_TIMEOUT_SECONDS, SSH_TOTAL_TIMEOUT_SECONDS,
-    SSH_PORT, NOTIFY_HOST_PORTS, NOTIFY_HOST_TAILNET, SSH_ALLOWED_HOSTS
+    SSH_PORT, NOTIFY_HOST_PORTS, NOTIFY_HOST_TAILNET, NOTIFY_LOCAL_HOST,
+    SSH_ALLOWED_HOSTS
 
 ``NOTIFY_HOST_PORTS`` is an optional JSON object of ``{"host": port}`` set by
 the run from the CMS. Port resolution for each host is the map entry, then
@@ -62,6 +63,18 @@ dialled by name exactly as before. The target decides where to dial, never
 which hosts are permitted. The map is validated strictly at startup like the
 port map, naming only the variable. Preference order is the tailnet target,
 then the panel name.
+
+``NOTIFY_LOCAL_HOST`` is the optional panel name of the host the agent itself
+runs on. When it is set and the requested host equals it, the probe dials the
+container's default gateway (the host, read from ``/proc/net/route``) instead
+of the tailnet target, keeping the host's own port from
+``NOTIFY_HOST_PORTS``. A host cannot reach its own tailnet address from inside
+the container (a hairpin), but the default gateway reaches the host's sshd.
+The local marker is matched against the panel name after normalisation and
+never changes which hosts are permitted; a host that is not the marker is
+never dialled at the gateway. The result still reports the host's own name.
+When the marker is unset, behaviour is exactly as before. A malformed marker
+fails startup naming only the variable.
 
 ``SSH_USER`` and ``SSH_KEY_PATH`` are required to probe. If either is absent,
 or the key file is not readable, the tool returns ``configured: false`` with a
@@ -98,6 +111,7 @@ import math
 import os
 import re
 import socket
+import struct
 import sys
 import time
 from typing import Any, Callable, NamedTuple, Sequence
@@ -133,6 +147,17 @@ HOST_PORTS_ENV = "NOTIFY_HOST_PORTS"
 # Optional: without an entry a host is dialled by its panel name. Keys are
 # always panel names, never addresses.
 HOST_TAILNET_ENV = "NOTIFY_HOST_TAILNET"
+
+# Set by the deployment, not by a run: the panel name of the host the agent
+# itself runs on. A host cannot reach its own tailnet address from inside the
+# container (a hairpin), so that exact host is dialled at the container's
+# default gateway instead. Unset means no change.
+LOCAL_HOST_ENV = "NOTIFY_LOCAL_HOST"
+
+# The Linux route table. The default route's gateway is the host from inside a
+# Docker bridge network. Read instead of hard-coded: the bridge subnet changes
+# when the stack is recreated.
+ROUTE_TABLE_PATH = "/proc/net/route"
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TIMEOUT_SECONDS = 30.0
@@ -323,6 +348,12 @@ class Settings(NamedTuple):
     # dialled by its panel name; the name stays the policy and result key. A
     # target is an IPv4 address or a hostname.
     host_tailnets: tuple[tuple[str, str], ...] = ()
+    # Panel name of the host the agent runs on, when the deployment marks one.
+    # Empty keeps the tailnet/panel-name behaviour for every host.
+    local_host: str = ""
+    # The container's default gateway, derived from the route table when
+    # local_host is set. Empty only when no local host is configured.
+    local_address: str = ""
 
 
 class Outcome(NamedTuple):
@@ -474,15 +505,86 @@ def _host_tailnets() -> tuple[tuple[str, str], ...]:
     return tuple(entries.items())
 
 
-def _dial_for(host: str, settings: Settings) -> str:
-    """Return the tailnet target for a panel name, or the name itself.
+def _local_host() -> str:
+    """Parse ``NOTIFY_LOCAL_HOST`` as a panel name, naming the variable only.
 
-    Only the destination changes. ``host`` remains the policy key and the name
-    a result reports, so a target can never widen the allowlist or the run
-    scope.
+    An empty value means the deployment has not marked a local host, so every
+    host keeps its old destination. A malformed value is a configuration
+    error: guessing which host is local could send a remote host's probe to
+    the agent's own gateway.
+    """
+
+    raw = _env(LOCAL_HOST_ENV)
+    if not raw:
+        return ""
+    host = _canonical(raw)
+    if not host or not HOST_PATTERN.match(host):
+        raise ConfigError(
+            f"{LOCAL_HOST_ENV} must be a host name", not_configured=False
+        )
+    return host
+
+
+def _default_gateway(route_text: str | None = None) -> str:
+    """Return the host address from the default route, or raise.
+
+    Inside a Docker bridge network the container's default gateway is the
+    host, so this is the address that reaches the host's own sshd. The address
+    is derived from ``/proc/net/route`` rather than hard-coded because the
+    bridge subnet changes when the stack is recreated. ``route_text`` is for
+    tests; production reads the real route table. Values are never echoed: a
+    failure names only ``NOTIFY_LOCAL_HOST``.
+    """
+
+    if route_text is None:
+        try:
+            with open(ROUTE_TABLE_PATH, "r", encoding="ascii") as handle:
+                route_text = handle.read()
+        except (OSError, UnicodeError):
+            raise ConfigError(
+                f"{LOCAL_HOST_ENV} is set but the host address could not be derived",
+                not_configured=False,
+            ) from None
+
+    for line in route_text.splitlines()[1:]:
+        fields = line.split()
+        # Destination 00000000 is the default route; its Gateway field is a
+        # little-endian 32-bit address. Skip an on-link default (no gateway).
+        if len(fields) < 3 or fields[1] != "00000000":
+            continue
+        try:
+            raw = int(fields[2], 16)
+            address = socket.inet_ntoa(struct.pack("<L", raw))
+        except (ValueError, struct.error, OSError):
+            continue
+        if address != "0.0.0.0" and IPV4_PATTERN.match(address):
+            return address
+
+    raise ConfigError(
+        f"{LOCAL_HOST_ENV} is set but the host address could not be derived",
+        not_configured=False,
+    )
+
+
+def _dial_for(host: str, settings: Settings) -> str:
+    """Return the destination for a panel name.
+
+    The local host is dialled at the container's default gateway, because a
+    host cannot reach its own tailnet address from inside the container (a
+    hairpin). Every other host keeps its tailnet target or panel name. Only
+    the destination changes: ``host`` remains the policy key and the name a
+    result reports, so neither a target nor the local marker can widen the
+    allowlist or the run scope.
     """
 
     canonical = _canonical(host)
+    if settings.local_host and canonical == settings.local_host:
+        if not settings.local_address:
+            raise ConfigError(
+                f"{LOCAL_HOST_ENV} is set but the host address is unavailable",
+                not_configured=False,
+            )
+        return settings.local_address
     for name, target in settings.host_tailnets:
         if _canonical(name) == canonical:
             return target
@@ -578,6 +680,7 @@ def load_settings() -> Settings:
         DEFAULT_TOTAL_TIMEOUT_SECONDS,
         MAX_TOTAL_TIMEOUT_SECONDS,
     )
+    local_host = _local_host()
     return Settings(
         user=user,
         key_path=key_path,
@@ -587,6 +690,10 @@ def load_settings() -> Settings:
         allowed_hosts=parse_allowed_hosts(),
         host_ports=_host_ports(),
         host_tailnets=_host_tailnets(),
+        local_host=local_host,
+        # Derive the gateway only when a local host is actually configured, so
+        # a deployment without the marker never touches the route table.
+        local_address=_default_gateway() if local_host else "",
     )
 
 
@@ -807,9 +914,10 @@ def _probe_with_paramiko(
     """Open one key-authenticated session, then run the fixed journal command.
 
     A completed handshake plus public-key authentication is the health signal.
-    The destination is the host's tailnet target when the map has one, and its
-    panel name otherwise; the panel name remains the policy key and the name
-    the result reports. Once the session is open, exactly one read-only
+    The destination is the container's default gateway when this is the local
+    host, the host's tailnet target when the map has one, and its panel name
+    otherwise; the panel name remains the policy key and the name the result
+    reports. Once the session is open, exactly one read-only
     command -- the module's fixed ``FAILED_LOGIN_COMMAND``, never caller or
     model text -- reads the SSH journal for the last hour. The journal read has
     its own short timeout, kept inside the host's remaining budget, and any
@@ -996,6 +1104,10 @@ def selftest() -> int:
         detail += f"; per-host ports {len(settings.host_ports)}"
     if settings.host_tailnets:
         detail += f"; per-host tailnets {len(settings.host_tailnets)}"
+    if settings.local_host:
+        # Count only: the panel name and gateway are configuration, not log
+        # material.
+        detail += "; local host set"
     if scope:
         detail += f"; run scope {len(scope)} host(s)"
     print(f"selftest: ssh configured: {detail}")

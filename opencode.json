@@ -67,6 +67,7 @@
           "NOTIFY_HOST_SCOPE": "{env:NOTIFY_HOST_SCOPE}",
           "NOTIFY_HOST_PORTS": "{env:NOTIFY_HOST_PORTS}",
           "NOTIFY_HOST_TAILNET": "{env:NOTIFY_HOST_TAILNET}",
+          "NOTIFY_LOCAL_HOST": "{env:NOTIFY_LOCAL_HOST}",
           "PYTHONPATH": "/opt/mcp-python",
           "PYTHONUNBUFFERED": "1"
         }

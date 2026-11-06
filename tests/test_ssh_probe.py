@@ -440,6 +440,117 @@ class TailnetTests(unittest.TestCase):
                     self.assertNotIn("203.0.113.10", message)
 
 
+class LocalHostTests(unittest.TestCase):
+    def test_local_host_is_dialled_at_the_gateway_and_reports_its_own_name(self) -> None:
+        settings = SETTINGS._replace(
+            host_ports=(("host1.example.com", 2222),),
+            host_tailnets=(("host1.example.com", "203.0.113.10"),),
+            local_host="host1.example.com",
+            local_address="172.27.0.1",
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host1.example.com"], settings)
+
+        result = payload["results"][0]
+        self.assertEqual(result["status"], "ok")
+        # The result still reports the panel name, not the gateway address.
+        self.assertEqual(result["host"], "host1.example.com")
+        # The destination is the default gateway, on the host's own port.
+        self.assertEqual(client.connect_kwargs["hostname"], "172.27.0.1")
+        self.assertEqual(client.connect_kwargs["port"], 2222)
+
+    def test_remote_host_still_uses_its_tailnet_target(self) -> None:
+        settings = SETTINGS._replace(
+            host_tailnets=(("host2.example.com", "203.0.113.11"),),
+            local_host="host1.example.com",
+            local_address="172.27.0.1",
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host2.example.com"], settings)
+
+        self.assertEqual(payload["results"][0]["host"], "host2.example.com")
+        self.assertEqual(client.connect_kwargs["hostname"], "203.0.113.11")
+        self.assertNotEqual(client.connect_kwargs["hostname"], "172.27.0.1")
+
+    def test_unset_local_marker_changes_nothing(self) -> None:
+        settings = SETTINGS._replace(
+            host_tailnets=(("host1.example.com", "203.0.113.10"),)
+        )
+        client = ParamikoClient()
+        with mock.patch.dict(sys.modules, {"paramiko": _fake_paramiko(client)}):
+            payload = ssh_probe.probe(["host1.example.com"], settings)
+
+        self.assertEqual(payload["results"][0]["status"], "ok")
+        self.assertEqual(client.connect_kwargs["hostname"], "203.0.113.10")
+
+    def test_default_gateway_is_derived_from_the_route_table(self) -> None:
+        route = (
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+            "Mask\t\tMTU\tWindow\tIRTT\n"
+            "eth0\t00000000\t01001BAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+            "eth0\t00001BAC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+        )
+        self.assertEqual(ssh_probe._default_gateway(route), "172.27.0.1")
+
+    def test_route_table_without_a_gateway_fails_naming_the_variable_only(self) -> None:
+        route = (
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+            "Mask\t\tMTU\tWindow\tIRTT\n"
+            "eth0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"
+        )
+        with self.assertRaises(ssh_probe.ConfigError) as raised:
+            ssh_probe._default_gateway(route)
+        message = str(raised.exception)
+        self.assertIn("NOTIFY_LOCAL_HOST", message)
+        self.assertNotIn("172.27.0.1", message)
+
+    def test_malformed_local_marker_fails_naming_the_variable_only(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "NOTIFY_LOCAL_HOST": "bad host",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ssh_probe.ConfigError) as raised:
+                    ssh_probe.load_settings()
+        message = str(raised.exception)
+        self.assertIn("NOTIFY_LOCAL_HOST", message)
+        self.assertNotIn("bad host", message)
+
+    def test_load_settings_reads_the_marker_and_derives_the_gateway(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "NOTIFY_LOCAL_HOST": "HOST1.Example.COM.",
+            }
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                ssh_probe, "_default_gateway", return_value="172.27.0.1"
+            ) as gateway:
+                settings = ssh_probe.load_settings()
+        self.assertEqual(settings.local_host, "host1.example.com")
+        self.assertEqual(settings.local_address, "172.27.0.1")
+        gateway.assert_called_once_with()
+
+    def test_load_settings_does_not_read_the_route_table_when_marker_absent(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+            }
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                ssh_probe,
+                "_default_gateway",
+                side_effect=AssertionError("must not read the route table"),
+            ):
+                settings = ssh_probe.load_settings()
+        self.assertEqual(settings.local_host, "")
+        self.assertEqual(settings.local_address, "")
+
+
 class FailureTests(unittest.TestCase):
     def test_each_failure_class_survives_the_tool(self) -> None:
         for status, message in (
@@ -774,11 +885,14 @@ class ConfigurationTests(unittest.TestCase):
                 "NOTIFY_HOST_TAILNET": (
                     '{"host1.example.com":"203.0.113.10"}'
                 ),
+                "NOTIFY_LOCAL_HOST": "host1.example.com",
             }
             boom = mock.Mock(side_effect=AssertionError("must not connect"))
             stdout = io.StringIO()
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                 ssh_probe, "_connector", boom
+            ), mock.patch.object(
+                ssh_probe, "_default_gateway", return_value="172.27.0.1"
             ), contextlib.redirect_stdout(stdout):
                 rc = ssh_probe.selftest()
         output = stdout.getvalue()
@@ -787,10 +901,13 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("SSH_KEY_PATH readable", output)
         self.assertIn("per-host ports 1", output)
         self.assertIn("per-host tailnets 1", output)
+        self.assertIn("local host set", output)
         self.assertNotIn(key.name, output)
         self.assertNotIn("agent", output)
         self.assertNotIn("2222", output)
         self.assertNotIn("203.0.113.10", output)
+        self.assertNotIn("host1.example.com", output)
+        self.assertNotIn("172.27.0.1", output)
         boom.assert_not_called()
 
     def test_selftest_without_configuration_is_successful_and_plain(self) -> None:
