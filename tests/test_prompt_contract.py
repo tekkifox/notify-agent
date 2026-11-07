@@ -790,7 +790,11 @@ class FleetDigestScheduleTests(unittest.TestCase):
         for name, text in CRONTABS.items():
             with self.subTest(crontab=name):
                 self.assertNotIn("reply with one line", text)
-                self.assertNotIn("say so in one line", text)
+                if "say so in one line" in text:
+                    self.assertIn(
+                        "say so in one line at the top and still send the report",
+                        text,
+                    )
 
     def test_skip_capable_prompts_end_the_run_silently(self) -> None:
         """Every schedule that may skip delivery must stop with no output."""
@@ -812,25 +816,27 @@ class FleetDigestScheduleTests(unittest.TestCase):
                         "the notification itself carries the finding", line
                     )
 
-    def test_morning_digest_stays_silent_when_nothing_is_flagged(self) -> None:
+    def test_morning_digest_always_sends_even_when_nothing_is_flagged(self) -> None:
         for name in CRONTABS:
             with self.subTest(crontab=name):
                 line = self._schedule_line(name, "0 9 * * * ", "automations")
                 self.assertIn(
-                    "Call notify.sh only when at least one host is flagged; "
-                    "if none is, do not call notify.sh and do not reply: end "
-                    "the run silently with no output.",
+                    "Send the report with notify.sh every day, even when no "
+                    "host is flagged",
                     line,
                 )
                 self.assertIn(
-                    "notify.sh is the only way this run may say anything", line
+                    "when nothing crossed a threshold, say so in one line at "
+                    "the top and still send the report",
+                    line,
                 )
-                self.assertNotIn("Send it now with notify.sh", line)
+                self.assertNotIn("Call notify.sh only when", line)
 
 
 class FlagGuardScheduleTests(unittest.TestCase):
-    """The two fleet-wide digests set the hard silence guard, and nothing else
-    does. The guard is the code-level floor under the prompt's silence rule."""
+    """The hourly fleet digest sets the hard silence guard; the morning digest
+    always sends. The guard is the code-level floor under the prompt's silence
+    rule."""
 
     def _schedule_line(self, name: str, schedule: str, target: str) -> str:
         for line in CRONTABS[name].splitlines():
@@ -839,13 +845,19 @@ class FlagGuardScheduleTests(unittest.TestCase):
                 return stripped
         self.fail(f"{name}: no {schedule!r} line for target {target!r}")
 
-    def test_both_fleet_wide_lines_require_a_flag(self) -> None:
+    def test_the_silent_fleet_wide_line_requires_a_flag(self) -> None:
         for name in CRONTABS:
-            for schedule in ("0 9 * * * ", "15 * * * * "):
-                with self.subTest(crontab=name, schedule=schedule):
-                    line = self._schedule_line(name, schedule, "automations")
-                    self.assertIn("NOTIFY_REQUIRE_FLAG=1", line)
-                    self.assertIn("NOTIFY_PREFETCH=host_stats", line)
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "15 * * * * ", "automations")
+                self.assertIn("NOTIFY_REQUIRE_FLAG=1", line)
+                self.assertIn("NOTIFY_PREFETCH=host_stats", line)
+
+    def test_the_morning_digest_always_sends(self) -> None:
+        for name in CRONTABS:
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "0 9 * * * ", "automations")
+                self.assertNotIn("NOTIFY_REQUIRE_FLAG", line)
+                self.assertIn("NOTIFY_PREFETCH=host_stats,ssh", line)
 
     def test_the_admin_chat_hourly_job_does_not_require_a_flag(self) -> None:
         for name in CRONTABS:
