@@ -185,10 +185,10 @@ jobs:
       # Portainer lives on the tailnet and answers on a MagicDNS name with a
       # self-signed certificate, so the hosted runner joins the tailnet first.
       - name: Join the tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
-          args: --hostname=gh-notify-agent-${{ github.run_id }}
+          hostname: gh-notify-agent-${{ github.run_id }}
 
       - name: Redeploy stack via Portainer API
         shell: bash
