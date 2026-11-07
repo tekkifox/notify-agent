@@ -14,7 +14,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Pinned OpenCode `2.2.1`, supercronic `0.2.51`, non-root uid `10001`. |
-| `.github/workflows/publish-image.yml` | Builds and publishes `ghcr.io/tekkifox/notify-agent` on `main`, then redeploys the Portainer stack through its API. |
+| `.github/workflows/publish-image.yml` | Runs the test suites on pull requests; on `main`, builds and publishes `ghcr.io/tekkifox/notify-agent`, then redeploys the Portainer stack through its API. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
 | `crontab` | Default supercronic schedules, all commented out. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
@@ -56,7 +56,11 @@ Schedules default to `./crontab`, so a fresh checkout starts as-is. To keep the 
 
 ## Deploy
 
-Production runs the image published from GitHub, not a local build. A push to `main` runs `.github/workflows/publish-image.yml`, which builds `linux/amd64`, pushes `ghcr.io/tekkifox/notify-agent` to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then redeploys the Portainer stack through its API. `workflow_dispatch` runs the same job by hand.
+Production runs the image published from GitHub, not a local build.
+
+A pull request (opened, updated or reopened) runs `.github/workflows/publish-image.yml` as **tests only**: the Python suite (`python3 -m unittest discover -s tests -p 'test_*.py' -v`) and the shell suites under `tests/` (`tests/run-prompt-*.sh` and `tests/notify-targets.sh`) on a clean `ubuntu-latest` runner. The shell suites are self-contained: they start their own fake `opencode` and stub MCP servers, and require only `python3`, `jq`, `curl`, `openssl`, `flock` and `timeout`, which the runner provides. A pull request never builds an image, publishes a manifest or deploys. A `concurrency` group cancels the previous run when the same pull request is pushed again.
+
+A push to `main` runs the build and deploy jobs: it builds `linux/amd64` and `linux/arm64` on native runners, publishes the multi-arch manifest to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then redeploys the Portainer stack through its API. `workflow_dispatch` runs the same jobs by hand. The build, manifest and deploy jobs are gated to non-pull-request events, and the deploy job additionally to `refs/heads/main`, so a pull request cannot deploy. Runs on `main` are not cancelled, so a deploy in progress always finishes.
 
 - The Portainer stack's compose must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`.
 - The deploy job reads the stack through the Portainer API to preserve its `Env` array, then sends `compose.deploy.yaml` back with `PullImage: true`, so Portainer pulls the new image and recreates the `agent` container.

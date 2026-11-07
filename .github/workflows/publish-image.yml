@@ -4,7 +4,18 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
   workflow_dispatch:
+
+# A new push to a pull request (or a non-main ref) cancels its previous run.
+# Runs on main are never cancelled, so an in-progress Portainer deploy finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -14,8 +25,43 @@ env:
   IMAGE_NAME: ghcr.io/tekkifox/notify-agent
 
 jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # The suites are self-contained: they start their own fake `opencode` and
+      # stub MCP servers, and skip or fail by name when a tool is missing.
+      - name: Check test prerequisites
+        run: |
+          set -eu
+          missing=0
+          for bin in python3 jq curl openssl flock timeout; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              echo "::error::${bin} is required by the test suites but is not on PATH"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Run the Python suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run the shell suites
+        run: |
+          set -eu
+          for suite in tests/run-prompt-*.sh tests/notify-targets.sh; do
+            echo "::group::${suite}"
+            sh "$suite"
+            echo "::endgroup::"
+          done
+
   build:
     name: Build linux/${{ matrix.arch }}
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +126,7 @@ jobs:
   merge:
     name: Publish multi-arch manifest
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     needs:
       - build
     steps:
@@ -130,7 +177,7 @@ jobs:
     runs-on: [self-hosted, paseo]
     needs:
       - merge
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
