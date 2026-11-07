@@ -27,6 +27,14 @@ changes which hosts are permitted.  The tailnet map is emitted as
 ``NOTIFY_HOST_TAILNET`` and is consulted only after the allowlist and run scope
 have been checked against the panel name.
 
+The panel means "report on all hosts" by omitting a target's ``host_scope``.
+Such a target resolves to every usable name in the CMS ``hosts`` array, in
+array order, so the run reports on all of them with no extra configuration.
+An explicit ``host_scope`` (including an explicit empty list, which the send
+boundary refuses) keeps its current meaning.  The resolved names are also
+emitted as a JSON array by ``--json`` so ``run-prompt.sh`` can make them the
+SSH allowlist when the CMS supplied the configuration.
+
 Security boundaries:
 
 * ``BOT_SETTINGS_API_KEY`` is a Payload API key.  It is sent only in the
@@ -163,6 +171,7 @@ class Resolution:
     reason: str = ""
     host_ports_json: str = ""
     host_tailnets_json: str = ""
+    hosts_json: str = ""
     hosts_total: int = 0
     host_ports_count: int = 0
     hosts_dropped: int = 0
@@ -416,8 +425,8 @@ def _usable_tailnet(entry: object) -> str | None:
 
 def _validate_hosts(
     hosts: object,
-) -> tuple[dict[str, int], dict[str, str], int, int]:
-    """Return the per-host maps, the array length and the dropped count.
+) -> tuple[dict[str, int], dict[str, str], tuple[str, ...], int, int]:
+    """Return the per-host maps, the host names, the array length and drops.
 
     ``hosts`` is optional: a panel that predates the per-host ports change
     simply leaves the global ``SSH_PORT`` in charge.  A non-array value is a
@@ -425,16 +434,19 @@ def _validate_hosts(
     on its own so one typo does not discard every other host.  A host with a
     bad port is dropped from both maps, exactly as before; a host with a good
     port and a malformed optional tailnet keeps its port and is absent from
-    the tailnet map.
+    the tailnet map.  The returned names are the usable entries in array
+    order, deduplicated: they are what "all hosts" resolves to and what the
+    SSH allowlist becomes when the CMS supplied the configuration.
     """
 
     if hosts is None:
-        return {}, {}, 0, 0
+        return {}, {}, (), 0, 0
     if not isinstance(hosts, list):
         raise DocumentProblem("document hosts must be a JSON array")
 
     mapping: dict[str, int] = {}
     tailnets: dict[str, str] = {}
+    names: list[str] = []
     dropped = 0
     for entry in hosts:
         pair = _usable_host_port(entry)
@@ -443,15 +455,48 @@ def _validate_hosts(
             continue
         host, port = pair
         mapping[host] = port
+        if host not in names:
+            names.append(host)
         target = _usable_tailnet(entry)
         if target is not None:
             tailnets[host] = target
-    return mapping, tailnets, len(hosts), dropped
+    return mapping, tailnets, tuple(names), len(hosts), dropped
+
+
+def _expand_all_hosts(
+    targets: object, hosts: tuple[str, ...]
+) -> object:
+    """Give a CMS target with no ``host_scope`` every configured host.
+
+    The panel expresses "report on all hosts" by omitting ``host_scope``.  An
+    absent key therefore means the full CMS host list, not an empty scope.  An
+    explicit value, including an explicit empty list, is left exactly as it
+    came in so the existing validation and refusal still apply.  With no
+    usable hosts there is nothing to add and the target stays unscoped.
+    """
+
+    if not isinstance(targets, dict) or not hosts:
+        return targets
+    names = list(hosts)
+    expanded: dict[str, object] = {}
+    for name, entry in targets.items():
+        if isinstance(entry, dict) and "host_scope" not in entry:
+            entry = {**entry, "host_scope": list(names)}
+        expanded[name] = entry
+    return expanded
 
 
 def validate_document(
     document: object, environ: Mapping[str, str]
-) -> tuple[object, object, dict[str, int], dict[str, str], int, int]:
+) -> tuple[
+    object,
+    object,
+    dict[str, int],
+    dict[str, str],
+    tuple[str, ...],
+    int,
+    int,
+]:
     """Validate a CMS document and return targets, sources and host maps."""
 
     if not isinstance(document, dict):
@@ -471,10 +516,19 @@ def validate_document(
         raise DocumentProblem("document sources must be a JSON array")
     _validate_targets(targets)
     _validate_sources(environ, targets, sources)
-    host_ports, host_tailnets, hosts_total, dropped = _validate_hosts(
+    host_ports, host_tailnets, host_names, hosts_total, dropped = _validate_hosts(
         document.get("hosts")
     )
-    return targets, sources, host_ports, host_tailnets, hosts_total, dropped
+    targets = _expand_all_hosts(targets, host_names)
+    return (
+        targets,
+        sources,
+        host_ports,
+        host_tailnets,
+        host_names,
+        hosts_total,
+        dropped,
+    )
 
 
 def _encode(value: object) -> str:
@@ -574,6 +628,7 @@ def _document_resolution(
     sources: object,
     host_ports: Mapping[str, int],
     host_tailnets: Mapping[str, str],
+    host_names: tuple[str, ...],
     hosts_total: int,
     dropped: int,
     reason: str = "",
@@ -587,6 +642,7 @@ def _document_resolution(
         host_tailnets_json=(
             "" if not host_tailnets else _encode(host_tailnets)
         ),
+        hosts_json=_encode(list(host_names)),
         hosts_total=hosts_total,
         host_ports_count=len(host_ports),
         hosts_dropped=dropped,
@@ -613,6 +669,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
             sources,
             host_ports,
             host_tailnets,
+            host_names,
             hosts_total,
             dropped,
         ) = validate_document(_parse_document(raw), env)
@@ -632,6 +689,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
                 sources,
                 host_ports,
                 host_tailnets,
+                host_names,
                 hosts_total,
                 dropped,
             ) = validate_document(_parse_document(cached_raw), env)
@@ -645,6 +703,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
             sources,
             host_ports,
             host_tailnets,
+            host_names,
             hosts_total,
             dropped,
             reason=reason,
@@ -663,6 +722,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
         sources,
         host_ports,
         host_tailnets,
+        host_names,
         hosts_total,
         dropped,
     )
@@ -702,6 +762,8 @@ def _main(argv: list[str]) -> int:
                     "sources": resolution.sources_json,
                     "host_ports": resolution.host_ports_json,
                     "host_tailnets": resolution.host_tailnets_json,
+                    "source": resolution.source,
+                    "hosts": resolution.hosts_json,
                 }
             )
         )

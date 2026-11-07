@@ -428,15 +428,15 @@ an unset or empty map changes nothing. The map is validated strictly: it must
 be a JSON object, every name must be a usable hostname and every port a whole
 number from 1 to 65535. A malformed map fails startup with a message naming
 `NOTIFY_HOST_PORTS`, never a host or port value. The map only decides which
-port is dialled; `SSH_ALLOWED_HOSTS` and `NOTIFY_HOST_SCOPE` are still checked
-first and are unchanged.
+port is dialled; the effective allowlist and `NOTIFY_HOST_SCOPE` are still
+checked first and are unchanged.
 
 A host may also carry a tailnet target in `NOTIFY_HOST_TAILNET`, a JSON object
 of `{"host": "<ipv4-or-hostname>"}` resolved from the same CMS `hosts` array.
 When a host has an entry there, the probe dials that target instead of the panel
 name; when it does not, the panel name is dialled exactly as before. The target
-(an IPv4 dotted quad or a MagicDNS hostname) is only a destination:
-`SSH_ALLOWED_HOSTS` and `NOTIFY_HOST_SCOPE` are still matched against the panel
+(an IPv4 dotted quad or a MagicDNS hostname) is only a destination: the
+effective allowlist and `NOTIFY_HOST_SCOPE` are still matched against the panel
 name, and a result still reports that name, so a target can never widen a
 boundary. The resolver drops a malformed target (keeping the host's port entry)
 rather than failing the run; a hand-set `NOTIFY_HOST_TAILNET` that reaches the
@@ -465,14 +465,19 @@ container hostname and compose service name do not carry the panel name.
 
 Before any connection is attempted, the tool applies two checks:
 
-1. **Global allowlist.** The host must be covered by `SSH_ALLOWED_HOSTS`
-   (default `host1.example.com,host2.example.com,host3.example.com`). An entry
-   covers itself and its subdomains, so `example.com` covers
-   `vortex1.example.com`, but not `notexample.com` or
-   `example.com.example`.
+1. **Global allowlist.** The host must be covered by the effective allowlist.
+   Without the CMS that is `SSH_ALLOWED_HOSTS` (default
+   `host1.example.com,host2.example.com,host3.example.com`). When the CMS
+   supplied the configuration, `run-prompt.sh` exports the panel's `hosts`
+   names as `NOTIFY_ALLOWED_HOSTS` and the probe does not consult
+   `SSH_ALLOWED_HOSTS`; the operator therefore maintains the host list once, in
+   the CMS. An empty panel host list permits no host. An entry covers itself
+   and its subdomains, so `example.com` covers `vortex1.example.com`, but not
+   `notexample.com` or `example.com.example`.
 2. **Run scope.** `run-prompt.sh` exports the selected target's `host_scope` as
    `NOTIFY_HOST_SCOPE`; the tool refuses a host outside it. The optional
-   `scope` argument can narrow that list, never widen it. A run scoped to
+   `scope` argument can narrow that list, never widen it; it accepts an array,
+   a comma-separated string or a JSON-encoded array string. A run scoped to
    `admin-chat` therefore cannot even receive a rossmoney result, even if the
    model asks for one.
 
@@ -497,7 +502,8 @@ string over the authenticated channel and is then replaced by the host's forced
 | --- | --- | --- |
 | `SSH_USER` | yes | Unprivileged account used for the key-authenticated probe |
 | `SSH_KEY_PATH` | yes | In-container path of the private key; compose sets `/ssh/id_ed25519` |
-| `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `host1.example.com,host2.example.com,host3.example.com` |
+| `SSH_ALLOWED_HOSTS` | no | Comma-separated global allowlist; default `host1.example.com,host2.example.com,host3.example.com`. Used only when the run did not come from the CMS |
+| `NOTIFY_ALLOWED_HOSTS` | run only | JSON array of the CMS `hosts` names, exported by `run-prompt.sh` only when the CMS supplied the configuration; when present it replaces `SSH_ALLOWED_HOSTS` (an empty array permits no host) |
 | `SSH_TIMEOUT_SECONDS` | no | Per-host timeout, default 5; capped at 30 |
 | `SSH_TOTAL_TIMEOUT_SECONDS` | no | Whole-call deadline, default 20; capped at 60 |
 | `SSH_PORT` | no | Default SSH port for hosts without an entry in `NOTIFY_HOST_PORTS`; default 22 |
@@ -755,26 +761,29 @@ append the SSH result per host. `run-prompt.sh` filters `HOST_REPORT_HOSTS` to
 the selected target's `host_scope` and carries the ordered list into the
 instruction, so a scoped run only sees its own hosts.
 
-### Host-statistics pre-fetch
+### Host-statistics and SSH pre-fetch
 
-A digest does not have to make the model call `oracle_query`. Set
-`NOTIFY_PREFETCH=host_stats` on the schedule line and `run-prompt.sh` fetches
-the statistics before OpenCode starts, then appends them to the instruction as
-data. The model is told the rows are complete for this run and not to call
-`oracle_query` for host statistics; the SSH probe is still collected with the
-tool.
+A digest does not have to make the model call `oracle_query` or `ssh_probe`.
+Set `NOTIFY_PREFETCH=host_stats` on the schedule line and `run-prompt.sh`
+fetches the statistics before OpenCode starts, then appends them to the
+instruction as data. Add `ssh` (`NOTIFY_PREFETCH=host_stats,ssh`) and it also
+runs the probe's own logic for the resolved hosts and supplies those results
+the same way, so the digest needs no model turn for either. The `ssh_probe`
+tool stays available for ad-hoc runs.
 
-The pre-fetch is opt-in. Unset, or any value other than `host_stats`, leaves the
+The pre-fetch is opt-in. Unset, or any value other than those modes, leaves the
 instruction exactly as before. The scope is the resolved target's `host_scope`:
-only those hosts are queried, and a target with no scope skips the pre-fetch
-with `run-prompt: prefetch skipped: target has no host scope` rather than
-querying every host.
+only those hosts are queried, and a target with no scope skips a mode with
+`run-prompt: prefetch skipped: target has no host scope` or
+`run-prompt: ssh prefetch skipped: target has no host scope` rather than
+querying every host. A CMS target with no `host_scope` resolves to every panel
+host first, so "report on all hosts" covers the whole fleet.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `NOTIFY_PREFETCH` | unset | `host_stats` enables the pre-fetch; any other value leaves the run unchanged |
+| `NOTIFY_PREFETCH` | unset | Comma-separated modes: `host_stats`, `ssh`, or both; any other value leaves the run unchanged |
 | `NOTIFY_PREFETCH_WINDOW_MINUTES` | `70` | How many minutes of samples the aggregate covers; a positive whole number |
-| `NOTIFY_PREFETCH_TIMEOUT_SECONDS` | `60` | Deadline for the whole pre-fetch; a positive whole number |
+| `NOTIFY_PREFETCH_TIMEOUT_SECONDS` | `60` | Deadline for each pre-fetch call; a positive whole number |
 
 One aggregate row per in-scope host is fetched from `NOTIFY_RO.HOST_STATS_V`
 with `COUNT(*)`, `MAX(sampled_at)`, `AVG`/`MAX(cpu_percent)`,
@@ -813,6 +822,17 @@ through unchanged, so the run falls back to the `oracle_query` tool exactly as
 it does without the variable. A pre-fetch never costs a digest. The server's
 stdout is never printed to the container log.
 
+The `ssh` mode speaks JSON-RPC to `mcp/ssh_probe.py`, so it is the same probe
+with the same fixed read-only command, the same allowlist and `NOTIFY_HOST_SCOPE`
+checks, and the same failure classification. It requests one host list and
+appends the per-host JSON (`status`, `latency_ms`, the status-line fields and
+the classified failure when there is one) under `## SSH status for this run`,
+with the model told not to call `ssh_probe`. A probe failure is data for that
+host, never a failed digest; a server error, timeout or malformed response
+logs one line starting `run-prompt: ssh prefetch failed:` and leaves the
+instruction on the tool. A successful run logs
+`run-prompt: ssh prefetch: <n> host(s)`.
+
 ### Ready-to-paste schedule lines
 
 The schedule is a host file (`SCHEDULES_FILE`, default `./crontab`), not
@@ -827,6 +847,13 @@ automations channel; the second is a Vortex-only digest for `admin-chat`.
 ```cron
 0 9 * * * NOTIFY_PREFETCH=host_stats NOTIFY_PREFETCH_WINDOW_MINUTES=1440 /app/scripts/run-prompt.sh -t admin-chat "Compose the morning Vortex digest. The 24-hour host statistics are supplied in this instruction; use them and do not call oracle_query for host statistics. Then call ssh_probe for SSH status, for the Vortex hosts only. Use the old host report shape: one line per host with sample count, last-seen age, CPU average and peak, memory average, load average and peak, and disk from the latest sample, plus SSH success with latency or the classified failure. Include every known host in this run, in order. Flag stale hosts (no sample in 20 minutes) and the thresholds. Keep it under 2,000 characters; drop whole host lines from the end and say how many were not shown. Never mention a rossmoney host or anything about it. If SSH status cannot be checked, omit the SSH part. Send it now with notify.sh."
 ```
+
+To remove the `ssh_probe` model turn from either line, use
+`NOTIFY_PREFETCH=host_stats,ssh`; the supplied SSH section is complete for the
+run. The prompt text still says to call the tool, but the instruction appended
+by `run-prompt.sh` overrides it for that run. For a CMS target that means
+"report on all hosts", leave its `host_scope` unset and the panel's whole
+`hosts` list is used.
 
 ## Test delivery (sends a real message)
 
@@ -1084,7 +1111,9 @@ Resolution works like this:
   connected account also wins over `COMPOSIO_CONNECTED_ACCOUNT_ID`.
 - An optional `host_scope` is a non-empty string or a non-empty array of
   non-empty strings. It names the only host(s) a message to that target may
-  talk about; absent means no restriction. An entry covers itself and its
+  talk about; absent means no restriction for an environment target, while a
+  CMS target with the key absent means "report on all hosts" and resolves to
+  the panel's whole `hosts` list. An entry covers itself and its
   subdomains. The guard is enforced twice: `run-prompt.sh` adds the scope to
   the instruction and exports it to `ssh_probe`, and `notify.sh` refuses to
   send a message whose body names a host outside the list. The delivery refusal
@@ -1180,10 +1209,21 @@ own port and, when one is recorded, at its tailnet target (an IPv4 address or a
 MagicDNS hostname) instead of its public panel name. An entry with no usable
 `name` or `sshPort` is dropped and counted in the source log, never passed
 through; a malformed `tailnet` value drops only that target and keeps the
-entry's port. The target never changes which host is permitted: the allowlist
-and run scope are matched against the panel name. Nothing else moves:
-Composio credentials, author allowlists, state paths and model settings stay in
-`stack.env`.
+entry's port.
+
+The `hosts` array is also the host list. A target that omits `host_scope` means
+"report on all hosts": it resolves to every usable `hosts` name, in panel order,
+so the statistics prefetch, the delivery scope, the instruction's known-host
+filter and the SSH probe's run scope all cover the whole panel without a second
+list. An explicit `host_scope` keeps its current meaning (and an explicit empty
+list is still refused). When the document was fetched and validated, the panel
+names also become `NOTIFY_ALLOWED_HOSTS`, the probe's whole global allowlist;
+`SSH_ALLOWED_HOSTS` is then not required or consulted. That makes a CMS run
+configured in one place. The cache and environment fallbacks keep the old rule
+exactly: if the CMS is disabled, unreachable or invalid, the probe still uses
+`SSH_ALLOWED_HOSTS`, so an outage can never widen what it may dial. Nothing else
+moves: Composio credentials, author allowlists, state paths and model settings
+stay in `stack.env`.
 
 Resolution order, for every scheduled prompt and every inbound reply:
 
@@ -1192,15 +1232,19 @@ Resolution order, for every scheduled prompt and every inbound reply:
    parsers: targets by the rules `notify.sh` applies at the send boundary,
    sources by `discord_inbound`'s `_load_sources`, hosts entry by entry. A
    document the agent would refuse from the environment is refused from the
-   panel with the same errors.
+   panel with the same errors. A target with no `host_scope` is resolved to all
+   `hosts` names; the same names are the SSH allowlist for a scheduled run.
 2. **Cache.** A validated fetch is written atomically (temp file plus
    `os.replace`) with mode `0600` to
    `$XDG_STATE_HOME/notify-agent/bot-settings-cache.json`. On any CMS failure
    (network error, timeout, non-200, malformed JSON, failed validation) the
-   last good copy is used, including its `hosts` map.
+   last good copy is used, including its `hosts` map; its targets expand an
+   absent `host_scope` the same way. The cached copy is not treated as a live
+   CMS for the SSH allowlist: the probe falls back to `SSH_ALLOWED_HOSTS`.
 3. **Environment.** If there is no usable cache, `NOTIFY_TARGETS`,
    `NOTIFY_INBOUND_SOURCES`, `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` are
-   used exactly as before. When the environment has no map, it stays unset and
+   used exactly as before, and `SSH_ALLOWED_HOSTS` remains the allowlist. When
+   the environment has no map, it stays unset and
    the global `SSH_PORT` or the panel name governs.
 
 The timeout is 5 seconds by default and capped at 30; a malformed value falls
@@ -1669,12 +1713,12 @@ Verified while building this branch:
 - The image still runs `opencode debug agents` as uid `10001` with `--read-only` and the compose tmpfs/volume layout, and a write to `/` fails with `Read-only file system`.
 - The target stub tests in `tests/notify-targets.sh` cover: a target resolves into the Composio payload, unknown and malformed targets fail without requests, malformed `host_scope`, `allow_content`, `allow_runbooks` and `bookstack` values fail by target name only (never the id or value), `-t` is rejected with a webhook, the legacy and default-target paths both work, and the bot-source reply path posts `DISCORDBOT_CREATE_MESSAGE` to the pinned source channel and account. The delivery guard is covered explicitly: a report naming `host1.example.com` aimed at `admin-chat` exits non-zero and makes no request; the same report aimed at `automations` is delivered; a Vortex host is accepted on `admin-chat`; `other.example` is refused on both; a rossmoney subdomain and a rossmoney URL are refused on `admin-chat`; and an unscoped target is not guarded. The send marker is covered too: a 2xx Composio or webhook send writes it, a rejected send does not, an unset marker changes nothing, and an unwritable marker warns without changing the exit status.
 - `tests/test_notify_guard.py` covers the `NOTIFY_REQUIRE_FLAG=1` delivery guard with a fake `curl` that records what it would have sent: a message without `[!]` writes no request, writes no send marker and exits 0; a message with `[!]` is delivered; a refused send makes no request even with a webhook configured, proving the guard runs before any delivery; unset, `0`, `true` and empty keep the old behaviour for both flagged and unflagged messages; and a `[!]` that only appears beyond the 2,000-character truncation point does not count, because the guard inspects the message that would be sent.
-- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **490 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
-- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; a host in `NOTIFY_HOST_TAILNET` dialled at that address while an absent host is dialled by name and the result still reports the panel name; a hostname target dialled the same way; a refused host with an address still refused before any connection; tailnet map keys normalised; a malformed tailnet map, including a malformed hostname target, failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The status-line tests cover a good line parsed into every field, a `yes` reboot and `not-checked` images, a short or empty line refused without inventing values, a malformed line refused as a whole, the last non-empty line winning over a banner, absent optional fields staying null, an invalid keyhash not becoming a baseline, and a result carrying the whole line alongside the existing fields. The keyhash-state tests cover first sighting `false`, the same hash `false`, a changed hash `true` and the new baseline, a per-host baseline, a `0600` file under `0700` in `XDG_STATE_HOME`, a corrupt state file treated as a first sighting and rewritten, bad entries cleaned, a missing hash giving `keys_changed: null`, and an unwritable state directory never failing the probe. The read tests cover the fixed command and its own timeout on the session the probe opened, a readable zero, an unreadable line, a read timeout and a command that never finishes, a missing status script, oversized output refused rather than truncated, non-status output reported as `malformed`, no key path or command text in the result, a connector unable to smuggle text into the count fields, and a failed connect running no command. No live SSH connection was made.
+- The whole Python suite passes on the rebased tree: `python3 -m unittest discover -s tests -p 'test_*.py'` reports **502 tests, OK**. That includes the Oracle guard/search suite, the inbound listener suite, the config resolver, the prompt/config contract tests, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_bookstack.py`.
+- `tests/test_ssh_probe.py` covers: an allowlisted success with latency; every failure class; a Vortex host probed when it is in scope; a rossmoney host refused in a Vortex scope with the connector asserted never called; a host outside `SSH_ALLOWED_HOSTS` refused without a connection; a CMS `NOTIFY_ALLOWED_HOSTS` list replacing `SSH_ALLOWED_HOSTS`, including an empty list permitting no host and a malformed list naming only the variable; the run scope still narrowing the CMS list; a JSON-encoded array string accepted as `scope`, including one equal to the run scope and one that cannot widen it; SSH not configured reported as `configured: false`; one failing host not poisoning another; the total-time deadline skipping later hosts; the `scope` argument unable to widen `NOTIFY_HOST_SCOPE`; subdomain matching and lookalike rejection; a bound/unbound selftest; a host in `NOTIFY_HOST_PORTS` dialled on its own port while an absent host keeps `SSH_PORT`; map keys normalised; a malformed map failing configuration while naming only the variable; a host in `NOTIFY_HOST_TAILNET` dialled at that address while an absent host is dialled by name and the result still reports the panel name; a hostname target dialled the same way; a refused host with an address still refused before any connection; tailnet map keys normalised; a malformed tailnet map, including a malformed hostname target, failing configuration while naming only the variable; refusal-before-connection still winning with a map present; and no key path, user or key material in output. The status-line tests cover a good line parsed into every field, a `yes` reboot and `not-checked` images, a short or empty line refused without inventing values, a malformed line refused as a whole, the last non-empty line winning over a banner, absent optional fields staying null, an invalid keyhash not becoming a baseline, and a result carrying the whole line alongside the existing fields. The keyhash-state tests cover first sighting `false`, the same hash `false`, a changed hash `true` and the new baseline, a per-host baseline, a `0600` file under `0700` in `XDG_STATE_HOME`, a corrupt state file treated as a first sighting and rewritten, bad entries cleaned, a missing hash giving `keys_changed: null`, and an unwritable state directory never failing the probe. The read tests cover the fixed command and its own timeout on the session the probe opened, a readable zero, an unreadable line, a read timeout and a command that never finishes, a missing status script, oversized output refused rather than truncated, non-status output reported as `malformed`, no key path or command text in the result, a connector unable to smuggle text into the count fields, and a failed connect running no command. No live SSH connection was made.
 - `tests/test_host_report.py` covers the old report shape: per-host field order including the CPU core count, the summary counts, known-host-first ordering then extras by name, zero-sample hosts, the stale boundary at exactly 20 minutes (fresh) and 21 minutes (stale), each sustained threshold at the boundary and one below (average CPU 60, average memory 85, latest disk 95, average load at twice the core count), the load rule on the average with a known count and never with a null one, a huge load peak with a modest average flagging nothing, the same absolute average being fine on a 4-core host, the absence of any CPU-peak or load-peak flag, the inline flag text and its order, the `[!]` marker, SSH success/failure/refusal handling, the not-configured line, and truncation dropping whole lines with the exact count. It runs without a database.
 - `tests/run-prompt-preflight.sh` passes against a stub MCP server and the real `notify.sh` with a stubbed `curl`: a transient self-test failure is logged with its safe reason, retried once and the run continues to `opencode`; a persistent failure runs exactly two preflights, does not start `opencode`, and sends exactly one message to the configured target through `notify.sh`, with no statistics and no environment leak; host-like wallet filenames are masked so the target's `host_scope` guard still allows the failure message; and the healthy path keeps one handshake and one self-test.
-- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The CMS case resolves `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` from the panel `hosts` array, and a panel without hosts clears an inherited map of each while an unset URL keeps the environment maps verbatim. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
-- `tests/run-prompt-prefetch.sh` passes against a fake MCP server and the fake `opencode`: a scoped target receives one aggregate row per in-scope host with the latest `failed_logins` and `failed_login_users`, plus the latest `ssh_logins`, `ssh_login_users`, `ssh_logins_today`, `ssh_login_users_today` and `ssh_logins_today_since`; the query takes each from the newest sample that carries a value, the instruction tells the model the data is complete, the query is restricted to the scope, and the run summary records `prefetch=ok`; an unscoped target skips with the log line, queries nothing and records `prefetch=skipped`; a failing fetch logs `run-prompt: prefetch failed:`, leaves the instruction byte-identical and still runs the agent; `ORA-00904` retries once without `cpu_cores`, logs the retry and keeps the digest; an unset `NOTIFY_PREFETCH` changes nothing; the window override reaches the SQL and the instruction; a hung server is bounded by `NOTIFY_PREFETCH_TIMEOUT_SECONDS`; the parser passes an unexpected column through into the per-host object, so a new view column needs no parser change; a null sample newer than the latest good one does not hide the good counts or usernames for either login kind; and a window of all nulls stays null.
+- `tests/run-prompt-scope.sh` passes against the fake `opencode`: a scoped target adds the scope line and exports `NOTIFY_HOST_SCOPE` as JSON; an unscoped target keeps its instruction plus the known-host line; an array scope lists both hosts; `allow_content: false` still exports only `NOTIFY_CONTENT_DISABLED` when no runbook grant is present; `allow_runbooks: true` with a `bookstack` object adds the runbook line and exports the grant plus that target's URL, books and resolved token pair; `admin-chat` exports the Vortex URL, its six books and the `vortex` credential while `automations` exports the operator URL, `runbooks` and the `operator` credential, and neither carries the other's; a grant without an instance, an instance without a grant, and a named suffix with no configured pair export nothing; a content-enabled target without the flag mentions no runbooks and clears inherited values; a malformed `bookstack` or token suffix fails before the agent runs; a global `BOOKSTACK_TOKEN_*` pair does not rescue an unconfigured suffix. The CMS case resolves `NOTIFY_HOST_PORTS` and `NOTIFY_HOST_TAILNET` from the panel `hosts` array, exports the panel hosts as `NOTIFY_ALLOWED_HOSTS`, resolves a target with no `host_scope` to every panel host in the instruction and `NOTIFY_HOST_SCOPE`, and a panel without hosts clears an inherited map of each; a cache fallback clears the CMS-derived allowlist and keeps the `SSH_ALLOWED_HOSTS` gate, while an unset URL keeps the environment maps verbatim. The MCP preflight cases still pass. The transcript cases assert the header (path, model, exact prompt), captured stdout and stderr, the exit/duration/send footer, `sent=yes` when the marker is touched, `sent=no` and the real exit code on failure, the 256 KiB cap, and that `NOTIFY_DEBUG_LLM=1` (and only then) adds `--print-logs --log-level debug`.
+- `tests/run-prompt-prefetch.sh` passes against fake Oracle and SSH MCP servers and the fake `opencode`: a scoped target receives one aggregate row per in-scope host with the latest `failed_logins` and `failed_login_users`, plus the latest `ssh_logins`, `ssh_login_users`, `ssh_logins_today`, `ssh_login_users_today` and `ssh_logins_today_since`; the query takes each from the newest sample that carries a value, the instruction tells the model the data is complete, the query is restricted to the scope, and the run summary records `prefetch=ok`; an unscoped target skips with the log line, queries nothing and records `prefetch=skipped`; a failing fetch logs `run-prompt: prefetch failed:`, leaves the instruction byte-identical and still runs the agent; `ORA-00904` retries once without `cpu_cores`, logs the retry and keeps the digest; an unset `NOTIFY_PREFETCH` changes nothing; the window override reaches the SQL and the instruction; a hung server is bounded by `NOTIFY_PREFETCH_TIMEOUT_SECONDS`; the parser passes an unexpected column through into the per-host object, so a new view column needs no parser change; a null sample newer than the latest good one does not hide the good counts or usernames for either login kind; and a window of all nulls stays null. The SSH mode supplies one probe result per in-scope host and removes the tool turn, the combined `host_stats,ssh` value supplies both sections, a failed or unscoped SSH prefetch leaves the instruction on the tool without failing the run, and a CMS target with no `host_scope` feeds both prefetches from the whole panel `hosts` list and exports it as the allowlist.
 - `python3 -m py_compile` passes on `mcp/bookstack.py`, `mcp/ssh_probe.py`, `mcp/host_report.py`, `scripts/agent_capture.py`, `scripts/discord_inbound.py`, `tests/test_bookstack.py`, `tests/test_ssh_probe.py`, `tests/test_host_report.py`, `tests/test_notify_guard.py` and `tests/test_discord_inbound.py`; `sh -n` passes on `scripts/notify.sh`, `scripts/run-prompt.sh`, `tests/notify-targets.sh`, `tests/run-prompt-fallback.sh`, `tests/run-prompt-preflight.sh`, `tests/run-prompt-prefetch.sh` and `tests/run-prompt-scope.sh`.
 - `opencode.json` statically registers three MCP servers (`oracle`, `ssh` and `bookstack`), gives all three the same 60-second startup/execution budget, keeps the global denies on `oracle_query`, `oracle_search_content`, `ssh_probe`, `bookstack_search` and `bookstack_read`, and allows all five for `notify`.
 - `tests/test_bookstack.py` makes real HTTP requests to loopback stubs (with a test-only opener that maps a fake `https://` host to each stub) and asserts what each stub received: search asks only the resolved book on the selected instance, a result whose `book.id` is outside the allowlist is dropped and never contributes to `count`, a page with `book_id: 99` is refused in both id and slug form without fetching its content, and a forbidden page, a missing page and an unknown slug return the identical `page is not available` message with no book or page name. It also covers default-deny: with `NOTIFY_RUNBOOKS_ALLOWED` missing, empty or any value other than `1`, both tools refuse with zero requests, even with a complete BookStack configuration; a grant without a URL, books or token pair refuses; a URL that is absent or not `https` fails configuration; there is no fallback to a global `BOOKSTACK_TOKEN_*` pair; the token appearing only in the `Authorization` header (never in a URL parameter) and never in output on a 401 or 500 whose body echoes it; redirect refusal; the allowlist/URL/timeout configuration errors; the startup exit path naming the variable without echoing the value; a startup without the grant serving without configuration; and a server that accepts a connection and never answers failing inside `BOOKSTACK_TIMEOUT_SECONDS`. The isolation tests run an `admin-chat` (Vortex) environment against a Vortex stub and an `automations` (operator) environment against an operator stub: each contacts only its own stub, the other stub receives zero requests, and the exported URLs and token pairs differ; each stub authenticates with its own credential. The allowlist tests also prove that a slug which does not exist on the instance is skipped, that a search with no resolvable book returns an empty result, and that a read is then refused, rather than failing the run.

@@ -60,6 +60,9 @@ fi
 if [ -n "${CAPTURE_HOST_TAILNET:-}" ]; then
     printf '%s' "${NOTIFY_HOST_TAILNET-}" > "$CAPTURE_HOST_TAILNET"
 fi
+if [ -n "${CAPTURE_ALLOWLIST:-}" ]; then
+    printf '%s' "${NOTIFY_ALLOWED_HOSTS-}" > "$CAPTURE_ALLOWLIST"
+fi
 if [ -n "${CAPTURE_OUTPUT:-}" ]; then
     printf 'agent stdout line\n'
     printf 'agent stderr line\n' >&2
@@ -178,7 +181,7 @@ capture() {
     rm -f "$out" "$out.env" "$out.scope" "$out.runbooks" \
         "$out.bookstack-url" "$out.bookstack-books" \
         "$out.bookstack-token-id" "$out.bookstack-token-secret" \
-        "$out.host-ports" "$out.host-tailnet"
+        "$out.host-ports" "$out.host-tailnet" "$out.allowlist"
     env -i \
         PATH="$tmp/bin:$PATH" \
         OPENCODE_MODEL="test/model" \
@@ -198,6 +201,7 @@ capture() {
         CAPTURE_BOOKSTACK_TOKEN_SECRET="$out.bookstack-token-secret" \
         CAPTURE_HOST_PORTS="$out.host-ports" \
         CAPTURE_HOST_TAILNET="$out.host-tailnet" \
+        CAPTURE_ALLOWLIST="$out.allowlist" \
         "$@" >"$out.stdout" 2>"$out.stderr"
 }
 
@@ -850,11 +854,80 @@ else
         no "CMS source: NOTIFY_HOST_PORTS was not exported from the panel"
     elif [ "$(cat "$tmp/cms.host-tailnet" 2>/dev/null)" != '{"cms.example":"203.0.113.10"}' ]; then
         no "CMS source: NOTIFY_HOST_TAILNET was not exported from the panel"
+    elif [ "$(cat "$tmp/cms.allowlist" 2>/dev/null)" != '["cms.example","other.example"]' ]; then
+        no "CMS source: NOTIFY_ALLOWED_HOSTS was not the panel host list"
     elif [ "$(stat -c '%a' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null || stat -f '%Lp' "$tmp/state/notify-agent/bot-settings-cache.json" 2>/dev/null)" != "600" ]; then
         no "CMS source: cache file is not 0600"
     else
         pass "run-prompt resolves targets, host ports and tailnets through the CMS and caches them"
     fi
+fi
+
+# 17b. The panel expresses "report on all hosts" by omitting host_scope. That
+#      target resolves to every CMS host, feeds the instruction and the probe
+#      scope, and the CMS host list becomes the SSH allowlist.
+if [ -n "$cms_pid" ]; then
+    kill "$cms_pid" 2>/dev/null || true
+    cms_pid=
+fi
+cms_all_hosts='{"version":1,"targets":{"all-hosts":{"channel_id":"777777777777777777"}},"sources":[],"hosts":[{"name":"cms.example","sshPort":2222},{"name":"other.example","sshPort":2200}]}'
+if ! start_cms "$cms_all_hosts"; then
+    no "CMS all hosts: loopback stub did not start"
+else
+    set +e
+    capture "$tmp/cms-all-hosts" \
+        BOT_SETTINGS_URL="$cms_url" \
+        BOT_SETTINGS_API_KEY="cms-test-key" \
+        XDG_STATE_HOME="$tmp/state-all-hosts" \
+        NOTIFY_TARGETS='{"env-target":{"channel_id":"666666666666666666"}}' \
+        "$run_prompt" -t all-hosts "Compose a status message." 2>/dev/null
+    rc=$?
+    set -e
+    err=$(cat "$tmp/cms-all-hosts.stderr")
+    prompt=$(cat "$tmp/cms-all-hosts" 2>/dev/null || true)
+    if [ "$rc" -ne 0 ]; then
+        no "CMS all hosts: run-prompt.sh failed: $err"
+    elif ! contains "$prompt" "The delivery scope for this run is \`cms.example\`, \`other.example\`."; then
+        no "CMS all hosts: absent host_scope did not resolve to every panel host"
+    elif [ "$(cat "$tmp/cms-all-hosts.scope" 2>/dev/null)" != '["cms.example","other.example"]' ]; then
+        no "CMS all hosts: NOTIFY_HOST_SCOPE was not the full panel host list"
+    elif [ "$(cat "$tmp/cms-all-hosts.allowlist" 2>/dev/null)" != '["cms.example","other.example"]' ]; then
+        no "CMS all hosts: NOTIFY_ALLOWED_HOSTS was not the panel host list"
+    else
+        pass "an absent host_scope resolves to every CMS host for delivery and SSH"
+    fi
+fi
+
+# 17c. A cache fallback keeps today's SSH_ALLOWED_HOSTS gate: the run must not
+#      export the stale CMS-derived allowlist, and a stale inherited value is
+#      cleared.
+if [ -n "$cms_pid" ]; then
+    kill "$cms_pid" 2>/dev/null || true
+    cms_pid=
+    sleep 0.1
+fi
+set +e
+capture "$tmp/cms-cache" \
+    BOT_SETTINGS_URL="$cms_url" \
+    BOT_SETTINGS_API_KEY="cms-test-key" \
+    XDG_STATE_HOME="$tmp/state-all-hosts" \
+    NOTIFY_ALLOWED_HOSTS='["stale.example"]' \
+    NOTIFY_TARGETS='{"env-target":{"channel_id":"666666666666666666"}}' \
+    "$run_prompt" -t all-hosts "Compose a status message." 2>/dev/null
+rc=$?
+set -e
+err=$(cat "$tmp/cms-cache.stderr")
+prompt=$(cat "$tmp/cms-cache" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "CMS cache: run-prompt.sh failed: $err"
+elif ! contains "$err" "config source=cache"; then
+    no "CMS cache: the cached document was not used"
+elif ! contains "$prompt" "The delivery scope for this run is \`cms.example\`, \`other.example\`."; then
+    no "CMS cache: absent host_scope was not expanded from the cached hosts"
+elif [ -n "$(cat "$tmp/cms-cache.allowlist" 2>/dev/null)" ]; then
+    no "CMS cache: a CMS-derived or inherited allowlist leaked into the fallback run"
+else
+    pass "a cache fallback keeps the SSH_ALLOWED_HOSTS gate and clears a stale allowlist"
 fi
 
 # 18. A panel document without a hosts array clears an inherited map, so the
@@ -907,6 +980,8 @@ elif [ "$(cat "$tmp/url-unset.host-ports" 2>/dev/null)" != '{"host1.example.com"
     no "unset URL: inherited NOTIFY_HOST_PORTS was not preserved"
 elif [ "$(cat "$tmp/url-unset.host-tailnet" 2>/dev/null)" != '{"host1.example.com":"203.0.113.10"}' ]; then
     no "unset URL: inherited NOTIFY_HOST_TAILNET was not preserved"
+elif [ -n "$(cat "$tmp/url-unset.allowlist" 2>/dev/null)" ]; then
+    no "unset URL: NOTIFY_ALLOWED_HOSTS was exported without the CMS"
 elif contains "$(cat "$tmp/url-unset.stderr")" "config source="; then
     no "unset URL: a config source line was logged"
 else
