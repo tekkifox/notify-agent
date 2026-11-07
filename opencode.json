@@ -61,6 +61,7 @@
           "SSH_USER": "{env:SSH_USER}",
           "SSH_KEY_PATH": "{env:SSH_KEY_PATH}",
           "SSH_ALLOWED_HOSTS": "{env:SSH_ALLOWED_HOSTS}",
+          "NOTIFY_ALLOWED_HOSTS": "{env:NOTIFY_ALLOWED_HOSTS}",
           "SSH_TIMEOUT_SECONDS": "{env:SSH_TIMEOUT_SECONDS}",
           "SSH_TOTAL_TIMEOUT_SECONDS": "{env:SSH_TOTAL_TIMEOUT_SECONDS}",
           "SSH_PORT": "{env:SSH_PORT}",

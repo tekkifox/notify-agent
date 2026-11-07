@@ -262,6 +262,9 @@ class Config:
     sources_json: str = ""
     host_ports_json: str = ""
     host_tailnets_json: str = ""
+    # Set only when the CMS supplied the configuration: the panel's host names
+    # are the probe allowlist for this reply run.
+    allowed_hosts_json: str = ""
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -897,18 +900,22 @@ def load_config(environ: Mapping[str, str]) -> Config:
         sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
         host_ports_json=env.get("NOTIFY_HOST_PORTS") or "",
         host_tailnets_json=env.get("NOTIFY_HOST_TAILNET") or "",
+        allowed_hosts_json=env.get("NOTIFY_ALLOWED_HOSTS") or "",
     )
 
 
 def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
     """Resolve targets/sources, preferring the CMS, then cache, then env.
 
-    Only the two configuration variables are replaced.  Every other setting
-    (Composio credentials, allowlist, state path) stays environment-only, so
-    the panel changes where the configuration comes from without becoming a
-    second source of truth for secrets.  The single source line is logged once
-    here; when ``BOT_SETTINGS_URL`` is unset the values are byte-for-byte the
-    environment's and nothing is logged.
+    The resolved targets, sources and optional host maps are replaced.  Every
+    other setting (Composio credentials, allowlist, state path) stays
+    environment-only, so the panel changes where the configuration comes from
+    without becoming a second source of truth for secrets.  When the CMS
+    supplied the configuration its ``hosts`` names also become the probe
+    allowlist, so ``SSH_ALLOWED_HOSTS`` is not consulted; the cache and
+    environment fallbacks keep the old allowlist exactly.  The single source
+    line is logged once here; when ``BOT_SETTINGS_URL`` is unset the values are
+    byte-for-byte the environment's and nothing is logged.
     """
 
     resolution = bot_config.resolve(environ)
@@ -930,6 +937,13 @@ def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
         env["NOTIFY_HOST_TAILNET"] = resolution.host_tailnets_json
     else:
         env.pop("NOTIFY_HOST_TAILNET", None)
+    # The CMS host list replaces SSH_ALLOWED_HOSTS only when the CMS itself
+    # supplied the document. A cache or environment fallback must not inherit
+    # a wider list from an earlier render.
+    if resolution.source == "cms" and resolution.hosts_json:
+        env["NOTIFY_ALLOWED_HOSTS"] = resolution.hosts_json
+    else:
+        env.pop("NOTIFY_ALLOWED_HOSTS", None)
     return env
 
 
@@ -1714,6 +1728,11 @@ def _agent_environment(config: Config, chosen: InboundSource) -> dict[str, str]:
     environment.pop("NOTIFY_HOST_TAILNET", None)
     if config.host_tailnets_json:
         environment["NOTIFY_HOST_TAILNET"] = config.host_tailnets_json
+    # The CMS host list is the SSH allowlist for this run. Absent means the
+    # cache/environment fallback and the old SSH_ALLOWED_HOSTS gate.
+    environment.pop("NOTIFY_ALLOWED_HOSTS", None)
+    if config.allowed_hosts_json:
+        environment["NOTIFY_ALLOWED_HOSTS"] = config.allowed_hosts_json
     environment.pop("NOTIFY_CONTENT_DISABLED", None)
     if chosen.target is not None and not chosen.target.allow_content:
         environment["NOTIFY_CONTENT_DISABLED"] = "1"

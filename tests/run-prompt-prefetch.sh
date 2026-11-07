@@ -17,7 +17,13 @@ command -v jq >/dev/null 2>&1 || {
 }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/run-prompt-prefetch.XXXXXX")
-cleanup() { rm -rf "$tmp"; }
+cms_pid=
+cleanup() {
+    if [ -n "$cms_pid" ]; then
+        kill "$cms_pid" 2>/dev/null || true
+    fi
+    rm -rf "$tmp"
+}
 trap cleanup EXIT INT TERM
 
 mkdir -p "$tmp/bin"
@@ -25,6 +31,7 @@ cat > "$tmp/bin/opencode" <<'SH'
 #!/bin/sh
 for arg do last=$arg; done
 printf '%s' "$last" > "$CAPTURE"
+printf '%s' "${NOTIFY_ALLOWED_HOSTS-}" > "$CAPTURE.allowlist"
 exit 0
 SH
 chmod +x "$tmp/bin/opencode"
@@ -234,6 +241,148 @@ for line in sys.stdin:
             },
         }
     )
+PY
+
+# Fake ssh_probe MCP server. It answers initialize and tools/list, and a
+# tools/call for `probe` returns one ok result per requested host. No SSH
+# connection is made.
+cat > "$tmp/mcp-ssh.py" <<'PY'
+import json
+import os
+import sys
+import time
+
+if "--selftest" in sys.argv[1:]:
+    sys.exit(0)
+
+
+def write(message):
+    print(json.dumps(message), flush=True)
+
+
+tools = [
+    {
+        "name": "probe",
+        "description": "stub",
+        "inputSchema": {"type": "object"},
+    }
+]
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+
+    if method == "initialize":
+        write(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "stub-ssh", "version": "1"},
+                },
+            }
+        )
+        continue
+
+    if method == "tools/list":
+        write({"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}})
+        continue
+
+    if method != "tools/call":
+        continue
+
+    arguments = request.get("params", {}).get("arguments", {})
+    hosts = arguments.get("hosts", [])
+    if not isinstance(hosts, list):
+        hosts = []
+    log = os.environ.get("SSH_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(",".join(hosts) + "\n")
+
+    if os.environ.get("SSH_PREFETCH_SLEEP"):
+        time.sleep(float(os.environ["SSH_PREFETCH_SLEEP"]))
+
+    if os.environ.get("SSH_PREFETCH_FAIL"):
+        text = json.dumps({"error": "probe unavailable"})
+        write(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": True,
+                },
+            }
+        )
+        continue
+
+    results = []
+    for host in hosts:
+        results.append(
+            {
+                "host": host,
+                "status": "ok",
+                "message": "connected",
+                "attempted": True,
+                "latency_ms": 7,
+                "failed_logins": 0,
+                "logins": "root:1,ross:1",
+                "keyhash": "0123456789ab",
+                "keys_changed": False,
+                "reboot_required": False,
+                "outdated_images": "not-checked",
+            }
+        )
+    payload = {
+        "configured": True,
+        "count": len(results),
+        "elapsed_ms": 7,
+        "results": results,
+    }
+    write(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(payload)}
+                ],
+                "isError": False,
+            },
+        }
+    )
+PY
+
+# Loopback CMS stub for the "all hosts" case.
+cat > "$tmp/cms.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+body = open(sys.argv[1], "rb").read()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+server.serve_forever()
 PY
 
 targets='{"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com"]},"general":{"channel_id":"111111111111111111"}}'
@@ -537,6 +686,140 @@ elif ! grep -Fq '"ssh_logins_today_since_latest":null' "$tmp/all_null"; then
     no "all null: the day's start time was not null"
 else
     pass "a window of all nulls stays null"
+fi
+
+# 11. NOTIFY_PREFETCH=ssh supplies the probe results before the model starts,
+#     so a digest needs no ssh_probe turn. The same scope and server are used.
+rm -f "$tmp/ssh.ssh"
+run_case ssh automations NOTIFY_PREFETCH=ssh \
+    NOTIFY_SSH_MCP_SERVER="$tmp/mcp-ssh.py" SSH_LOG="$tmp/ssh.ssh"
+prompt=$(cat "$tmp/ssh" 2>/dev/null || true)
+err=$(cat "$tmp/ssh.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "ssh prefetch: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## SSH status for this run"; then
+    no "ssh prefetch: instruction did not carry the SSH section"
+elif ! contains "$prompt" '"host":"host1.example.com"'; then
+    no "ssh prefetch: instruction lost the first host"
+elif ! contains "$prompt" '"host":"host2.example.com"'; then
+    no "ssh prefetch: instruction lost the second host"
+elif ! contains "$prompt" "Do not call ssh_probe in this run"; then
+    no "ssh prefetch: instruction did not remove the tool turn"
+elif contains "$prompt" "## Host statistics for this run"; then
+    no "ssh prefetch: instruction carried statistics that were not requested"
+elif ! contains "$err" "run-prompt: ssh prefetch: 2 host(s)"; then
+    no "ssh prefetch: success was not logged"
+elif ! grep -Fq "host1.example.com,host2.example.com" "$tmp/ssh.ssh" 2>/dev/null; then
+    no "ssh prefetch: the probe did not receive the delivery scope"
+else
+    pass "NOTIFY_PREFETCH=ssh supplies the probe results and skips the tool"
+fi
+
+# 12. Both modes in one value supply both sections, and the statistics note
+#     stops sending the model to ssh_probe.
+rm -f "$tmp/both.ssh"
+run_case both automations NOTIFY_PREFETCH=host_stats,ssh \
+    NOTIFY_SSH_MCP_SERVER="$tmp/mcp-ssh.py" SSH_LOG="$tmp/both.ssh"
+prompt=$(cat "$tmp/both" 2>/dev/null || true)
+err=$(cat "$tmp/both.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "both prefetch: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "both prefetch: instruction did not carry the statistics section"
+elif ! contains "$prompt" "## SSH status for this run"; then
+    no "both prefetch: instruction did not carry the SSH section"
+elif ! contains "$prompt" "SSH status is supplied below; do not call ssh_probe for it."; then
+    no "both prefetch: the statistics note still sent the model to ssh_probe"
+elif ! grep -q "host_label IN ('host1.example.com','host2.example.com')" "$tmp/both.sql" 2>/dev/null; then
+    no "both prefetch: the statistics query did not use the delivery scope"
+elif ! grep -Fq "host1.example.com,host2.example.com" "$tmp/both.ssh" 2>/dev/null; then
+    no "both prefetch: the probe did not receive the delivery scope"
+elif ! contains "$err" "run-prompt: ssh prefetch: 2 host(s)"; then
+    no "both prefetch: the SSH success was not logged"
+else
+    pass "NOTIFY_PREFETCH=host_stats,ssh supplies both sections"
+fi
+
+# 13. A failed SSH prefetch is logged and never fails the run; the instruction
+#     stays byte-identical so the model can still use the tool.
+run_case ssh-fail automations NOTIFY_PREFETCH=ssh \
+    NOTIFY_SSH_MCP_SERVER="$tmp/mcp-ssh.py" SSH_PREFETCH_FAIL=1
+prompt=$(cat "$tmp/ssh-fail" 2>/dev/null || true)
+err=$(cat "$tmp/ssh-fail.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "ssh prefetch failure: a failed prefetch failed the run: $err"
+elif contains "$prompt" "## SSH status for this run"; then
+    no "ssh prefetch failure: instruction carried a partial section"
+elif [ "$prompt" != "$(cat "$tmp/control")" ]; then
+    no "ssh prefetch failure: instruction was not left untouched"
+elif ! contains "$err" "run-prompt: ssh prefetch failed: probe unavailable"; then
+    no "ssh prefetch failure: the safe reason was not logged"
+else
+    pass "a failed SSH prefetch leaves the instruction on the tool"
+fi
+
+# 14. With no delivery scope the SSH prefetch skips, exactly like statistics.
+run_case ssh-unscoped general NOTIFY_PREFETCH=ssh \
+    NOTIFY_SSH_MCP_SERVER="$tmp/mcp-ssh.py" SSH_LOG="$tmp/ssh-unscoped.ssh"
+prompt=$(cat "$tmp/ssh-unscoped" 2>/dev/null || true)
+err=$(cat "$tmp/ssh-unscoped.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "ssh unscoped: run-prompt.sh failed: $err"
+elif contains "$prompt" "## SSH status for this run"; then
+    no "ssh unscoped: instruction carried SSH data"
+elif ! contains "$err" "run-prompt: ssh prefetch skipped: target has no host scope"; then
+    no "ssh unscoped: skip was not logged"
+elif [ -s "$tmp/ssh-unscoped.ssh" ]; then
+    no "ssh unscoped: the probe was called despite having no scope"
+elif [ "$prompt" != "$(cat "$tmp/control-unscoped")" ]; then
+    no "ssh unscoped: instruction changed"
+else
+    pass "an unscoped target skips the SSH prefetch and calls no probe"
+fi
+
+# 15. A CMS target with no host_scope resolves to every panel host, which feeds
+#     both prefetches and becomes the SSH allowlist.
+cms_doc='{"version":1,"targets":{"automations":{"channel_id":"555555555555555555"}},"sources":[],"hosts":[{"name":"host1.example.com","sshPort":2222},{"name":"host2.example.com","sshPort":2200}]}'
+printf '%s' "$cms_doc" > "$tmp/cms-body.json"
+rm -f "$tmp/cms-port"
+python3 "$tmp/cms.py" "$tmp/cms-body.json" "$tmp/cms-port" &
+cms_pid=$!
+tries=0
+while [ ! -s "$tmp/cms-port" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 100 ]; then
+        break
+    fi
+    sleep 0.05
+done
+if [ ! -s "$tmp/cms-port" ]; then
+    no "CMS all hosts: loopback stub did not start"
+else
+    cms_url="http://127.0.0.1:$(cat "$tmp/cms-port")/api/bot-settings"
+    rm -f "$tmp/cms-all.ssh"
+    run_case cms-all automations NOTIFY_PREFETCH=host_stats,ssh \
+        BOT_SETTINGS_URL="$cms_url" \
+        BOT_SETTINGS_API_KEY="cms-test-key" \
+        XDG_STATE_HOME="$tmp/state-cms" \
+        NOTIFY_SSH_MCP_SERVER="$tmp/mcp-ssh.py" \
+        SSH_LOG="$tmp/cms-all.ssh"
+    prompt=$(cat "$tmp/cms-all" 2>/dev/null || true)
+    err=$(cat "$tmp/cms-all.stderr" 2>/dev/null || true)
+    if [ "$rc" -ne 0 ]; then
+        no "CMS all hosts: run-prompt.sh failed: $err"
+    elif ! contains "$err" "config source=cms hosts=2 ssh_ports=2"; then
+        no "CMS all hosts: the CMS was not the source"
+    elif ! grep -q "host_label IN ('host1.example.com','host2.example.com')" "$tmp/cms-all.sql" 2>/dev/null; then
+        no "CMS all hosts: absent host_scope did not reach the statistics query"
+    elif ! contains "$prompt" "## SSH status for this run"; then
+        no "CMS all hosts: SSH results were not supplied"
+    elif ! contains "$prompt" '"host":"host2.example.com"'; then
+        no "CMS all hosts: the second panel host was not probed"
+    elif [ "$(cat "$tmp/cms-all.allowlist" 2>/dev/null)" != '["host1.example.com","host2.example.com"]' ]; then
+        no "CMS all hosts: the panel host list was not exported as the allowlist"
+    else
+        pass "an absent host_scope resolves to every CMS host for both prefetches"
+    fi
 fi
 
 if [ "$failures" -ne 0 ]; then

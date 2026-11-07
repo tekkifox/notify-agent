@@ -1209,6 +1209,143 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("SSH_TIMEOUT_SECONDS must be a number", stderr.getvalue())
 
 
+class CmsAllowlistTests(unittest.TestCase):
+    def test_cms_allowlist_replaces_ssh_allowed_hosts(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "SSH_ALLOWED_HOSTS": "legacy.example",
+                "NOTIFY_ALLOWED_HOSTS": '["cms.example.com"]',
+            }
+            connector = Connector()
+            with mock.patch.dict(os.environ, env, clear=True):
+                payload = ssh_probe.probe(
+                    ["cms.example.com", "legacy.example"],
+                    connector=connector,
+                )
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["ok", "not_allowed"],
+        )
+        self.assertEqual(connector.calls, [("cms.example.com", 5.0)])
+
+    def test_an_empty_cms_allowlist_permits_nothing(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "SSH_ALLOWED_HOSTS": "host1.example.com",
+                "NOTIFY_ALLOWED_HOSTS": "[]",
+            }
+            connector = Connector()
+            with mock.patch.dict(os.environ, env, clear=True):
+                payload = ssh_probe.probe(
+                    ["host1.example.com"], connector=connector
+                )
+        self.assertEqual(payload["results"][0]["status"], "not_allowed")
+        self.assertEqual(connector.calls, [])
+
+    def test_cms_allowlist_still_uses_the_run_scope(self) -> None:
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "NOTIFY_ALLOWED_HOSTS": (
+                    '["host1.example.com","host3.example.com"]'
+                ),
+                "NOTIFY_HOST_SCOPE": '["host3.example.com"]',
+            }
+            connector = Connector()
+            with mock.patch.dict(os.environ, env, clear=True):
+                payload = ssh_probe.probe(
+                    ["host1.example.com", "host3.example.com"],
+                    run_scope=ssh_probe.parse_run_scope(),
+                    connector=connector,
+                )
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["out_of_scope", "ok"],
+        )
+        self.assertEqual(connector.calls, [("host3.example.com", 5.0)])
+
+    def test_a_malformed_cms_allowlist_fails_naming_only_the_variable(
+        self,
+    ) -> None:
+        for value in ("not json", '{"hosts":[]}', '["ok.example",7]', '["bad host"]'):
+            with self.subTest(value=value), tempfile.NamedTemporaryFile() as key:
+                env = {
+                    "SSH_USER": "agent",
+                    "SSH_KEY_PATH": key.name,
+                    "NOTIFY_ALLOWED_HOSTS": value,
+                }
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(ssh_probe.ConfigError) as caught:
+                        ssh_probe.load_settings()
+                self.assertIn("NOTIFY_ALLOWED_HOSTS", str(caught.exception))
+
+
+class ScopeArgumentTests(unittest.TestCase):
+    def _call(self, run_scope, requested, hosts):
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "SSH_ALLOWED_HOSTS": (
+                    "host1.example.com,host2.example.com,host3.example.com"
+                ),
+                "NOTIFY_HOST_SCOPE": json.dumps(run_scope),
+            }
+            connector = Connector()
+            with mock.patch.dict(
+                os.environ, env, clear=True
+            ), mock.patch.object(ssh_probe, "_connector", connector):
+                text, is_error = ssh_probe.call_probe(
+                    {"hosts": hosts, "scope": requested}
+                )
+        return json.loads(text), is_error, connector
+
+    def test_a_json_array_string_equal_to_the_run_scope_is_harmless(self) -> None:
+        payload, is_error, connector = self._call(
+            ["host1.example.com", "host3.example.com"],
+            '["host1.example.com","host3.example.com"]',
+            ["host1.example.com", "host3.example.com"],
+        )
+        self.assertFalse(is_error)
+        self.assertEqual(
+            [result["status"] for result in payload["results"]], ["ok", "ok"]
+        )
+        self.assertEqual(len(connector.calls), 2)
+
+    def test_a_json_array_string_scope_cannot_widen_the_run_scope(self) -> None:
+        payload, is_error, connector = self._call(
+            ["host3.example.com"],
+            '["host1.example.com","host3.example.com"]',
+            ["host1.example.com", "host3.example.com"],
+        )
+        self.assertFalse(is_error)
+        self.assertEqual(
+            [result["status"] for result in payload["results"]],
+            ["out_of_scope", "ok"],
+        )
+        self.assertEqual(connector.calls, [("host3.example.com", 5.0)])
+
+    def test_a_malformed_json_array_string_is_still_refused(self) -> None:
+        env = {
+            "SSH_USER": "agent",
+            "SSH_KEY_PATH": "/run/secrets/id_ed25519",
+            "SSH_ALLOWED_HOSTS": "host3.example.com",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            ssh_probe, "_connector", Connector()
+        ):
+            text, is_error = ssh_probe.call_probe(
+                {"hosts": ["host3.example.com"], "scope": '["host3.example.com"'}
+            )
+        self.assertTrue(is_error)
+        self.assertIn("scope", json.loads(text)["error"])
+
+
 class ProtocolTests(unittest.TestCase):
     def test_tools_list_exposes_probe(self) -> None:
         responses = io.StringIO()

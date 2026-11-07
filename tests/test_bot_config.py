@@ -206,6 +206,7 @@ class ResolverTests(unittest.TestCase):
         self.assertFalse(resolution.log_required)
         self.assertEqual(resolution.targets_json, env["NOTIFY_TARGETS"])
         self.assertEqual(resolution.sources_json, env["NOTIFY_INBOUND_SOURCES"])
+        self.assertEqual(resolution.hosts_json, "")
         self.assertFalse(self.cache.exists())
 
     def test_fetch_success_uses_cms_and_writes_cache(self) -> None:
@@ -242,6 +243,88 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.cache.stat().st_mode), 0o600)
         leftovers = list(self.cache.parent.glob(".bot-settings-*.tmp"))
         self.assertEqual(leftovers, [])
+
+    def test_absent_host_scope_resolves_to_every_cms_host(self) -> None:
+        targets = {
+            "all-hosts": {"channel_id": CHANNEL},
+            "narrow": {
+                "channel_id": OTHER_CHANNEL,
+                "host_scope": "host2.example.com",
+            },
+        }
+        hosts = [
+            {"name": "host2.example.com", "sshPort": 2200},
+            {"name": "host1.example.com", "sshPort": 2222},
+        ]
+        with StubServer(
+            200, encode(document(targets=targets, hosts=hosts, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        resolved = json.loads(resolution.targets_json)
+        self.assertEqual(
+            resolved["all-hosts"]["host_scope"],
+            ["host2.example.com", "host1.example.com"],
+        )
+        self.assertEqual(resolved["narrow"]["host_scope"], "host2.example.com")
+        self.assertEqual(
+            json.loads(resolution.hosts_json),
+            ["host2.example.com", "host1.example.com"],
+        )
+
+    def test_explicit_empty_host_scope_is_still_refused(self) -> None:
+        with StubServer(200, encode(document())) as server:
+            self.assertEqual(self.resolve(server.url).source, "cms")
+
+        bad_targets = {
+            "panel-target": {"channel_id": CHANNEL, "host_scope": []}
+        }
+        with StubServer(
+            200, encode(document(targets=bad_targets, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.source, "cache")
+        self.assertIn("invalid host_scope", resolution.reason)
+        self.assertEqual(json.loads(resolution.targets_json), CMS_TARGETS)
+
+    def test_cached_document_also_expands_an_absent_host_scope(self) -> None:
+        targets = {"all-hosts": {"channel_id": CHANNEL}}
+        with StubServer(
+            200, encode(document(targets=targets, sources=[]))
+        ) as server:
+            fresh = self.resolve(server.url)
+        self.assertEqual(
+            json.loads(fresh.targets_json)["all-hosts"]["host_scope"],
+            ["host1.example.com", "host2.example.com"],
+        )
+
+        with StubServer(401, b"denied") as server:
+            cached = self.resolve(server.url)
+
+        self.assertEqual(cached.source, "cache")
+        self.assertEqual(
+            json.loads(cached.targets_json)["all-hosts"]["host_scope"],
+            ["host1.example.com", "host2.example.com"],
+        )
+        self.assertEqual(
+            json.loads(cached.hosts_json),
+            ["host1.example.com", "host2.example.com"],
+        )
+
+    def test_no_cms_hosts_leaves_an_absent_host_scope_unscoped(self) -> None:
+        targets = {"all-hosts": {"channel_id": CHANNEL}}
+        with StubServer(
+            200,
+            encode(document(targets=targets, hosts=None, sources=[])),
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(
+            json.loads(resolution.targets_json),
+            {"all-hosts": {"channel_id": CHANNEL}},
+        )
+        self.assertEqual(json.loads(resolution.hosts_json), [])
 
     def test_hosts_absent_leaves_host_ports_unset(self) -> None:
         with StubServer(200, encode(document(hosts=None))) as server:
@@ -578,7 +661,15 @@ class ResolverTests(unittest.TestCase):
         # could not be updated; the previous good copy is intact and no
         # partial temp file is left behind.
         self.assertEqual(resolution.source, "cms")
-        self.assertEqual(json.loads(resolution.targets_json), {"new-target": {"channel_id": OTHER_CHANNEL}})
+        self.assertEqual(
+            json.loads(resolution.targets_json),
+            {
+                "new-target": {
+                    "channel_id": OTHER_CHANNEL,
+                    "host_scope": ["host1.example.com", "host2.example.com"],
+                }
+            },
+        )
         self.assertEqual(self.cache.read_bytes(), first)
         self.assertEqual(
             list(self.cache.parent.glob(".bot-settings-*.tmp")), []
@@ -679,6 +770,11 @@ class CommandLineTests(unittest.TestCase):
         payload = json.loads(combined.stdout)
         self.assertEqual(json.loads(payload["targets"]), CMS_TARGETS)
         self.assertEqual(json.loads(payload["sources"]), CMS_SOURCES)
+        self.assertEqual(payload["source"], "cms")
+        self.assertEqual(
+            json.loads(payload["hosts"]),
+            ["host1.example.com", "host2.example.com"],
+        )
         self.assertEqual(
             json.loads(payload["host_ports"]),
             {"host1.example.com": 2222, "host2.example.com": 2200},
@@ -790,6 +886,10 @@ class InboundWiringTests(unittest.TestCase):
             json.loads(child_env["NOTIFY_HOST_TAILNET"]),
             {"host1.example.com": "203.0.113.10"},
         )
+        self.assertEqual(
+            json.loads(child_env["NOTIFY_ALLOWED_HOSTS"]),
+            ["host1.example.com", "host2.example.com"],
+        )
 
     def test_agent_child_does_not_inherit_a_stale_host_port_map(self) -> None:
         with StubServer(200, encode(document(hosts=None))) as server:
@@ -810,6 +910,7 @@ class InboundWiringTests(unittest.TestCase):
         child_env = popen.call_args.kwargs["env"]
         self.assertNotIn("NOTIFY_HOST_PORTS", child_env)
         self.assertNotIn("NOTIFY_HOST_TAILNET", child_env)
+        self.assertEqual(json.loads(child_env["NOTIFY_ALLOWED_HOSTS"]), [])
 
     def test_resolved_environment_carries_the_cms_tailnet_map(self) -> None:
         with StubServer(200, encode(document())) as server:
@@ -832,9 +933,20 @@ class InboundWiringTests(unittest.TestCase):
             env = dict(self.env)
             env["BOT_SETTINGS_URL"] = server.url
             env["NOTIFY_HOST_TAILNET"] = '{"stale.example":"203.0.113.99"}'
+            env["NOTIFY_ALLOWED_HOSTS"] = '["stale.example"]'
             resolved = discord_inbound.resolve_environment(env)
 
         self.assertNotIn("NOTIFY_HOST_TAILNET", resolved)
+        self.assertEqual(json.loads(resolved["NOTIFY_ALLOWED_HOSTS"]), [])
+
+    def test_resolved_environment_clears_a_stale_allowlist_on_fallback(self) -> None:
+        with StubServer(401, b"denied") as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            env["NOTIFY_ALLOWED_HOSTS"] = '["stale.example"]'
+            resolved = discord_inbound.resolve_environment(env)
+
+        self.assertNotIn("NOTIFY_ALLOWED_HOSTS", resolved)
 
     def test_listener_falls_back_to_env_without_a_cache(self) -> None:
         with StubServer(401, b"denied") as server:
