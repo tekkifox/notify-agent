@@ -10,7 +10,7 @@ set -eu
 repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 notify="$repo_dir/scripts/notify.sh"
 
-for bin in python3 openssl curl jq; do
+for bin in python3 openssl curl jq bash; do
     command -v "$bin" >/dev/null 2>&1 || {
         printf 'test: %s is required\n' "$bin" >&2
         exit 1
@@ -49,16 +49,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length)
         index = len([n for n in os.listdir(captures) if n.endswith(".json")])
-        with open(os.path.join(captures, "req-%d.json" % index), "wb") as fh:
+        # Write under a temporary name and rename into place: a reader that
+        # counts or reads *.json must never see a half-written or empty
+        # capture, whatever the filesystem's visibility timing.
+        json_path = os.path.join(captures, "req-%d.json" % index)
+        with open(json_path + ".tmp", "wb") as fh:
             fh.write(body)
-        with open(os.path.join(captures, "req-%d.path" % index), "w") as fh:
+        os.replace(json_path + ".tmp", json_path)
+        path_path = os.path.join(captures, "req-%d.path" % index)
+        with open(path_path + ".tmp", "w") as fh:
             fh.write(self.path)
+        os.replace(path_path + ".tmp", path_path)
         # A path containing REJECT stands in for a remote refusal.
         status = 500 if "REJECT" in self.path else 200
+        response_body = b"{}"
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        # Content-Length, so curl reads the response and closes cleanly rather
+        # than depending on the connection close to delimit the body.
+        self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(response_body)
 
     def log_message(self, *args):
         pass
@@ -73,7 +84,8 @@ with open(port_file, "w") as fh:
 server.serve_forever()
 PY
 
-python3 "$tmp/stub.py" "$tmp/captures" "$tmp/cert.pem" "$tmp/key.pem" "$tmp/port" &
+python3 "$tmp/stub.py" "$tmp/captures" "$tmp/cert.pem" "$tmp/key.pem" "$tmp/port" \
+    2>"$tmp/stub.log" &
 stub_pid=$!
 
 i=0
@@ -86,6 +98,23 @@ while [ ! -s "$tmp/port" ]; do
     sleep 0.1
 done
 api_base="https://127.0.0.1:$(cat "$tmp/port")"
+
+# The port file exists before serve_forever() is reached, so do not assume the
+# stub answers yet: complete one TLS request before the first real case. A GET
+# is not captured, and 501 is fine; what matters is a completed round trip.
+i=0
+while :; do
+    i=$((i + 1))
+    if curl -sS --proto '=https' --tlsv1.2 --max-time 2 \
+        --cacert "$tmp/cert.pem" -o /dev/null "$api_base/" 2>/dev/null; then
+        break
+    fi
+    [ "$i" -lt 25 ] || {
+        printf 'test: stub did not answer\n' >&2
+        exit 1
+    }
+    sleep 0.1
+done
 
 targets='{"general":{"channel_id":"111111111111111111","connected_account_id":"aaaaaaaa-1111-1111-1111-111111111111"},"admin-chat":{"channel_id":"222222222222222222","connected_account_id":"bbbbbbbb-2222-2222-2222-222222222222"}}'
 
@@ -147,6 +176,22 @@ send_message() {
         CURL_CA_BUNDLE="$tmp/cert.pem" \
         "$@" \
         "$notify" -t "$target" -m "$message"
+}
+
+# send_with_shell SHELL [ENV=VALUE ...] -- runs notify.sh through an explicit
+# interpreter, so a shell-specific bug cannot hide behind the shebang.
+send_with_shell() {
+    interpreter=$1
+    shift
+    env -i \
+        PATH="$PATH" \
+        COMPOSIO_API_KEY="test-key" \
+        COMPOSIO_TOOL="DISCORDBOT_CREATE_MESSAGE" \
+        COMPOSIO_API_BASE="$api_base" \
+        SSL_CERT_FILE="$tmp/cert.pem" \
+        CURL_CA_BUNDLE="$tmp/cert.pem" \
+        "$@" \
+        "$interpreter" "$notify" -m "hello"
 }
 
 expect_fail() {
@@ -689,27 +734,37 @@ else
     pass "no NOTIFY_SEND_MARKER means no behaviour change"
 fi
 
-# 19. An unwritable marker never turns a delivered message into a failure.
-marker="$tmp/no-such-directory/marker"
-before=$(count_requests)
-set +e
-out=$(send NOTIFY_SEND_MARKER="$marker" 2>&1)
-rc=$?
-set -e
-after=$(count_requests)
-if [ "$rc" -ne 0 ]; then
-    no "send marker unwritable: a delivered send exited non-zero: $out"
-elif [ -e "$marker" ]; then
-    no "send marker unwritable: the marker unexpectedly exists"
-elif [ "$after" -ne $((before + 1)) ]; then
-    no "send marker unwritable: expected one request"
-elif ! contains "$out" "warning: could not record the send marker"; then
-    no "send marker unwritable: no warning was printed"
-else
-    pass "an unwritable marker does not change the exit status"
-fi
+# 19. An unwritable marker never turns a delivered message into a failure, in
+#     every shell the script might run under. This is shell-specific: dash
+#     aborts the whole script on a failed redirection to a special builtin, and
+#     /bin/sh is dash here and in CI, so run the interpreter explicitly instead
+#     of trusting the shebang.
+for shell in sh bash; do
+    marker="$tmp/no-such-directory/marker"
+    before=$(count_requests)
+    set +e
+    out=$(send_with_shell "$shell" NOTIFY_SEND_MARKER="$marker" 2>&1)
+    rc=$?
+    set -e
+    after=$(count_requests)
+    if [ "$rc" -ne 0 ]; then
+        no "send marker unwritable ($shell): a delivered send exited non-zero: $out"
+    elif [ -e "$marker" ]; then
+        no "send marker unwritable ($shell): the marker unexpectedly exists"
+    elif [ "$after" -ne $((before + 1)) ]; then
+        no "send marker unwritable ($shell): expected one request"
+    elif ! contains "$out" "warning: could not record the send marker"; then
+        no "send marker unwritable ($shell): no warning was printed"
+    else
+        pass "an unwritable marker does not change the exit status ($shell)"
+    fi
+done
 
 if [ "$failures" -ne 0 ]; then
+    if [ -s "$tmp/stub.log" ]; then
+        printf 'test: stub log follows\n' >&2
+        cat "$tmp/stub.log" >&2
+    fi
     printf '%d test(s) failed\n' "$failures" >&2
     exit 1
 fi
