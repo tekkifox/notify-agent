@@ -86,11 +86,13 @@ usage_fail() {
 # delivered message into a failed one (the exit status must not change).
 mark_sent() {
     [ -n "${NOTIFY_SEND_MARKER:-}" ] || return 0
-    # `printf`, not `:`, because a redirection error on a POSIX special builtin
-    # aborts a non-interactive shell under dash, which would turn a delivered
-    # message into a failed one. stderr goes first so the shell's own "cannot
-    # create" line is suppressed too.
-    if ! printf '' 2>/dev/null > "$NOTIFY_SEND_MARKER"; then
+    # A redirection error on a POSIX special builtin aborts a non-interactive
+    # shell, and dash (/bin/sh here and in CI) does exactly that: a bare
+    # `: > path` would take the whole script down after a delivered send. Put
+    # the special builtin in its own subshell, where a failed redirection can
+    # only fail that subshell. The subshell's stderr is /dev/null, so the
+    # shell's own "cannot create" line is suppressed too.
+    if ! ( : > "$NOTIFY_SEND_MARKER" ) 2>/dev/null; then
         printf '%s: warning: could not record the send marker\n' "$PROG" >&2
     fi
     return 0
