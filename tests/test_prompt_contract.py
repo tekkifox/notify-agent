@@ -290,6 +290,14 @@ class PromptContractTests(unittest.TestCase):
             "it entirely",
             FLAT_PROMPT,
         )
+        self.assertIn(
+            "with neither, it probes exactly this run's delivery scope",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "or every host in the run's delivery scope when it lists none",
+            FLAT_PROMPT,
+        )
 
     def test_ssh_failure_omits_the_ssh_part(self) -> None:
         self.assertIn(
@@ -748,6 +756,30 @@ class FleetDigestScheduleTests(unittest.TestCase):
     def test_morning_digest_keeps_its_character_limit(self) -> None:
         line = self._schedule_line("crontab", "0 9 * * * ", "automations")
         self.assertIn("2,000 characters", line)
+
+    def test_daily_ssh_report_takes_its_hosts_from_the_scope(self) -> None:
+        """The CMS target's host_scope is the only host list the report needs."""
+        for name in CRONTABS:
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "0 8 * * * ", "automations")
+                self.assertIn("Call ssh_probe without a host list", line)
+                self.assertIn(
+                    "it probes every host in the scope of this target", line
+                )
+                self.assertIn("outside the scope of this run", line)
+                self.assertNotIn("outside the seven", line)
+                # No enumerated hosts, so the CMS list stays authoritative.
+                for host in (
+                    "rossmoney.me",
+                    "photos.rossmoney.me",
+                    "vortexservers.co.uk",
+                    "storage.rossmoney.me",
+                    "paseo.rossmoney.me",
+                    "mgmt.rossmoney.me",
+                    "media.rossmoney.me",
+                ):
+                    with self.subTest(host=host):
+                        self.assertNotIn(host, line)
 
     def test_live_morning_digest_matches_the_template(self) -> None:
         self.assertEqual(
