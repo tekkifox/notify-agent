@@ -222,10 +222,11 @@ Morning digest:
     whole host lines from the end and end with
     `… truncated: N host line(s) not shown`, where N is exactly the number
     dropped. Never let the report be cut mid-line by the transport.
-32. `ssh_probe` takes `{"hosts": [...]}` (or a single `{"host": "..."}`) and
-    returns one result per host: `status: "ok"` with `latency_ms` and the
-    fields from the host's forced status line — `failed_logins` (an integer
-    for the day), `logins` (the accepted-login breakdown), `keyhash` (a
+32. `ssh_probe` takes an optional `{"hosts": [...]}` (or a single
+    `{"host": "..."}`); with neither, it probes exactly this run's delivery
+    scope. It returns one result per host: `status: "ok"` with `latency_ms`
+    and the fields from the host's forced status line — `failed_logins` (an
+    integer for the day), `logins` (the accepted-login breakdown), `keyhash` (a
     12-character hash of `authorized_keys`), `keys_changed` (whether that hash
     changed since the last probe), `reboot_required` (true/false) and
     `outdated_images` (`not-checked`, or a count and stale image names) — or a
@@ -251,7 +252,8 @@ Morning digest:
     result is refused as `not_allowed` or `out_of_scope`, omit it entirely; do
     not write "a host was refused" into the message. In a run scoped to
     `admin-chat`, no rossmoney host may appear at all; in a run scoped to the
-    automations target, report only the hosts the instruction lists.
+    automations target, report only the hosts the instruction lists, or every
+    host in the run's delivery scope when it lists none.
 36. If `ssh_probe` cannot run, omit the SSH part of the digest entirely. Do not
     imply any host is healthy, and do not substitute a guess. Still send the
     host-statistics part.

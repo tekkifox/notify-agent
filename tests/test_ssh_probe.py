@@ -1346,6 +1346,78 @@ class ScopeArgumentTests(unittest.TestCase):
         self.assertIn("scope", json.loads(text)["error"])
 
 
+class DefaultScopeTests(unittest.TestCase):
+    """An omitted host list falls back to the run scope, never to everything."""
+
+    def _call(self, run_scope, arguments, allowed=None):
+        with tempfile.NamedTemporaryFile() as key:
+            env = {
+                "SSH_USER": "agent",
+                "SSH_KEY_PATH": key.name,
+                "SSH_ALLOWED_HOSTS": (
+                    allowed
+                    if allowed is not None
+                    else "host1.example.com,host2.example.com,host3.example.com"
+                ),
+            }
+            if run_scope is not None:
+                env["NOTIFY_HOST_SCOPE"] = json.dumps(run_scope)
+            connector = Connector()
+            with mock.patch.dict(
+                os.environ, env, clear=True
+            ), mock.patch.object(ssh_probe, "_connector", connector):
+                text, is_error = ssh_probe.call_probe(arguments)
+        return json.loads(text), is_error, connector
+
+    def test_omitted_hosts_probe_exactly_the_run_scope(self) -> None:
+        payload, is_error, connector = self._call(
+            ["host1.example.com", "host3.example.com"], {}
+        )
+        self.assertFalse(is_error)
+        self.assertEqual(
+            [result["status"] for result in payload["results"]], ["ok", "ok"]
+        )
+        self.assertEqual(
+            connector.calls,
+            [("host1.example.com", 5.0), ("host3.example.com", 5.0)],
+        )
+
+    def test_omitted_hosts_without_a_scope_are_refused(self) -> None:
+        payload, is_error, connector = self._call(None, {})
+        self.assertTrue(is_error)
+        self.assertIn("no host scope", payload["error"])
+        self.assertEqual(connector.calls, [])
+
+    def test_an_empty_scope_is_not_a_fallback_to_everything(self) -> None:
+        payload, is_error, connector = self._call([], {})
+        self.assertTrue(is_error)
+        self.assertIn("no host scope", payload["error"])
+        self.assertEqual(connector.calls, [])
+
+    def test_an_explicit_list_still_narrows_the_scope(self) -> None:
+        payload, is_error, connector = self._call(
+            ["host1.example.com", "host3.example.com"],
+            {"hosts": ["host1.example.com"]},
+        )
+        self.assertFalse(is_error)
+        self.assertEqual(
+            [result["status"] for result in payload["results"]], ["ok"]
+        )
+        self.assertEqual(connector.calls, [("host1.example.com", 5.0)])
+
+    def test_a_scoped_host_outside_the_allowlist_is_refused(self) -> None:
+        payload, is_error, connector = self._call(
+            ["host2.example.com"],
+            {},
+            allowed="host1.example.com",
+        )
+        self.assertFalse(is_error)
+        result = payload["results"][0]
+        self.assertEqual(result["status"], "not_allowed")
+        self.assertFalse(result["attempted"])
+        self.assertEqual(connector.calls, [])
+
+
 class ProtocolTests(unittest.TestCase):
     def test_tools_list_exposes_probe(self) -> None:
         responses = io.StringIO()

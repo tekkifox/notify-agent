@@ -13,6 +13,10 @@ key, token or password from the operator's deployment.
 - When a code default is only a convenience and the deployment sets the variable explicitly, the
   default is documentation too: give it a placeholder.
 
+## One host list
+
+Prompts never enumerate SSH hosts: `ssh_probe` defaults to the target's `host_scope`, so the CMS is the only list.
+
 ## `/bin/sh` is dash, and dash exits on some redirection errors
 
 `/bin/sh` is dash in the container image and on the CI runner, and it is not bash. A failed

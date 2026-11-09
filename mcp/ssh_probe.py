@@ -34,8 +34,14 @@ short ``failed_logins_reason`` (``unreadable``, ``timeout``, ``unavailable`` or
 was fully read and parsed can produce a number, including a genuine zero.
 
 Input is ``{"hosts": ["a.example", "b.example"]}`` or a single
-``{"host": "a.example"}``. Every requested host gets one result. A failure for
-one host never fails the call or hides the other hosts.
+``{"host": "a.example"}``. The host list is optional: when both keys are
+omitted, the probe checks exactly the hosts in this run's delivery scope
+(``NOTIFY_HOST_SCOPE``, exported by ``scripts/run-prompt.sh`` from the selected
+target's ``host_scope``). An explicitly supplied list can only narrow that
+scope, never widen it. With no scope and no list the call is refused rather
+than probing every host or guessing from the port map. Every requested host
+gets one result. A failure for one host never fails the call or hides the
+other hosts.
 
 Two independent host boundaries are enforced here, before any socket is
 opened:
@@ -285,7 +291,11 @@ TOOL = {
     "name": "probe",
     "description": (
         "Check SSH reachability, key authentication and host status for one "
-        "or more hosts. Every host returns a result: status 'ok' with "
+        "or more hosts. The host list is optional: with neither 'hosts' nor "
+        "'host', the tool checks every host in this run's delivery scope "
+        "(the CMS target's host_scope); the call is refused when the run has "
+        "no scope. An explicit list can narrow that scope but never widen it. "
+        "Every host returns a result: status 'ok' with "
         "latency_ms and the line printed by the host's forced ssh-status.sh: "
         "failed_logins (failed-password count for the day), logins (the "
         "accepted-login breakdown), keyhash (a 12-character hash of every "
@@ -312,14 +322,18 @@ TOOL = {
                 "items": {"type": "string"},
                 "description": (
                     "Hosts to check. At most "
-                    f"{MAX_HOSTS} hosts; duplicates are collapsed."
+                    f"{MAX_HOSTS} hosts; duplicates are collapsed. Optional: "
+                    "when both 'hosts' and 'host' are omitted, every host in "
+                    "this run's delivery scope is checked; if the run has no "
+                    "scope, the call is refused."
                 ),
             },
             "host": {
                 "type": "string",
                 "description": (
                     "A single host to check. Used only when 'hosts' is "
-                    "absent."
+                    "absent. Optional in the same way: with no 'hosts' and no "
+                    "'host', this run's delivery scope is checked."
                 ),
             },
             "scope": {
@@ -893,6 +907,29 @@ def prepare_hosts(arguments: dict[str, Any]) -> list[str]:
     return hosts
 
 
+def resolve_hosts(
+    arguments: dict[str, Any], run_scope: Sequence[str]
+) -> list[str]:
+    """Return the hosts to probe for one call.
+
+    An explicit ``hosts`` or ``host`` always wins and is only narrowed later
+    by the run scope. When both are omitted, the run scope is the list, so the
+    CMS target's ``host_scope`` is the single source of truth for which hosts
+    a scheduled report covers. With no scope and no list there is nothing
+    trustworthy to probe: refuse instead of probing everything or inferring a
+    list from the port map.
+    """
+
+    if arguments.get("hosts") is not None or arguments.get("host") is not None:
+        return prepare_hosts(arguments)
+    if not run_scope:
+        raise InputError(
+            "no hosts given and this run has no host scope; "
+            "pass hosts or use a target with a host_scope"
+        )
+    return list(run_scope)
+
+
 def _policy_result(
     host: str,
     allowed: Sequence[str],
@@ -1405,11 +1442,11 @@ def call_probe(arguments: dict[str, Any]) -> tuple[str, bool]:
     """Return (text, is_error) for one tools/call invocation."""
 
     try:
-        hosts = prepare_hosts(arguments)
+        run_scope = parse_run_scope()
+        hosts = resolve_hosts(arguments, run_scope)
         requested_scope = None
         if "scope" in arguments and arguments.get("scope") is not None:
             requested_scope = parse_scope_argument(arguments.get("scope"))
-        run_scope = parse_run_scope()
     except (InputError, ConfigError) as exc:
         return _error_payload(str(exc)), True
 
