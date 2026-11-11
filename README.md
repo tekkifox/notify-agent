@@ -1094,10 +1094,11 @@ post fails, the failure is logged and the plain JSON post is retried, so an
 attachment can never turn a delivered message into a failed run. The Composio
 path has no file upload, so it sends text and logs one warning.
 
-A named target reaches a webhook through its own variable. When the run names a
-target and `NOTIFY_ATTACH_DIR` holds a PNG, `notify.sh` reads
-`NOTIFY_WEBHOOK_<TARGET>`, where `<TARGET>` is the target name uppercased with
-every character that is not `A-Z0-9` replaced by `_`:
+A named target reaches a webhook through its own variable, or the bot creates
+one. When a run names a target and `NOTIFY_ATTACH_DIR` holds a PNG,
+`notify.sh` first reads `NOTIFY_WEBHOOK_<TARGET>`, where `<TARGET>` is the
+target name uppercased with every character that is not `A-Z0-9` replaced by
+`_`:
 
 | target | variable |
 | --- | --- |
@@ -1105,23 +1106,39 @@ every character that is not `A-Z0-9` replaced by `_`:
 | `automations` | `NOTIFY_WEBHOOK_AUTOMATIONS` |
 | `ops.eu` | `NOTIFY_WEBHOOK_OPS_EU` |
 
-A webhook URL is a credential: it is never printed, neither on success nor in a
-warning or an error. Each target has its own, so a chart is never posted to the
-wrong chat, and a target never falls back to `DISCORD_WEBHOOK_URL` (the script
-still refuses that combination). Only `https://discord.com/api/webhooks/...`
-and `https://discordapp.com/api/webhooks/...` are accepted; any other value
-logs one line naming the target and sends text only. A variable that is unset
-keeps today's behaviour exactly: Composio text with its attachment warning. A
-chat with no variable therefore gets text only, whatever another target has
-configured. A message with no attached PNG never uses this path.
+A variable that is set wins and must be a Discord webhook URL. It is an
+override for testing, or for a chat where the bot lacks Manage Webhooks. Only
+`https://discord.com/api/webhooks/...` and
+`https://discordapp.com/api/webhooks/...` are accepted; any other value logs
+one line naming the target and sends text only.
+
+When the variable is unset, `notify.sh` resolves a webhook at send time through
+Composio, using the target's `connected_account_id` (a bot connection covers
+one server). It calls `DISCORDBOT_LIST_CHANNEL_WEBHOOKS` for the target's
+`channel_id` and reuses the webhook named exactly `Server Notification Agent`
+when one exists. If the list has none, it calls `DISCORDBOT_CREATE_WEBHOOK`
+with that name and the same channel, and uses the new webhook. Either way it
+builds `https://discord.com/api/webhooks/<id>/<token>` and posts the same
+multipart body the webhook path already builds. The bot needs Manage Webhooks
+in that channel.
+
+A webhook URL and its token are credentials: neither is ever printed, neither
+on success nor in a warning or an error. A failed lookup or creation (missing
+permission, Composio error) logs one line naming the target only, never a
+response body, and sends text through Composio instead. A webhook that exists
+but comes back without a token is neither reused nor duplicated: that message
+is text only. A chat with no working webhook therefore gets text only, and a
+target never falls back to `DISCORD_WEBHOOK_URL` (the script still refuses that
+combination). A message with no attached PNG never uses this path.
 
 ```sh
 NOTIFY_WEBHOOK_ADMIN_CHAT='https://discord.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN'
 NOTIFY_WEBHOOK_AUTOMATIONS='https://discord.com/api/webhooks/111111111111111111/EXAMPLE-TOKEN'
 ```
 
-Those values are placeholders. Put the real webhooks only in `stack.env`, which
-is gitignored and mode `0600`.
+Those values are placeholders for the override. Most deployments leave both
+empty and let the bot create the webhook. A real override is a secret: put it
+only in `stack.env`, which is gitignored and mode `0600`.
 
 ### Composio path
 

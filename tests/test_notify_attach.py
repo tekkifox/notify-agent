@@ -7,7 +7,8 @@ script would have made. A failed multipart request is simulated with an HTTP
 status or a curl exit code.
 
 The per-target webhook tests use the same fake: a chart reaches Discord only
-through a webhook, and a named target takes its own NOTIFY_WEBHOOK_* variable.
+through a webhook, and a named target either takes its own NOTIFY_WEBHOOK_*
+override or resolves/creates one through canned Composio tool responses.
 
 Run with:
     python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -29,6 +30,13 @@ NOTIFY = ROOT / "scripts" / "notify.sh"
 WEBHOOK = "https://discord.example.test/webhook"
 TARGET_WEBHOOK = "https://discord.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN"
 FOREIGN_WEBHOOK = "https://example.test/webhook"
+WEBHOOK_NAME = "Server Notification Agent"
+EXISTING_ID = "000000000000000001"
+EXISTING_TOKEN = "EXISTINGTOKEN1234567890"
+CREATED_ID = "000000000000000002"
+CREATED_TOKEN = "CREATEDTOKEN0987654321"
+TARGET_CHANNEL = "222222222222222222"
+TARGET_ACCOUNT = "bbbbbbbb-2222-2222-2222-222222222222"
 FILE_PART = re.compile(r"^files\[(\d+)\]=@(.+)$")
 
 
@@ -49,8 +57,10 @@ class NotifyAttachTests(unittest.TestCase):
             "  for arg do printf 'ARG|%s\\n' \"$arg\"; done\n"
             "} >> \"$NOTIFY_TEST_LOG\"\n"
             "multipart=0\n"
+            "url=\n"
             "for arg do\n"
             "  [ \"$arg\" = '-F' ] && multipart=1\n"
+            "  url=$arg\n"
             "done\n"
             "if [ \"$multipart\" -eq 1 ]; then\n"
             "  if [ -n \"${NOTIFY_TEST_MULTIPART_EXIT:-}\" ]; then\n"
@@ -60,7 +70,27 @@ class NotifyAttachTests(unittest.TestCase):
             "  exit 0\n"
             "fi\n"
             "cat > \"${NOTIFY_TEST_LOG}.body\" 2>/dev/null || true\n"
-            "printf '200'\n",
+            "case \"$url\" in\n"
+            "  *DISCORDBOT_LIST_CHANNEL_WEBHOOKS*)\n"
+            "    if [ -n \"${NOTIFY_TEST_LIST_EXIT:-}\" ]; then\n"
+            "      exit \"$NOTIFY_TEST_LIST_EXIT\"\n"
+            "    fi\n"
+            "    response=${NOTIFY_TEST_LIST_RESPONSE-}\n"
+            "    [ -n \"$response\" ] || response='{\"successful\":true,\"data\":[]}'\n"
+            "    printf '%s' \"$response\"\n"
+            "    ;;\n"
+            "  *DISCORDBOT_CREATE_WEBHOOK*)\n"
+            "    if [ -n \"${NOTIFY_TEST_CREATE_EXIT:-}\" ]; then\n"
+            "      exit \"$NOTIFY_TEST_CREATE_EXIT\"\n"
+            "    fi\n"
+            "    response=${NOTIFY_TEST_CREATE_RESPONSE-}\n"
+            "    [ -n \"$response\" ] || response='{\"successful\":true,\"data\":{\"id\":\"000000000000000002\",\"token\":\"CREATEDTOKEN0987654321\"}}'\n"
+            "    printf '%s' \"$response\"\n"
+            "    ;;\n"
+            "  *)\n"
+            "    printf '200'\n"
+            "    ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         fake_curl.chmod(0o755)
@@ -78,6 +108,10 @@ class NotifyAttachTests(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
         multipart_status: str | None = None,
         multipart_exit: str | None = None,
+        list_response: str | None = None,
+        list_exit: str | None = None,
+        create_response: str | None = None,
+        create_exit: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = {
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -96,7 +130,12 @@ class NotifyAttachTests(unittest.TestCase):
             env["DISCORD_WEBHOOK_URL"] = WEBHOOK
         if target is not None:
             env["NOTIFY_TARGETS"] = json.dumps(
-                {target: {"channel_id": "222222222222222222"}}
+                {
+                    target: {
+                        "channel_id": "222222222222222222",
+                        "connected_account_id": "bbbbbbbb-2222-2222-2222-222222222222",
+                    }
+                }
             )
         if attach is not None:
             env["NOTIFY_ATTACH_DIR"] = str(attach)
@@ -104,6 +143,14 @@ class NotifyAttachTests(unittest.TestCase):
             env["NOTIFY_TEST_MULTIPART_STATUS"] = multipart_status
         if multipart_exit is not None:
             env["NOTIFY_TEST_MULTIPART_EXIT"] = multipart_exit
+        if list_response is not None:
+            env["NOTIFY_TEST_LIST_RESPONSE"] = list_response
+        if list_exit is not None:
+            env["NOTIFY_TEST_LIST_EXIT"] = list_exit
+        if create_response is not None:
+            env["NOTIFY_TEST_CREATE_RESPONSE"] = create_response
+        if create_exit is not None:
+            env["NOTIFY_TEST_CREATE_EXIT"] = create_exit
         if extra_env:
             env.update(extra_env)
         command = [str(NOTIFY)]
@@ -285,26 +332,203 @@ class NotifyAttachTests(unittest.TestCase):
         self.assertNotIn(TARGET_WEBHOOK, result.stdout)
         self.assertNotIn(TARGET_WEBHOOK, result.stderr)
         self.assertIn("with 2 image(s)", result.stdout)
+        self.assertFalse(
+            any(
+                "DISCORDBOT_LIST_CHANNEL_WEBHOOKS" in arg
+                for arg in args
+            ),
+            "a set override must not trigger a lookup",
+        )
 
-    def test_a_target_without_its_webhook_keeps_the_composio_text_path(self) -> None:
+    def test_a_target_without_an_override_reuses_its_named_webhook(self) -> None:
         attach = self.charts()
+        marker = self.dir / "marker"
         result = self.run_notify(
-            "the digest", attach=attach, composio=True, target="admin-chat"
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            list_response=json.dumps(
+                {
+                    "successful": True,
+                    "data": {
+                        "webhooks": [
+                            {
+                                "id": "999999999999999999",
+                                "token": "OTHERTOKEN1234567890",
+                                "name": "Unrelated",
+                            },
+                            {
+                                "id": EXISTING_ID,
+                                "token": EXISTING_TOKEN,
+                                "name": WEBHOOK_NAME,
+                            },
+                        ]
+                    },
+                }
+            ),
+            extra_env={"NOTIFY_SEND_MARKER": str(marker)},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists(), "a delivered send must write the marker")
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("DISCORDBOT_LIST_CHANNEL_WEBHOOKS", calls[0][-1])
+
+        list_body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertEqual(list_body["arguments"]["channel_id"], TARGET_CHANNEL)
+        self.assertEqual(list_body["connected_account_id"], TARGET_ACCOUNT)
+
+        args = calls[1]
+        self.assertIn("-F", args)
+        self.assertEqual(
+            args[-1],
+            f"https://discord.com/api/webhooks/{EXISTING_ID}/{EXISTING_TOKEN}",
+        )
+        self.assertEqual(
+            [name for _, name in self.files_from(args)], ["a.example.com.png"]
+        )
+        self.assertEqual(self.payload_from(args)["content"], "the digest")
+        self.assertFalse(
+            any(
+                "DISCORDBOT_CREATE_WEBHOOK" in arg
+                for call in calls
+                for arg in call
+            ),
+            "an existing webhook must be reused, not recreated",
+        )
+        self.assertNotIn(EXISTING_TOKEN, result.stdout)
+        self.assertNotIn(EXISTING_TOKEN, result.stderr)
+        self.assertNotIn(
+            f"https://discord.com/api/webhooks/{EXISTING_ID}", result.stdout
+        )
+        self.assertNotIn(
+            f"https://discord.com/api/webhooks/{EXISTING_ID}", result.stderr
+        )
+
+    def test_a_target_without_an_override_creates_the_webhook(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            list_response=json.dumps({"successful": True, "data": []}),
+            create_response=json.dumps(
+                {
+                    "successful": True,
+                    "data": {
+                        "webhook": {
+                            "id": CREATED_ID,
+                            "token": CREATED_TOKEN,
+                            "name": WEBHOOK_NAME,
+                        }
+                    },
+                }
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("DISCORDBOT_LIST_CHANNEL_WEBHOOKS", calls[0][-1])
+        self.assertIn("DISCORDBOT_CREATE_WEBHOOK", calls[1][-1])
+
+        create_body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertEqual(create_body["arguments"]["channel_id"], TARGET_CHANNEL)
+        self.assertEqual(create_body["arguments"]["name"], WEBHOOK_NAME)
+        self.assertEqual(create_body["connected_account_id"], TARGET_ACCOUNT)
+
+        args = calls[2]
+        self.assertIn("-F", args)
+        self.assertEqual(
+            args[-1],
+            f"https://discord.com/api/webhooks/{CREATED_ID}/{CREATED_TOKEN}",
+        )
+        self.assertNotIn(CREATED_TOKEN, result.stdout)
+        self.assertNotIn(CREATED_TOKEN, result.stderr)
+        self.assertNotIn(
+            f"https://discord.com/api/webhooks/{CREATED_ID}", result.stderr
+        )
+
+    def test_a_failed_webhook_lookup_falls_back_to_text(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            list_exit="22",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('target "admin-chat"', result.stderr)
+        self.assertIn("could not resolve a Discord webhook", result.stderr)
         self.assertIn("only supported on the Discord webhook path", result.stderr)
         calls = self.calls()
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("-F", calls[0])
-        self.assertIn(
-            "https://api.example.test/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE",
-            calls[0],
-        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn("DISCORDBOT_LIST_CHANNEL_WEBHOOKS", calls[0][-1])
+        self.assertNotIn("-F", calls[1])
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )
         self.assertEqual(body["arguments"]["content"], "the digest")
-        self.assertEqual(body["arguments"]["channel_id"], "222222222222222222")
+        self.assertEqual(body["arguments"]["channel_id"], TARGET_CHANNEL)
+
+    def test_a_failed_webhook_creation_falls_back_to_text(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            list_response=json.dumps({"successful": True, "data": []}),
+            create_exit="22",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('target "admin-chat"', result.stderr)
+        self.assertIn("could not resolve a Discord webhook", result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("DISCORDBOT_LIST_CHANNEL_WEBHOOKS", calls[0][-1])
+        self.assertIn("DISCORDBOT_CREATE_WEBHOOK", calls[1][-1])
+        self.assertNotIn("-F", calls[2])
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertEqual(body["arguments"]["content"], "the digest")
+
+    def test_an_existing_webhook_without_a_token_is_not_recreated(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            list_response=json.dumps(
+                {
+                    "successful": True,
+                    "data": [
+                        {"id": EXISTING_ID, "name": WEBHOOK_NAME},
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not resolve a Discord webhook", result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(
+            any(
+                "DISCORDBOT_CREATE_WEBHOOK" in arg
+                for call in calls
+                for arg in call
+            ),
+            "a webhook that exists must not be duplicated",
+        )
+        self.assertNotIn("-F", calls[1])
 
     def test_a_non_discord_webhook_is_refused_and_falls_back_to_text(self) -> None:
         for url in (
@@ -441,19 +665,27 @@ class NotifyAttachTests(unittest.TestCase):
         self.assertNotIn(TARGET_WEBHOOK, result.stderr)
         self.assertNotIn(WEBHOOK, result.stderr)
 
-    def test_only_the_exact_derived_variable_is_read(self) -> None:
+    def test_a_differently_spelled_variable_is_not_an_override(self) -> None:
         attach = self.charts()
         result = self.run_notify(
             "the digest",
             attach=attach,
             composio=True,
             target="admin-chat",
-            extra_env={"NOTIFY_WEBHOOK_ADMINCHAT": TARGET_WEBHOOK},
+            extra_env={"NOTIFY_WEBHOOK_ADMINCHAT": FOREIGN_WEBHOOK},
+            list_response=json.dumps({"successful": True, "data": []}),
+            create_response=json.dumps(
+                {
+                    "successful": True,
+                    "data": {"id": CREATED_ID, "token": CREATED_TOKEN},
+                }
+            ),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("not a Discord webhook URL", result.stderr)
         calls = self.calls()
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("-F", calls[0])
+        self.assertIn("DISCORDBOT_LIST_CHANNEL_WEBHOOKS", calls[0][-1])
+        self.assertIn("-F", calls[-1])
 
     def test_a_set_target_webhook_does_not_change_a_message_without_images(self) -> None:
         attach = self.dir / "charts"
