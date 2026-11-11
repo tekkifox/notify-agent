@@ -67,11 +67,25 @@ Optional flag guard:
 Optional Discord attachments:
   NOTIFY_ATTACH_DIR    a directory of chart PNGs to upload with the message.
                        At most ten regular .png files directly inside it are
-                       sent, sorted by name. Only the Discord webhook path
-                       supports attachments; the Composio path sends text and
-                       logs one warning. When the directory is unset or has no
-                       PNG the request is exactly the plain JSON post. A failed
+                       sent, sorted by name. Only a Discord webhook supports
+                       attachments; the Composio path sends text and logs one
+                       warning. When the directory is unset or has no PNG the
+                       request is exactly the plain JSON post. A failed
                        multipart post is retried once without images.
+
+Per-target webhook for attachments:
+  NOTIFY_WEBHOOK_<TARGET>  Discord webhook URL for one named target. The name
+                       is the target uppercased with every character that is
+                       not A-Z0-9 replaced by "_": admin-chat ->
+                       NOTIFY_WEBHOOK_ADMIN_CHAT, operations.eu ->
+                       NOTIFY_WEBHOOK_OPERATIONS_EU. It is a secret and is
+                       never printed. When NOTIFY_ATTACH_DIR holds a PNG and
+                       the run names a target, a set variable posts the message
+                       and its images to that webhook. Unset, or set to a URL
+                       that is not https://discord.com/api/webhooks/... or
+                       https://discordapp.com/api/webhooks/..., means text only
+                       through Composio and its usual warning. A target never
+                       uses DISCORD_WEBHOOK_URL.
 
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
@@ -360,11 +374,76 @@ enforce_host_scope() {
 enforce_host_scope
 
 send_discord() {
-    webhook_url=${DISCORD_WEBHOOK_URL:-}
-    case "$webhook_url" in
+    case "${DISCORD_WEBHOOK_URL:-}" in
         https://*) ;;
         *) fail "DISCORD_WEBHOOK_URL must be an https:// URL" ;;
     esac
+
+    post_discord_webhook "$DISCORD_WEBHOOK_URL"
+}
+
+# Resolve the per-target webhook variable name: uppercase the target name and
+# replace every character that is not A-Z0-9 with an underscore. The result is
+# always a safe shell variable name, so the indirect read cannot interpolate
+# anything but the operator's own target name.
+target_webhook_var() {
+    printf 'NOTIFY_WEBHOOK_%s' "$1" \
+        | jq -Rr 'ascii_upcase | gsub("[^A-Z0-9]"; "_")'
+}
+
+# True when NOTIFY_ATTACH_DIR holds at least one regular .png directly inside
+# it. With no image every path keeps its exact previous behaviour.
+has_attachments() {
+    [ -n "${NOTIFY_ATTACH_DIR:-}" ] || return 1
+    [ -d "$NOTIFY_ATTACH_DIR" ] || return 1
+    for attach_file in "$NOTIFY_ATTACH_DIR"/*.png; do
+        [ -f "$attach_file" ] && return 0
+    done
+    return 1
+}
+
+# The text-only delivery path. This is what every named target used before a
+# per-target webhook existed, so it stays byte for byte the same.
+send_text() {
+    if [ -n "${COMPOSIO_API_KEY:-}" ] && [ -n "${COMPOSIO_TOOL:-}" ]; then
+        send_composio
+    else
+        fail "no delivery configured: set DISCORD_WEBHOOK_URL, or COMPOSIO_API_KEY and COMPOSIO_TOOL"
+    fi
+}
+
+# A named target may carry its own Discord webhook, the only route that can
+# carry a file. The URL is a credential: it is never printed, including in a
+# warning or a failure, and it is never taken from DISCORD_WEBHOOK_URL.
+send_target_webhook() {
+    webhook_var=$(target_webhook_var "$target_name") \
+        || fail "could not derive the webhook variable for target \"${target_name}\""
+    eval "target_webhook_url=\${${webhook_var}:-}"
+
+    if [ -z "$target_webhook_url" ]; then
+        send_text
+        return 0
+    fi
+
+    case "$target_webhook_url" in
+        https://discord.com/api/webhooks/?*|https://discordapp.com/api/webhooks/?*)
+            ;;
+        *)
+            printf '%s: warning: target "%s" has a webhook that is not a Discord webhook URL; sending text only\n' \
+                "$PROG" "$target_name" >&2
+            send_text
+            return 0
+            ;;
+    esac
+
+    post_discord_webhook "$target_webhook_url"
+}
+
+# Post the message to one Discord webhook. With no eligible PNG this is the
+# plain JSON request; with PNGs it is multipart, retried once without images
+# when it fails.
+post_discord_webhook() {
+    post_url=$1
 
     payload=$(jq -cn --arg content "$message" \
         '{content: $content, allowed_mentions: {parse: []}}') \
@@ -387,7 +466,7 @@ send_discord() {
     fi
 
     if [ "$attach_count" -eq 0 ]; then
-        discord_post_json "$payload" "$webhook_url"
+        discord_post_json "$payload" "$post_url"
         return 0
     fi
 
@@ -396,11 +475,11 @@ send_discord() {
     status=$(curl -sS --proto '=https' --tlsv1.2 --max-time 30 \
         -o /dev/null -w '%{http_code}' \
         "$@" \
-        "$webhook_url" 2>/dev/null) || rc=$?
+        "$post_url" 2>/dev/null) || rc=$?
     if [ "$rc" -ne 0 ]; then
         printf '%s: warning: discord attachment post failed (curl exit %s); sending without images\n' \
             "$PROG" "$rc" >&2
-        discord_post_json "$payload" "$webhook_url"
+        discord_post_json "$payload" "$post_url"
         return 0
     fi
 
@@ -413,7 +492,7 @@ send_discord() {
         *)
             printf '%s: warning: discord attachment post failed (HTTP %s); sending without images\n' \
                 "$PROG" "${status:-unknown}" >&2
-            discord_post_json "$payload" "$webhook_url"
+            discord_post_json "$payload" "$post_url"
             ;;
     esac
 }
@@ -536,8 +615,11 @@ if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
         fail "a target was requested but DISCORD_WEBHOOK_URL is set; a webhook has no targets"
     fi
     send_discord
-elif [ -n "${COMPOSIO_API_KEY:-}" ] && [ -n "${COMPOSIO_TOOL:-}" ]; then
-    send_composio
+elif [ -n "$target_name" ] && has_attachments; then
+    # A chart only leaves the container through a Discord webhook. A named
+    # target uses its own NOTIFY_WEBHOOK_* variable when the operator set one;
+    # otherwise the text-only path below is unchanged.
+    send_target_webhook
 else
-    fail "no delivery configured: set DISCORD_WEBHOOK_URL, or COMPOSIO_API_KEY and COMPOSIO_TOOL"
+    send_text
 fi
