@@ -214,6 +214,11 @@ class InboundTarget:
     bookstack_url: str
     bookstack_books: str
     bookstack_token: str
+    # The same scope as a plain tuple, for matching a host the operator names
+    # in a graph request. host_scope keeps the display form with backticks.
+    host_scope_hosts: tuple[str, ...] = ()
+    # True when the target means the whole run scope rather than a host list.
+    all_hosts: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,6 +267,8 @@ class Config:
     sources_json: str = ""
     host_ports_json: str = ""
     host_tailnets_json: str = ""
+    # JSON array of host names whose panel entry has charts: true.
+    chart_hosts_json: str = ""
     # Set only when the CMS supplied the configuration: the panel's host names
     # are the probe allowlist for this reply run.
     allowed_hosts_json: str = ""
@@ -344,7 +351,9 @@ def parse_allowlist(raw: str) -> frozenset[str]:
     return frozenset(authors)
 
 
-def _format_host_scope(scope: object) -> str:
+def _host_scope_values(scope: object) -> tuple[str, ...]:
+    """Return the validated host labels from a target's host_scope."""
+
     if isinstance(scope, str):
         parts = [scope]
     elif isinstance(scope, list):
@@ -356,7 +365,7 @@ def _format_host_scope(scope: object) -> str:
         )
     if not parts:
         raise ConfigError("target host_scope must not be empty")
-    formatted: list[str] = []
+    values: list[str] = []
     for part in parts:
         if not isinstance(part, str) or not part.strip():
             raise ConfigError(
@@ -366,8 +375,12 @@ def _format_host_scope(scope: object) -> str:
             raise ConfigError(
                 "target host_scope must not contain backticks or newlines"
             )
-        formatted.append(f"`{part.strip()}`")
-    return ", ".join(formatted)
+        values.append(part.strip())
+    return tuple(values)
+
+
+def _format_host_scope(scope: object) -> str:
+    return ", ".join(f"`{value}`" for value in _host_scope_values(scope))
 
 
 def _format_bookstack(
@@ -511,7 +524,9 @@ def _load_target_by_name(
         target_account = expected_account
 
     host_scope = ""
+    host_scope_hosts: tuple[str, ...] = ()
     if "host_scope" in entry:
+        host_scope_hosts = _host_scope_values(entry["host_scope"])
         host_scope = _format_host_scope(entry["host_scope"])
 
     allow_content = True
@@ -534,6 +549,12 @@ def _load_target_by_name(
 
     bookstack_url, bookstack_books, bookstack_token = _format_bookstack(entry, name)
 
+    all_hosts = entry.get("all_hosts") is True
+    if "all_hosts" in entry and not isinstance(entry["all_hosts"], bool):
+        LOG.warning(
+            "target %r all_hosts must be a boolean; treating it as off", name
+        )
+
     return InboundTarget(
         name=name,
         channel_id=target_channel.strip(),
@@ -544,6 +565,8 @@ def _load_target_by_name(
         bookstack_url=bookstack_url,
         bookstack_books=bookstack_books,
         bookstack_token=bookstack_token,
+        host_scope_hosts=host_scope_hosts,
+        all_hosts=all_hosts,
     )
 
 
@@ -900,6 +923,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
         host_ports_json=env.get("NOTIFY_HOST_PORTS") or "",
         host_tailnets_json=env.get("NOTIFY_HOST_TAILNET") or "",
+        chart_hosts_json=env.get("NOTIFY_CHART_HOSTS") or "",
         allowed_hosts_json=env.get("NOTIFY_ALLOWED_HOSTS") or "",
     )
 
@@ -937,6 +961,12 @@ def resolve_environment(environ: Mapping[str, str]) -> dict[str, str]:
         env["NOTIFY_HOST_TAILNET"] = resolution.host_tailnets_json
     else:
         env.pop("NOTIFY_HOST_TAILNET", None)
+    # The panel's per-host chart ticks travel with the host configuration. A
+    # run without the panel must not inherit a stale list.
+    if resolution.chart_hosts_json:
+        env["NOTIFY_CHART_HOSTS"] = resolution.chart_hosts_json
+    else:
+        env.pop("NOTIFY_CHART_HOSTS", None)
     # The CMS host list replaces SSH_ALLOWED_HOSTS only when the CMS itself
     # supplied the document. A cache or environment fallback must not inherit
     # a wider list from an earlier render.
@@ -1589,6 +1619,258 @@ def _operator_message_from_instruction(instruction: str) -> str | None:
     return instruction[start:end].strip() or None
 
 
+# ---------------------------------------------------------------------------
+# On-demand charts
+# ---------------------------------------------------------------------------
+
+CHART_KEYWORD_RE = re.compile(r"\b(?:graphs?|charts?|plots?)\b", re.IGNORECASE)
+CHART_WINDOW_RE = re.compile(
+    r"(?<![\w.])(?:(?:last|past|previous|for)\s+)?"
+    r"(?P<amount>\d+)\s*"
+    r"(?P<unit>minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\b",
+    re.IGNORECASE,
+)
+CHART_BARE_WINDOW_RE = re.compile(r"\b(hour|day|week)\b", re.IGNORECASE)
+CHART_UNIT_MINUTES = {
+    "m": 1, "min": 1, "mins": 1, "minute": 1, "minutes": 1,
+    "h": 60, "hr": 60, "hrs": 60, "hour": 60, "hours": 60,
+    "d": 1440, "day": 1440, "days": 1440,
+    "w": 10080, "week": 10080, "weeks": 10080,
+}
+CHART_BARE_MINUTES = {"hour": 60, "day": 1440, "week": 10080}
+CHART_DEFAULT_WINDOW_MINUTES = 60
+CHART_MIN_WINDOW_MINUTES = 5
+CHART_MAX_WINDOW_MINUTES = 30 * 24 * 60
+CHART_MAX_HOSTS = 10
+CHART_TIMEOUT_SECONDS = 45
+
+
+def parse_chart_window(message: str) -> int:
+    """Return the requested window in minutes, clamped, defaulting to 60.
+
+    A number with no unit is ignored on purpose: "graph for 6" is not six of
+    anything.  A bare ``hour``/``day``/``week`` is one of those units.
+    """
+
+    match = CHART_WINDOW_RE.search(message)
+    if match is not None:
+        amount = int(match.group("amount"))
+        unit = CHART_UNIT_MINUTES.get(match.group("unit").lower(), 0)
+        if unit:
+            return max(
+                CHART_MIN_WINDOW_MINUTES,
+                min(CHART_MAX_WINDOW_MINUTES, amount * unit),
+            )
+    bare = CHART_BARE_WINDOW_RE.search(message)
+    if bare is not None:
+        return CHART_BARE_MINUTES[bare.group(1).lower()]
+    return CHART_DEFAULT_WINDOW_MINUTES
+
+
+def _mentions_host(text: str, host: str) -> bool:
+    # A trailing sentence period is allowed; a longer dotted name is not.
+    return re.search(
+        r"(?<![a-z0-9.-])"
+        + re.escape(host)
+        + r"(?![a-z0-9-])(?!\.[a-z0-9])",
+        text,
+    ) is not None
+
+
+def chart_hosts_named_in(message: str, hosts: Sequence[str]) -> list[str]:
+    """Return the run-scope hosts named in the message, in scope order."""
+
+    lowered = message.lower()
+    first_labels: collections.Counter[str] = collections.Counter(
+        host.strip().lower().rstrip(".").split(".")[0] for host in hosts
+    )
+    selected: list[str] = []
+    for host in hosts:
+        label = host.strip().lower().rstrip(".")
+        if not label:
+            continue
+        if _mentions_host(lowered, label):
+            selected.append(host)
+            continue
+        # A unique bare first label ("media" for media.example.com) also names
+        # the host. An ambiguous label names none of them.
+        first = label.split(".")[0]
+        if first and first_labels[first] == 1 and _mentions_host(lowered, first):
+            selected.append(host)
+    return selected
+
+
+def chart_request(
+    message: str, hosts: Sequence[str], default_hosts: Sequence[str]
+) -> tuple[int, list[str]] | None:
+    """Return ``(window_minutes, hosts)`` when the message asks for a chart.
+
+    A host named in the message wins. With none named, ``default_hosts`` (the
+    ticked hosts in scope, or the whole scope under the test override) are
+    charted.
+    """
+
+    if CHART_KEYWORD_RE.search(message) is None:
+        return None
+    window = parse_chart_window(message)
+    selected = chart_hosts_named_in(message, hosts)
+    if not selected:
+        selected = list(default_hosts)
+    return window, selected[:CHART_MAX_HOSTS]
+
+
+def _normalise_host(host: str) -> str:
+    return host.strip().lower().rstrip(".")
+
+
+def chart_hosts_ticked(config: Config) -> list[str]:
+    """The host names whose panel entry has ``charts: true``."""
+
+    raw = (config.chart_hosts_json or "").strip()
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [
+        _normalise_host(value)
+        for value in values
+        if isinstance(value, str) and value.strip()
+    ]
+
+
+def chart_scope_hosts(config: Config, chosen: InboundSource) -> list[str]:
+    """The hosts this reply may chart: the target scope, else its run scope."""
+
+    if chosen.target is not None:
+        if chosen.target.host_scope_hosts:
+            return list(chosen.target.host_scope_hosts)
+        if not chosen.target.all_hosts:
+            return []
+    raw = (config.allowed_hosts_json or "").strip()
+    if raw:
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError:
+            values = []
+        if isinstance(values, list):
+            return [
+                value for value in values if isinstance(value, str) and value.strip()
+            ]
+        return []
+    # Without a CMS document the SSH allowlist is the run's fleet scope.
+    allowed = (os.environ.get("SSH_ALLOWED_HOSTS") or "").strip()
+    if not allowed:
+        return []
+    return [part.strip() for part in allowed.split(",") if part.strip()]
+
+
+def _chart_reason(output: bytes) -> str:
+    """One safe line from the chart helper's stderr."""
+
+    for line in output.decode("utf-8", "replace").splitlines():
+        stripped = " ".join(line.split())
+        if stripped:
+            return stripped[:200]
+    return "chart render failed"
+
+
+def prepare_chart_run(
+    config: Config, chosen: InboundSource, instruction: str
+) -> tuple[Path | None, dict[str, str]]:
+    """Render charts for a graph request before the model starts.
+
+    A host named in the message wins. With none named, the ticked hosts in the
+    chat's scope are charted; ``NOTIFY_CHARTS=1``/``0`` are explicit test
+    overrides. Returns the directory to clean up and the environment additions
+    for the reply. A failure is logged once and leaves the reply on text only.
+    """
+
+    override = os.environ.get("NOTIFY_CHARTS")
+    if override == "0":
+        return None, {}
+
+    message = _operator_message_from_instruction(instruction)
+    if message is None:
+        message = instruction
+    scope = chart_scope_hosts(config, chosen)
+    if override == "1":
+        default_hosts = scope
+    else:
+        ticked = set(chart_hosts_ticked(config))
+        default_hosts = [
+            host for host in scope if _normalise_host(host) in ticked
+        ]
+    request = chart_request(message, scope, default_hosts)
+    if request is None:
+        return None, {}
+
+    window, selected = request
+    if not selected:
+        LOG.info("chart requested but no charted host is in this run's scope")
+        return None, {}
+
+    directory: Path | None = None
+    environment: dict[str, str] = {}
+    try:
+        directory = Path(tempfile.mkdtemp(prefix="notify-chart-"))
+        command = [
+            sys.executable or "python3",
+            str(Path(__file__).resolve().with_name("host_series.py")),
+            "--out",
+            str(directory),
+            "--window",
+            str(window),
+        ]
+        for host in selected:
+            command.extend(["--host", host])
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=os.environ.copy(),
+            timeout=CHART_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if completed.returncode != 0:
+            LOG.warning(
+                "chart unavailable for this reply: %s",
+                _chart_reason(completed.stderr or b""),
+            )
+            shutil.rmtree(directory, ignore_errors=True)
+            return None, environment
+        images = [
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix == ".png"
+        ]
+        if not images:
+            LOG.info("chart produced no image for the requested window; text only")
+            shutil.rmtree(directory, ignore_errors=True)
+            return None, environment
+        environment["NOTIFY_ATTACH_DIR"] = str(directory)
+        LOG.info(
+            "chart prepared for this reply: images=%d window=%dm hosts=%d",
+            len(images),
+            window,
+            len(selected),
+        )
+        return directory, environment
+    except subprocess.TimeoutExpired:
+        LOG.warning("chart unavailable for this reply: timed out")
+    except OSError as error:
+        LOG.warning("chart unavailable for this reply: %s", type(error).__name__)
+    except Exception as error:  # never let a chart break the reply path
+        LOG.warning("chart unavailable for this reply: %s", type(error).__name__)
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
+    return None, environment
+
+
 def _terminate(process: subprocess.Popen[Any]) -> None:
     """Terminate the agent and its MCP children, then reap it."""
 
@@ -1703,14 +1985,23 @@ def _release_run_lock(descriptor: int | None) -> None:
         pass
 
 
-def _agent_environment(config: Config, chosen: InboundSource) -> dict[str, str]:
+def _agent_environment(
+    config: Config,
+    chosen: InboundSource,
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """The environment one reply run gets: the validated delivery boundary.
 
     Shared by the agent attempt and the busy line, so both can only reach the
-    source's own channel with the source's own target guards.
+    source's own channel with the source's own target guards. Chart variables
+    are never inherited: only ``extra_env`` may set them for this run.
     """
 
     environment = os.environ.copy()
+    environment.pop("NOTIFY_CHARTS", None)
+    environment.pop("NOTIFY_CHART_WINDOW_MINUTES", None)
+    environment.pop("NOTIFY_CHART_HOSTS", None)
+    environment.pop("NOTIFY_ATTACH_DIR", None)
     # Carry the resolved (CMS, cache or environment) configuration to the
     # agent, so notify.sh validates the same targets the listener did.
     environment["NOTIFY_TARGETS"] = config.targets_json
@@ -1771,6 +2062,8 @@ def _agent_environment(config: Config, chosen: InboundSource) -> dict[str, str]:
         environment["COMPOSIO_ARGS"] = json.dumps(
             {"channel_id": chosen.channel_id}, separators=(",", ":")
         )
+    if extra_env:
+        environment.update(extra_env)
     return environment
 
 
@@ -1819,6 +2112,7 @@ def _run_agent_once(
     stop_event: threading.Event | None,
     summary_text: str | None = None,
     model: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> tuple[bool, bool]:
     """Run one attempt; return ``(clean_exit, send_marker_seen)``."""
 
@@ -1840,7 +2134,7 @@ def _run_agent_once(
         ]
     )
 
-    environment = _agent_environment(config, chosen)
+    environment = _agent_environment(config, chosen, extra_env)
 
     marker = _new_send_marker(config)
     environment["NOTIFY_SEND_MARKER"] = str(marker)
@@ -2006,6 +2300,10 @@ def run_agent(
     pinned to that source's channel and connected account for this run, so the
     answer cannot go to another server.  The environment is rebuilt for every
     attempt; the worker is single-threaded, so these values never race.
+
+    An operator message that asks for a graph gets its chart rendered before
+    the first attempt.  The per-run directory is passed to every attempt as
+    ``NOTIFY_ATTACH_DIR`` and removed when the run ends.
     """
 
     chosen = _resolve_source(config, source)
@@ -2031,10 +2329,24 @@ def run_agent(
         # must not silence the reply path: run unlocked, exactly as before.
         LOG.warning("%s; running without the single-flight lock", error)
     try:
+        chart_directory, chart_environment = prepare_chart_run(
+            config, chosen, instruction
+        )
+    except Exception as error:  # the reply must never depend on a chart
+        LOG.warning("chart unavailable for this reply: %s", type(error).__name__)
+        chart_directory, chart_environment = None, {}
+    try:
         return _run_agent_locked(
-            config, chosen, instruction, stop_event, summary_text
+            config,
+            chosen,
+            instruction,
+            stop_event,
+            summary_text,
+            chart_environment,
         )
     finally:
+        if chart_directory is not None:
+            shutil.rmtree(chart_directory, ignore_errors=True)
         _release_run_lock(lock_descriptor)
 
 
@@ -2044,6 +2356,7 @@ def _run_agent_locked(
     instruction: str,
     stop_event: threading.Event | None,
     summary_text: str | None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> bool:
     """The retrying run itself; the caller holds the single-flight lock."""
 
@@ -2098,7 +2411,7 @@ def _run_agent_locked(
     before = _log_size()
     clean_exit, sent = _run_agent_once(
         config, chosen, instruction, stop_event,
-        summary_text=summary_text, model=preferred,
+        summary_text=summary_text, model=preferred, extra_env=extra_env,
     )
     after_text = _read_slice(before)
     if not clean_exit and not sent and fallback and _model_unavailable(after_text):
@@ -2125,7 +2438,7 @@ def _run_agent_locked(
         before2 = _log_size()
         clean_exit2, sent2 = _run_agent_once(
             config, chosen, instruction, stop_event,
-            summary_text=summary_text, model=fallback,
+            summary_text=summary_text, model=fallback, extra_env=extra_env,
         )
         if not clean_exit2:
             LOG.warning(
@@ -2160,7 +2473,7 @@ def _run_agent_locked(
 
     clean_exit, sent = _run_agent_once(
         config, chosen, instruction, stop_event,
-        summary_text=summary_text, model=preferred,
+        summary_text=summary_text, model=preferred, extra_env=extra_env,
     )
     if not clean_exit:
         LOG.warning(

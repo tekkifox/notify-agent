@@ -326,6 +326,37 @@ class ResolverTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(resolution.hosts_json), [])
 
+    def test_per_host_charts_flag_selects_only_true_entries(self) -> None:
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222, "charts": True},
+            {"name": "host2.example.com", "sshPort": 2200, "charts": False},
+            {"name": "host3.example.com", "sshPort": 2201},
+            {"name": "host4.example.com", "sshPort": 2202, "charts": "yes"},
+        ]
+        with StubServer(
+            200, encode(document(hosts=hosts, sources=[]))
+        ) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(
+            json.loads(resolution.chart_hosts_json), ["host1.example.com"]
+        )
+        self.assertEqual(
+            json.loads(resolution.hosts_json),
+            [
+                "host1.example.com",
+                "host2.example.com",
+                "host3.example.com",
+                "host4.example.com",
+            ],
+        )
+
+    def test_absent_charts_flag_leaves_chart_hosts_empty(self) -> None:
+        with StubServer(200, encode(document(sources=[]))) as server:
+            resolution = self.resolve(server.url)
+
+        self.assertEqual(resolution.chart_hosts_json, "")
+
     def test_hosts_absent_leaves_host_ports_unset(self) -> None:
         with StubServer(200, encode(document(hosts=None))) as server:
             resolution = self.resolve(server.url)
@@ -783,8 +814,24 @@ class CommandLineTests(unittest.TestCase):
             json.loads(payload["host_tailnets"]),
             {"host1.example.com": "203.0.113.10"},
         )
+        self.assertEqual(payload["chart_hosts"], "")
         self.assertEqual(
             combined.stderr, "config source=cms hosts=2 ssh_ports=2\n"
+        )
+
+    def test_cli_json_carries_the_ticked_chart_hosts(self) -> None:
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222, "charts": True},
+            {"name": "host2.example.com", "sshPort": 2200},
+        ]
+        with StubServer(
+            200, encode(document(hosts=hosts, sources=[]))
+        ) as server:
+            combined = self.run_cli(server.url, "--json")
+        self.assertEqual(combined.returncode, 0)
+        self.assertEqual(
+            json.loads(json.loads(combined.stdout)["chart_hosts"]),
+            ["host1.example.com"],
         )
 
     def test_cli_host_ports_absent_is_empty_and_still_logs_counts(self) -> None:
@@ -856,6 +903,29 @@ class InboundWiringTests(unittest.TestCase):
         self.assertTrue(
             any("config source=cms" in line for line in logs.output)
         )
+
+    def test_listener_receives_the_cms_chart_hosts(self) -> None:
+        hosts = [
+            {"name": "host1.example.com", "sshPort": 2222, "charts": True},
+            {"name": "host2.example.com", "sshPort": 2200},
+        ]
+        with StubServer(200, encode(document(hosts=hosts))) as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            with self.assertLogs("discord-inbound", level="INFO"):
+                resolved = discord_inbound.resolve_environment(env)
+            config = discord_inbound.load_config(resolved)
+        self.assertEqual(config.chart_hosts_json, '["host1.example.com"]')
+
+    def test_a_cms_without_ticked_hosts_clears_an_inherited_list(self) -> None:
+        with StubServer(200, encode(document())) as server:
+            env = dict(self.env)
+            env["BOT_SETTINGS_URL"] = server.url
+            env["NOTIFY_CHART_HOSTS"] = '["stale.example.com"]'
+            with self.assertLogs("discord-inbound", level="INFO"):
+                resolved = discord_inbound.resolve_environment(env)
+            config = discord_inbound.load_config(resolved)
+        self.assertEqual(config.chart_hosts_json, "")
 
     def test_agent_child_receives_the_cms_targets(self) -> None:
         with StubServer(200, encode(document())) as server:

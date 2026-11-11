@@ -911,6 +911,17 @@ class FlagGuardScheduleTests(unittest.TestCase):
             "`[!]` is the only marker the boundary checks", FLAT_PROMPT
         )
 
+    def test_charts_are_per_host_and_never_the_models_choice(self) -> None:
+        self.assertIn(
+            "The switch is per host in the bot settings and is never yours to "
+            "change",
+            FLAT_PROMPT,
+        )
+        self.assertIn(
+            "A host whose entry is ticked always gets its chart", FLAT_PROMPT
+        )
+        self.assertIn("never name, link or embed an image file", FLAT_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()

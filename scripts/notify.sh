@@ -64,6 +64,15 @@ Optional flag guard:
                        any other value keeps the normal behaviour. Scheduled
                        digests set it so a run with nothing flagged cannot post.
 
+Optional Discord attachments:
+  NOTIFY_ATTACH_DIR    a directory of chart PNGs to upload with the message.
+                       At most ten regular .png files directly inside it are
+                       sent, sorted by name. Only the Discord webhook path
+                       supports attachments; the Composio path sends text and
+                       logs one warning. When the directory is unset or has no
+                       PNG the request is exactly the plain JSON post. A failed
+                       multipart post is retried once without images.
+
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
 EOF
@@ -361,12 +370,66 @@ send_discord() {
         '{content: $content, allowed_mentions: {parse: []}}') \
         || fail "could not build Discord payload"
 
-    status=$(printf '%s' "$payload" \
+    # Collect at most ten PNG files directly inside NOTIFY_ATTACH_DIR, sorted
+    # by name. Anything else in the directory is ignored. With no eligible
+    # file the request is exactly today's plain JSON request.
+    attach_count=0
+    set -- -F "payload_json=$payload"
+    if [ -n "${NOTIFY_ATTACH_DIR:-}" ] && [ -d "$NOTIFY_ATTACH_DIR" ]; then
+        for attach_file in "$NOTIFY_ATTACH_DIR"/*.png; do
+            [ -f "$attach_file" ] || continue
+            attach_count=$((attach_count + 1))
+            set -- "$@" -F "files[$((attach_count - 1))]=@$attach_file"
+            if [ "$attach_count" -ge 10 ]; then
+                break
+            fi
+        done
+    fi
+
+    if [ "$attach_count" -eq 0 ]; then
+        discord_post_json "$payload" "$webhook_url"
+        return 0
+    fi
+
+    # curl sets its own multipart boundary; do not pass a Content-Type header.
+    rc=0
+    status=$(curl -sS --proto '=https' --tlsv1.2 --max-time 30 \
+        -o /dev/null -w '%{http_code}' \
+        "$@" \
+        "$webhook_url" 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '%s: warning: discord attachment post failed (curl exit %s); sending without images\n' \
+            "$PROG" "$rc" >&2
+        discord_post_json "$payload" "$webhook_url"
+        return 0
+    fi
+
+    case "$status" in
+        2??)
+            printf '%s: delivered via discord (HTTP %s) with %s image(s)\n' \
+                "$PROG" "$status" "$attach_count"
+            mark_sent
+            ;;
+        *)
+            printf '%s: warning: discord attachment post failed (HTTP %s); sending without images\n' \
+                "$PROG" "${status:-unknown}" >&2
+            discord_post_json "$payload" "$webhook_url"
+            ;;
+    esac
+}
+
+# The plain JSON post. This is the original request, unchanged, and still the
+# hard failure path when no attachment could be delivered.
+discord_post_json() {
+    post_payload=$1
+    post_url=$2
+
+    status=$(printf '%s' "$post_payload" \
         | curl -sS --proto '=https' --tlsv1.2 --max-time 20 \
             -o /dev/null -w '%{http_code}' \
             -H 'Content-Type: application/json' \
             --data-binary @- \
-            "$webhook_url" 2>/dev/null) || {
+            "$post_url" 2>/dev/null) || {
         rc=$?
         fail "discord request failed (curl exit ${rc})"
     }
@@ -393,6 +456,10 @@ send_composio() {
     message_field=${COMPOSIO_MESSAGE_FIELD:-content}
     # A named target overrides the configured default connected account.
     connected_account_id=${target_connected_account_id:-${COMPOSIO_CONNECTED_ACCOUNT_ID:-}}
+
+    if [ -n "${NOTIFY_ATTACH_DIR:-}" ] && [ -d "$NOTIFY_ATTACH_DIR" ]; then
+        printf '%s: warning: attachments are only supported on the Discord webhook path; sending text only\n' "$PROG" >&2
+    fi
 
     case "$api_base" in
         https://*) ;;

@@ -32,6 +32,16 @@ cat > "$tmp/bin/opencode" <<'SH'
 for arg do last=$arg; done
 printf '%s' "$last" > "$CAPTURE"
 printf '%s' "${NOTIFY_ALLOWED_HOSTS-}" > "$CAPTURE.allowlist"
+printf '%s' "${NOTIFY_ATTACH_DIR-}" > "$CAPTURE.attach"
+if [ -n "${NOTIFY_ATTACH_DIR-}" ] && [ -d "${NOTIFY_ATTACH_DIR}" ]; then
+    find "$NOTIFY_ATTACH_DIR" -maxdepth 1 -type f -name '*.png' -printf '%f\n' 2>/dev/null \
+        | sort > "$CAPTURE.files"
+    first=$(find "$NOTIFY_ATTACH_DIR" -maxdepth 1 -type f -name '*.png' 2>/dev/null \
+        | sort | head -n 1)
+    if [ -n "$first" ]; then
+        od -An -tx1 -N8 "$first" 2>/dev/null | tr -d ' \n' > "$CAPTURE.signature"
+    fi
+fi
 exit 0
 SH
 chmod +x "$tmp/bin/opencode"
@@ -414,6 +424,84 @@ for line in sys.stdin:
     )
 PY
 
+# Fake oracledb for the scheduled chart helper. host_series.py speaks the same
+# small surface the real driver uses: defaults, connect(), a cursor with a
+# description and rows. CHART_EMPTY and CHART_FAIL drive the failure paths.
+mkdir -p "$tmp/pydeps"
+cat > "$tmp/pydeps/oracledb.py" <<'PY'
+import json
+import os
+
+
+class _Defaults:
+    fetch_lobs = False
+
+
+defaults = _Defaults()
+
+
+class _Cursor:
+    description = []
+
+    def execute(self, sql, binds=None):
+        self.binds = binds or {}
+        log = os.environ.get("HOST_SERIES_LOG")
+        if log:
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(self.binds) + "\n")
+        if os.environ.get("CHART_FAIL"):
+            raise RuntimeError("ORA-00942: table or view does not exist")
+        hosts = [
+            value
+            for key, value in sorted(self.binds.items())
+            if key.startswith("host")
+        ]
+        self.description = [
+            ("HOST_LABEL",),
+            ("BUCKET",),
+            ("CPU",),
+            ("MEMORY",),
+        ]
+        self.rows = []
+        if not os.environ.get("CHART_EMPTY"):
+            for host in hosts:
+                for index in range(5):
+                    self.rows.append(
+                        [
+                            host,
+                            f"2026-11-11T{8 + index:02d}:00:00+00:00",
+                            10.0 + index * 5,
+                            30.0 + index * 4,
+                        ]
+                    )
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        pass
+
+
+class _Connection:
+    call_timeout = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def cursor(self):
+        return _Cursor()
+
+    def close(self):
+        pass
+
+
+def connect(**kwargs):
+    return _Connection()
+PY
+
 # Loopback CMS stub for the "all hosts" case.
 cat > "$tmp/cms.py" <<'PY'
 import sys
@@ -440,7 +528,7 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
 server.serve_forever()
 PY
 
-targets='{"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com"]},"general":{"channel_id":"111111111111111111"}}'
+targets='{"automations":{"channel_id":"555555555555555555","host_scope":["host1.example.com","host2.example.com"]},"admin-chat":{"channel_id":"777777777777777777","host_scope":["host1.example.com","host2.example.com"]},"general":{"channel_id":"111111111111111111"}}'
 
 failures=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -461,10 +549,17 @@ run_case() {
     target=$2
     shift 2
     rm -f "$tmp/$name" "$tmp/$name.stderr" "$tmp/$name.sql" "$tmp/$name.stdout"
+    rm -f "$tmp/$name.attach" "$tmp/$name.files" "$tmp/$name.signature"
+    rm -f "$tmp/$name.series"
     rm -rf "$tmp/$name.data"
     set +e
     env -i \
         PATH="$tmp/bin:$PATH" \
+        PYTHONPATH="$tmp/pydeps" \
+        ORACLE_USER="test-user" \
+        ORACLE_PASSWORD="test-password" \
+        ORACLE_DSN="test-dsn" \
+        ORACLE_WALLET_DIR="${TMPDIR:-/tmp}" \
         OPENCODE_MODEL="test/model" \
         NOTIFY_MCP_SERVER="$tmp/mcp-prefetch.py" \
         NOTIFY_PREFLIGHT_RETRY_DELAY=0 \
@@ -472,6 +567,7 @@ run_case() {
         XDG_DATA_HOME="$tmp/$name.data" \
         CAPTURE="$tmp/$name" \
         SQL_LOG="$tmp/$name.sql" \
+        HOST_SERIES_LOG="$tmp/$name.series" \
         "$@" \
         "$run_prompt" -t "$target" "Compose the status message." \
         >"$tmp/$name.stdout" 2>"$tmp/$name.stderr"
@@ -974,6 +1070,215 @@ else
     fi
 fi
 
+# 15b. The CMS hosts array's per-host charts flag reaches the scheduled chart.
+if [ -n "$cms_pid" ]; then
+    kill "$cms_pid" 2>/dev/null || true
+    wait "$cms_pid" 2>/dev/null || true
+    cms_pid=
+fi
+cms_charts='{"version":1,"targets":{"automations":{"channel_id":"555555555555555555"}},"sources":[],"hosts":[{"name":"host1.example.com","sshPort":2222,"charts":true},{"name":"host2.example.com","sshPort":2200}]}'
+printf '%s' "$cms_charts" > "$tmp/cms-charts-body.json"
+rm -f "$tmp/cms-charts-port"
+python3 "$tmp/cms.py" "$tmp/cms-charts-body.json" "$tmp/cms-charts-port" &
+cms_pid=$!
+tries=0
+while [ ! -s "$tmp/cms-charts-port" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 100 ]; then
+        break
+    fi
+    sleep 0.05
+done
+if [ ! -s "$tmp/cms-charts-port" ]; then
+    no "CMS charts: loopback stub did not start"
+else
+    cms_charts_url="http://127.0.0.1:$(cat "$tmp/cms-charts-port")/api/bot-settings"
+    run_case cms-charts automations NOTIFY_PREFETCH=host_stats \
+        BOT_SETTINGS_URL="$cms_charts_url" \
+        BOT_SETTINGS_API_KEY="cms-test-key" \
+        XDG_STATE_HOME="$tmp/state-cms-charts"
+    prompt=$(cat "$tmp/cms-charts" 2>/dev/null || true)
+    err=$(cat "$tmp/cms-charts.stderr" 2>/dev/null || true)
+    files=$(cat "$tmp/cms-charts.files" 2>/dev/null || true)
+    series_args=$(cat "$tmp/cms-charts.series" 2>/dev/null || true)
+    if [ "$rc" -ne 0 ]; then
+        no "CMS charts: run-prompt.sh failed: $err"
+    elif ! contains "$err" "config source=cms hosts=2 ssh_ports=2"; then
+        no "CMS charts: the CMS was not the source"
+    elif ! contains "$prompt" "## Host statistics for this run"; then
+        no "CMS charts: the digest was not supplied"
+    elif ! contains "$files" "host1.example.com.png"; then
+        no "CMS charts: the ticked host was not charted"
+    elif contains "$files" "host2.example.com.png"; then
+        no "CMS charts: an unticked host was charted"
+    elif ! contains "$series_args" '"host0": "host1.example.com"'; then
+        no "CMS charts: the query did not use the panel's ticked host"
+    elif contains "$series_args" "host2.example.com"; then
+        no "CMS charts: an unticked panel host reached the query"
+    else
+        pass "the CMS hosts array's charts flag reaches the scheduled chart"
+    fi
+fi
+
+# 16. A ticked host is charted with no flag raised, and an unticked host in the
+#     same scope is not.
+run_case charts admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host1.example.com"]'
+prompt=$(cat "$tmp/charts" 2>/dev/null || true)
+err=$(cat "$tmp/charts.stderr" 2>/dev/null || true)
+attach=$(cat "$tmp/charts.attach" 2>/dev/null || true)
+files=$(cat "$tmp/charts.files" 2>/dev/null || true)
+series_args=$(cat "$tmp/charts.series" 2>/dev/null || true)
+signature=$(cat "$tmp/charts.signature" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "charts: instruction lost the statistics section"
+elif contains "$prompt" "[!]"; then
+    no "charts: the digest was unexpectedly flagged"
+elif ! contains "$prompt" "attached to the notification automatically"; then
+    no "charts: instruction did not say the chart is attached"
+elif ! contains "$files" "host1.example.com.png"; then
+    no "charts: the ticked host was not charted"
+elif contains "$files" "host2.example.com.png"; then
+    no "charts: an unticked host was charted automatically"
+elif [ "$signature" != "89504e470d0a1a0a" ]; then
+    no "charts: the file is not a PNG"
+elif ! contains "$series_args" '"window": 70'; then
+    no "charts: the series query did not use the digest window"
+elif ! contains "$series_args" '"host0": "host1.example.com"'; then
+    no "charts: the chart query did not use the ticked host in scope"
+elif contains "$series_args" "host2.example.com"; then
+    no "charts: an unticked host reached the series query"
+elif ! contains "$err" "run-prompt: charts: 1 image(s) for 70m"; then
+    no "charts: success was not logged"
+elif [ -e "$attach" ]; then
+    no "charts: the chart directory was not cleaned up"
+else
+    pass "a ticked host is charted with no flag raised and an unticked host is not"
+fi
+
+# 16b. A day-long window uses hourly buckets.
+run_case charts_window admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host1.example.com"]' \
+    NOTIFY_PREFETCH_WINDOW_MINUTES=1440
+err=$(cat "$tmp/charts_window.stderr" 2>/dev/null || true)
+files=$(cat "$tmp/charts_window.files" 2>/dev/null || true)
+series_args=$(cat "$tmp/charts_window.series" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts window: run-prompt.sh failed: $err"
+elif ! contains "$series_args" '"window": 1440'; then
+    no "charts window: the series query lost the override window"
+elif ! contains "$files" "host1.example.com.png"; then
+    no "charts window: no chart was written"
+else
+    pass "a 24-hour chart window reaches the series helper"
+fi
+
+# 16c. An empty series is logged and the run still delivers the text.
+run_case charts_empty admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host1.example.com"]' CHART_EMPTY=1
+prompt=$(cat "$tmp/charts_empty" 2>/dev/null || true)
+err=$(cat "$tmp/charts_empty.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts empty: an empty series failed the run: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "charts empty: the digest was lost"
+elif [ -s "$tmp/charts_empty.attach" ]; then
+    no "charts empty: an attach directory was exported with no image"
+elif ! contains "$err" "run-prompt: charts: no samples for the requested window"; then
+    no "charts empty: the empty series was not logged"
+else
+    pass "an empty series leaves the run successful and text only"
+fi
+
+# 16d. A failed series is logged and the run still delivers the text.
+run_case charts_fail admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host1.example.com"]' CHART_FAIL=1
+prompt=$(cat "$tmp/charts_fail" 2>/dev/null || true)
+err=$(cat "$tmp/charts_fail.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts fail: a failed series failed the run: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "charts fail: the digest was lost"
+elif [ -s "$tmp/charts_fail.attach" ]; then
+    no "charts fail: an attach directory was exported after a failure"
+elif ! contains "$err" "run-prompt: charts failed: host_series: oracle error ORA-00942"; then
+    no "charts fail: the failure was not logged"
+else
+    pass "a failed series leaves the run successful and text only"
+fi
+
+# 16e. An absent host chart list is off, even after a successful pre-fetch.
+run_case charts_absent admin-chat NOTIFY_PREFETCH=host_stats
+err=$(cat "$tmp/charts_absent.stderr" 2>/dev/null || true)
+chart_queries=$(wc -l < "$tmp/charts_absent.sql" 2>/dev/null | tr -d ' ' || printf '0')
+if [ "$rc" -ne 0 ]; then
+    no "charts absent: run-prompt.sh failed: $err"
+elif [ "$chart_queries" != "1" ]; then
+    no "charts absent: a chart query ran without a ticked host"
+elif [ -s "$tmp/charts_absent.attach" ]; then
+    no "charts absent: an attach directory was exported"
+else
+    pass "an absent per-host charts flag is off"
+fi
+
+# 16f. A ticked host outside the chat scope is not charted.
+run_case charts_outside admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host9.example.com"]'
+err=$(cat "$tmp/charts_outside.stderr" 2>/dev/null || true)
+chart_queries=$(wc -l < "$tmp/charts_outside.sql" 2>/dev/null | tr -d ' ' || printf '0')
+if [ "$rc" -ne 0 ]; then
+    no "charts outside: run-prompt.sh failed: $err"
+elif [ "$chart_queries" != "1" ]; then
+    no "charts outside: a chart query ran for an out-of-scope host"
+elif [ -s "$tmp/charts_outside.attach" ]; then
+    no "charts outside: an attach directory was exported"
+else
+    pass "a ticked host outside the chat scope is not charted"
+fi
+
+# 16g. NOTIFY_CHARTS=1 is a testing override: chart the whole chat scope.
+run_case charts_override_on admin-chat NOTIFY_PREFETCH=host_stats NOTIFY_CHARTS=1
+err=$(cat "$tmp/charts_override_on.stderr" 2>/dev/null || true)
+files=$(cat "$tmp/charts_override_on.files" 2>/dev/null || true)
+series_args=$(cat "$tmp/charts_override_on.series" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts override on: run-prompt.sh failed: $err"
+elif ! contains "$files" "host1.example.com.png"; then
+    no "charts override on: the first scoped host was not charted"
+elif ! contains "$files" "host2.example.com.png"; then
+    no "charts override on: the second scoped host was not charted"
+elif ! contains "$series_args" '"host0": "host1.example.com"'; then
+    no "charts override on: the first scoped host was not queried"
+elif ! contains "$series_args" '"host1": "host2.example.com"'; then
+    no "charts override on: the second scoped host was not queried"
+elif ! contains "$err" "run-prompt: charts: 2 image(s) for 70m"; then
+    no "charts override on: success was not logged"
+else
+    pass "NOTIFY_CHARTS=1 charts every host in the chat scope"
+fi
+
+# 16h. NOTIFY_CHARTS=0 is a testing override: no chart even for a ticked host.
+run_case charts_override_off admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHARTS=0 NOTIFY_CHART_HOSTS='["host1.example.com"]'
+chart_queries=$(wc -l < "$tmp/charts_override_off.sql" 2>/dev/null | tr -d ' ' || printf '0')
+if [ "$rc" -ne 0 ]; then
+    no "charts override off: run-prompt.sh failed: $(cat "$tmp/charts_override_off.stderr")"
+elif [ "$chart_queries" != "1" ]; then
+    no "charts override off: a chart query ran despite NOTIFY_CHARTS=0"
+elif [ -s "$tmp/charts_override_off.attach" ]; then
+    no "charts override off: an attach directory was exported"
+else
+    pass "NOTIFY_CHARTS=0 disables charts even for a ticked host"
+fi
+
+# 16i. Without NOTIFY_CHARTS nothing is attached, even when a pre-fetch runs.
+if [ -s "$tmp/scoped.attach" ]; then
+    no "charts off: a chart was attached without NOTIFY_CHARTS"
+else
+    pass "NOTIFY_CHARTS unset attaches nothing"
+fi
 if [ "$failures" -ne 0 ]; then
     printf '%d test(s) failed\n' "$failures" >&2
     exit 1

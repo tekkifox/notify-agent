@@ -37,6 +37,22 @@ esac
 # Set when the self-test fails so the caller can log and report the reason.
 preflight_reason=
 
+# Chart images for this run. The directory is created only when a chart host is
+# ticked (or the NOTIFY_CHARTS test override is on) and the series query
+# succeeds, and it is removed on every exit path so a PNG is never left behind
+# in /tmp.
+chart_dir=
+cleanup_charts() {
+    [ -n "${chart_dir:-}" ] || return 0
+    rm -rf "$chart_dir" 2>/dev/null || true
+    chart_dir=
+    return 0
+}
+trap cleanup_charts EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 # Single flight: the scheduler and the inbound listener share one lock, so two
 # OpenCode processes never touch the same session database at once. A wait that
 # expires is a skip, not a failure: exit 0 so supercronic stays quiet and the
@@ -575,6 +591,84 @@ prefetch_host_stats() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Chart pre-fetch for the scheduled digest
+# ---------------------------------------------------------------------------
+
+# The scheduled chart is deliberately CPU and memory only. Its hosts are the
+# ticked hosts in the chat's scope (the target's host_scope, or all_hosts), so
+# the bot settings stay the only host list. The window comes from
+# NOTIFY_PREFETCH_WINDOW_MINUTES (70 minutes by default), so the chart matches
+# the text digest.
+#
+# host_series.py queries NOTIFY_RO.HOST_STATS_V directly. The MCP query tool
+# caps a response at 100 rows, which is too small when several hosts are
+# ticked, and it renders one PNG per host with the shared renderer.
+chart_prefetch() {
+    case "$prefetch_window" in
+        ''|*[!0-9]*|0)
+            printf 'run-prompt: charts failed: NOTIFY_PREFETCH_WINDOW_MINUTES must be a positive whole number\n' >&2
+            return 1
+            ;;
+    esac
+    prefetch_check_timeout || return 1
+
+    host_list=$(printf '%s' "$chart_scope_json" | jq -r '
+        def valid_host:
+            type == "string" and length > 0 and length <= 253
+            and test("^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$");
+        .[0:10]
+        | if all(.[]; valid_host) then .[] else empty end
+    ' 2>/dev/null) || host_list=
+    if [ -z "$host_list" ]; then
+        printf 'run-prompt: charts skipped: no charted host in this run scope\n' >&2
+        return 2
+    fi
+
+    chart_dir=$(mktemp -d "${TMPDIR:-/tmp}/notify-charts.XXXXXX" 2>/dev/null) || {
+        chart_dir=
+        printf 'run-prompt: charts failed: could not create a chart directory\n' >&2
+        return 1
+    }
+
+    set -- python3 "$script_dir/host_series.py" \
+        --out "$chart_dir" \
+        --window "$prefetch_window"
+    old_ifs=$IFS
+    IFS='
+'
+    for chart_host in $host_list; do
+        set -- "$@" --host "$chart_host"
+    done
+    IFS=$old_ifs
+    if [ "$timeout_available" -eq 1 ]; then
+        set -- timeout --signal=TERM "$prefetch_timeout" "$@"
+    fi
+
+    if ! "$@" 2>"$chart_dir.reason"; then
+        reason=$(head -n 1 "$chart_dir.reason" 2>/dev/null | tr -d '\r')
+        printf 'run-prompt: charts failed: %s\n' "${reason:-could not render the chart}" >&2
+        cleanup_charts
+        return 1
+    fi
+    rm -f "$chart_dir.reason"
+
+    chart_images=$(find "$chart_dir" -maxdepth 1 -type f -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+    case "$chart_images" in
+        ''|*[!0-9]*) chart_images=0 ;;
+    esac
+    if [ "$chart_images" -eq 0 ]; then
+        printf 'run-prompt: charts: no samples for the requested window\n' >&2
+        cleanup_charts
+        return 1
+    fi
+
+    NOTIFY_ATTACH_DIR=$chart_dir
+    export NOTIFY_ATTACH_DIR
+    printf 'run-prompt: charts: %s image(s) for %sm\n' "$chart_images" "$prefetch_window" >&2
+    return 0
+}
+
 # Turn one tools/call response from ssh_probe into the compact JSON payload the
 # instruction carries. Only the tool payload is inspected; the server's
 # protocol output is never printed. A tool-level error is a short, secret-free
@@ -765,11 +859,16 @@ print(json.load(sys.stdin).get(sys.argv[1], ""), end="")
 # One resolve returns both values, so the panel is fetched once.
 #
 # NOTIFY_ALLOWED_HOSTS is a run variable, never an inherited one: clear it so a
-# stale value from an earlier source cannot narrow or widen this run.
+# stale value from an earlier source cannot narrow or widen this run. The
+# chart-host list from the panel's hosts array follows the same rule.
+env_chart_hosts=${NOTIFY_CHART_HOSTS:-}
+chart_hosts_json=$env_chart_hosts
 unset NOTIFY_ALLOWED_HOSTS
+unset NOTIFY_CHART_HOSTS
 if [ -n "${BOT_SETTINGS_URL:-}" ]; then
     resolved_source=
     resolved_hosts=
+    resolved_chart_hosts=
     if command -v python3 >/dev/null 2>&1; then
         resolved_config=$(python3 "$script_dir/bot_config.py" --json) || {
             printf 'run-prompt: could not resolve bot configuration; using NOTIFY_TARGETS from the environment\n' >&2
@@ -788,13 +887,16 @@ if [ -n "${BOT_SETTINGS_URL:-}" ]; then
                 printf 'run-prompt: could not read resolved tailnet addresses; using the environment\n' >&2
                 resolved_host_tailnets=${NOTIFY_HOST_TAILNET:-}
             }
+            resolved_chart_hosts=$(printf '%s' "$resolved_config" | json_value chart_hosts) || resolved_chart_hosts=
             resolved_source=$(printf '%s' "$resolved_config" | json_value source) || resolved_source=
             resolved_hosts=$(printf '%s' "$resolved_config" | json_value hosts) || resolved_hosts=
         else
             resolved_targets=${NOTIFY_TARGETS:-}
             resolved_host_ports=${NOTIFY_HOST_PORTS:-}
             resolved_host_tailnets=${NOTIFY_HOST_TAILNET:-}
+            resolved_chart_hosts=$env_chart_hosts
         fi
+        chart_hosts_json=$resolved_chart_hosts
         NOTIFY_TARGETS=$resolved_targets
         export NOTIFY_TARGETS
         # Per-host SSH ports are optional. Export the resolved map when there
@@ -837,6 +939,7 @@ target_host_scope=
 target_host_scope_json='[]'
 target_content_disabled=0
 target_runbooks_allowed=0
+target_all_hosts=0
 target_bookstack_url=
 target_bookstack_books=
 target_bookstack_token=
@@ -933,6 +1036,10 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         printf 'run-prompt: could not resolve target "%s"\n' "$target" >&2
         exit 1
     }
+    target_all_hosts=$(printf '%s' "$targets_json" | jq -r --arg name "$target" '
+        if has($name) and (.[$name] | type) == "object" and (.[$name].all_hosts == true)
+        then "1" else "0" end
+    ' 2>/dev/null) || target_all_hosts=0
     # bookstack is optional per target. When present it must be an object with
     # an https URL and a non-empty comma-separated book list. Report bad
     # entries by target name only, never their ids or values.
@@ -1010,6 +1117,56 @@ if [ -n "$target" ] && [ -n "${NOTIFY_TARGETS:-}" ]; then
         fi
     fi
 fi
+
+# Chart hosts are per host in the panel's hosts array. NOTIFY_CHARTS=1/0 is an
+# explicit test override; otherwise only hosts whose entry has charts: true are
+# charted, and a missing or non-boolean value means off. The host must also be
+# in this chat's scope.
+#
+# The chat scope is the target's host_scope. all_hosts means the run's host
+# universe (the CMS list, then the SSH allowlist, then the known-host list).
+chart_scope_json=$target_host_scope_json
+chart_scope_count=$(printf '%s' "$chart_scope_json" | jq 'length' 2>/dev/null) || chart_scope_count=0
+if [ "$chart_scope_count" -eq 0 ] && [ "$target_all_hosts" -eq 1 ]; then
+    if [ -n "${NOTIFY_ALLOWED_HOSTS:-}" ]; then
+        chart_scope_json=$NOTIFY_ALLOWED_HOSTS
+    elif [ -n "${SSH_ALLOWED_HOSTS:-}" ]; then
+        chart_scope_json=$(printf '%s' "$SSH_ALLOWED_HOSTS" | jq -R '
+            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+        ' 2>/dev/null) || chart_scope_json='[]'
+    else
+        chart_scope_json=$(printf '%s' "${HOST_REPORT_HOSTS:-host1.example.com,host2.example.com,host3.example.com}" | jq -R '
+            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+        ' 2>/dev/null) || chart_scope_json='[]'
+    fi
+fi
+
+charts_enabled=0
+case "${NOTIFY_CHARTS:-}" in
+    0)
+        chart_scope_json='[]'
+        ;;
+    1)
+        # Test override: chart every host in the chat's scope.
+        if [ "$(printf '%s' "$chart_scope_json" | jq 'length' 2>/dev/null || printf '0')" -gt 0 ]; then
+            charts_enabled=1
+        fi
+        ;;
+    *)
+        if [ -n "${chart_hosts_json:-}" ]; then
+            chart_scope_json=$(printf '%s' "$chart_scope_json" | jq -c --argjson ticked "$chart_hosts_json" '
+                def norm: ascii_downcase | gsub("\\.+$"; "");
+                ($ticked | map(norm)) as $on
+                | map(select(. as $host | ($on | index($host | norm)) != null))
+            ' 2>/dev/null) || chart_scope_json='[]'
+        else
+            chart_scope_json='[]'
+        fi
+        if [ "$(printf '%s' "$chart_scope_json" | jq 'length' 2>/dev/null || printf '0')" -gt 0 ]; then
+            charts_enabled=1
+        fi
+        ;;
+esac
 
 # The old host report always listed a configured set of hosts, even when one
 # sent no samples. Mirror that here: HOST_REPORT_HOSTS is the ordered known-host
@@ -1223,6 +1380,24 @@ if [ "$prefetch_ssh" -eq 1 ]; then
     esac
 fi
 
+# Charts ride on the host-statistics pre-fetch and only after it succeeds. A
+# chart failure is logged and never fails the run: the digest still goes out as
+# text. The per-host charts tick (or the explicit test override) decides.
+charts_status=skipped
+if [ "$charts_enabled" -eq 1 ]; then
+    if [ "$prefetch_status" = "ok" ]; then
+        charts_rc=0
+        chart_prefetch || charts_rc=$?
+        case "$charts_rc" in
+            0) charts_status=ok ;;
+            2) charts_status=skipped ;;
+            *) charts_status=failed ;;
+        esac
+    else
+        printf 'run-prompt: charts skipped: host statistics were not fetched\n' >&2
+    fi
+fi
+
 if [ "$prefetch_status" = "ok" ]; then
     if [ "$ssh_prefetch_status" = "ok" ]; then
         ssh_note="SSH status is supplied below; do not call ssh_probe for it."
@@ -1241,6 +1416,12 @@ ${prefetch_data}
 </data>
 
 Do not call oracle_query for host statistics in this run; the data above is complete. ${ssh_note}"
+fi
+
+if [ "$charts_status" = "ok" ] && [ -n "${NOTIFY_ATTACH_DIR:-}" ]; then
+    prompt="${prompt}
+
+A CPU and memory chart for this run is attached to the notification automatically. Do not mention, link or name an image file, and do not add an image URL."
 fi
 
 if [ "$ssh_prefetch_status" = "ok" ]; then

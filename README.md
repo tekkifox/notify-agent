@@ -1065,6 +1065,35 @@ no request at all and prints no send marker. `[!]` is the only marker it
 checks; the prompt requires that marker on every flagged host line and forbids
 adding it to a message that flags nothing.
 
+### Charts
+
+Charts are switched per host by an optional `charts` boolean on an entry of
+the bot-settings document's `hosts` array (`{name, sshPort, tailnet, charts}`).
+Only JSON `true` ticks a host; a missing, absent or non-boolean value means
+off. `NOTIFY_CHARTS=1` and `NOTIFY_CHARTS=0` are explicit test overrides.
+
+A scheduled run charts every ticked host in that chat's scope on every post,
+whether or not the host is flagged. An inbound reply charts the host named in
+the message; with none named it charts the ticked hosts in the chat's scope.
+One PNG per host, CPU and memory combined in the image.
+
+When there is a chart to render, `run-prompt.sh` runs one more query after its
+host-statistics pre-fetch succeeds, against `NOTIFY_RO.HOST_STATS_V` for those
+hosts and the same window. CPU and memory are the only columns.
+`scripts/host_chart.py` renders a dark, two-panel PNG (CPU in green, memory in
+amber, 0–100 % with a `%` suffix on the ticks, nulls breaking the line) and
+`run-prompt.sh` exports `NOTIFY_ATTACH_DIR` for the model's `notify.sh` call.
+The model never names a file. The directory is removed when the run ends, and
+a failed or empty series is one log line: the text digest still sends.
+
+`notify.sh` uploads at most ten regular `.png` files directly inside
+`NOTIFY_ATTACH_DIR`, sorted by name, as Discord `multipart/form-data`
+(`payload_json` plus one `files[n]` part per image) on the webhook path. With
+no eligible file the request is exactly the plain JSON post. If the multipart
+post fails, the failure is logged and the plain JSON post is retried, so an
+attachment can never turn a delivered message into a failed run. The Composio
+path has no file upload, so it sends text and logs one warning.
+
 ### Composio path
 
 The Composio path is behind `COMPOSIO_API_KEY` + `COMPOSIO_TOOL`, uses the
@@ -1235,9 +1264,12 @@ The panel returns `{version, targets, sources, hosts}`. `targets` has the same
 shape as `NOTIFY_TARGETS`; `sources` has the same shape as
 `NOTIFY_INBOUND_SOURCES` (an empty array leaves inbound in its
 environment-configured single-channel mode). `hosts` is an optional array of
-`{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<ipv4-or-hostname>"}`;
-`tailnet` is optional. The array becomes `NOTIFY_HOST_PORTS` and
-`NOTIFY_HOST_TAILNET` for the run, so `mcp/ssh_probe.py` dials each host on its
+`{"name": "<host>", "sshPort": <1-65535>, "tailnet": "<ipv4-or-hostname>",
+"charts": <boolean>}`; a `charts: true` entry ticks that host for chart
+attachments, and a missing or non-boolean value means off. `tailnet` and
+`charts` are optional. The array becomes `NOTIFY_HOST_PORTS`,
+`NOTIFY_HOST_TAILNET` and `NOTIFY_CHART_HOSTS` for the run, so
+`mcp/ssh_probe.py` dials each host on its
 own port and, when one is recorded, at its tailnet target (an IPv4 address or a
 MagicDNS hostname) instead of its public panel name. An entry with no usable
 `name` or `sshPort` is dropped and counted in the source log, never passed
@@ -1247,9 +1279,10 @@ entry's port.
 The `hosts` array is also the host list. A target that omits `host_scope` means
 "report on all hosts": it resolves to every usable `hosts` name, in panel order,
 so the statistics prefetch, the delivery scope, the instruction's known-host
-filter and the SSH probe's run scope all cover the whole panel without a second
-list. An explicit `host_scope` keeps its current meaning (and an explicit empty
-list is still refused). When the document was fetched and validated, the panel
+filter, the chart scope and the SSH probe's run scope all cover the whole panel
+without a second list. A target may also set `all_hosts: true` for the same
+run-scope meaning; an explicit `host_scope` still wins. An explicit empty
+list is still refused. When the document was fetched and validated, the panel
 names also become `NOTIFY_ALLOWED_HOSTS`, the probe's whole global allowlist;
 `SSH_ALLOWED_HOSTS` is then not required or consulted. That makes a CMS run
 configured in one place. The cache and environment fallbacks keep the old rule
@@ -1619,6 +1652,19 @@ agent replies with one short sentence declining and stops, with no offer of an
 alternative capability and no suggestion to enable anything. All the existing
 rules remain in force: one message per run, no mentions, no fabrication,
 read-only SQL, and no credentials in messages or logs.
+
+An inbound message that contains `graph`, `graphs`, `chart`, `charts`, `plot`
+or `plots` (any case, whole words) also gets a chart before the model starts.
+A host named in the message gets its chart; with none named, the ticked hosts
+in the target's scope are charted. `NOTIFY_CHARTS=1`/`0` are test overrides.
+The listener parses the timeframe from the same message without the model:
+`last 6 hours`, `6h`, `90 min`, `2 days`, `24h`, `7d`, and bare `hour`/`day`/
+`week` all work, clamped to 5 minutes through 30 days, with 60 minutes as the
+default. A number with no unit is ignored. A host named in the message wins;
+with no host named, every host in the run's delivery scope is charted, capped
+at ten images. The series is bucketed to roughly 40–60 points, rendered by
+`scripts/host_chart.py`, and attached to the reply through `NOTIFY_ATTACH_DIR`.
+A chart failure is logged and the reply still goes out as text.
 
 ## Security posture
 
