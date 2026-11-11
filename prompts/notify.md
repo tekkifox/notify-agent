@@ -101,9 +101,10 @@ Host statistics:
     one row per sample, roughly one every three minutes, with columns:
     `host_label`, `sampled_at` (the time column), `cpu_percent`, `cpu_cores`
     (the cores the host reported with the sample; stable per host but may be
-    null on an old sample), `memory_percent`, `disk_percent`, `load_avg`,
-    `process_count`, `swap_percent` (may be null), `network_rx_mb`,
-    `network_tx_mb`, `failed_logins` (failed SSH password attempts in the hour
+    null on an old sample), `memory_percent`, `memory_used_bytes`,
+    `memory_total_bytes`, `disk_percent`, `load_avg`, `process_count`,
+    `swap_percent` (may be null), `network_rx_mb`, `network_tx_mb`,
+    `failed_logins` (failed SSH password attempts in the hour
     before the sample, an integer or null), `failed_login_users` (the
     per-user breakdown behind those failures, as a JSON array of
     `{"user", "count"}` or null), `ssh_logins` (accepted SSH logins in the hour
@@ -113,7 +114,11 @@ Host statistics:
     the start of the current UTC day, an integer or null),
     `ssh_login_users_today` (the per-user breakdown behind those logins, the
     same JSON shape or null), and `ssh_logins_today_since` (the start of that
-    UTC day, as ISO text or null).
+    UTC day, as ISO text or null), `host_count` (hosts covered by the snapshot)
+    and `updated_at` (when the snapshot was rolled up). The newer columns may
+    be null on an old sample. Use them when a question asks for memory amounts,
+    swap, process count, network or the sample time; they do not change the
+    scheduled digest shape.
     Use aggregate functions such as `MIN`, `MAX`, `AVG`, and `COUNT` for
     anything beyond a single reading.
 12. Do not query `ROSSMONEY."host-samples"`. That raw table stores each sample

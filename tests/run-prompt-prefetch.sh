@@ -136,6 +136,26 @@ for line in sys.stdin:
         )
         continue
 
+    if os.environ.get("PREFETCH_EXTENDED_MISSING") and "memory_total_bytes" in sql:
+        text = json.dumps(
+            {
+                "error": "oracle error ORA-00904",
+                "code": "ORA-00904",
+                "retryable": False,
+            }
+        )
+        write(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": True,
+                },
+            }
+        )
+        continue
+
     match = re.search(r"host_label IN \(([^)]*)\)", sql)
     hosts = []
     if match:
@@ -157,6 +177,21 @@ for line in sys.stdin:
     ]
     if "cpu_cores" in sql:
         columns.append("cpu_cores")
+    extended = "memory_total_bytes" in sql
+    if extended:
+        columns.extend(
+            [
+                "swap_avg",
+                "swap_peak",
+                "memory_total_bytes",
+                "memory_used_bytes_latest",
+                "process_count_latest",
+                "network_rx_mb_latest",
+                "network_tx_mb_latest",
+                "host_count",
+                "updated_at_latest",
+            ]
+        )
     columns.append("disk_latest")
     columns.append("failed_logins_latest")
     columns.append("failed_login_users_latest")
@@ -189,11 +224,31 @@ for line in sys.stdin:
             return good if skip_nulls in sql else None
         return good
 
+    def extended_value(good):
+        """Emulate a sample that predates the newer view columns."""
+        if os.environ.get("PREFETCH_EXTENDED_WINDOW") == "null":
+            return None
+        return good
+
     rows = []
     for host in hosts:
         row = [host, 23, "2026-11-03T08:00:00+00:00", 12.5, 40.0, 33.3, 0.5, 1.2]
         if "cpu_cores" in sql:
             row.append(4)
+        if extended:
+            row.extend(
+                [
+                    extended_value(2.3),
+                    extended_value(6.1),
+                    extended_value(8589934592),
+                    extended_value(1395864371),
+                    extended_value(165),
+                    extended_value(75.0),
+                    extended_value(31.0),
+                    extended_value(3),
+                    extended_value("2026-11-03T08:00:00+00:00"),
+                ]
+            )
         row.append(55.5)
         row.append(latest_with_value("failed_logins", 12))
         row.append(
@@ -462,6 +517,40 @@ elif ! contains "$err" 'prefetch=ok "'; then
     no "scoped: run summary did not record prefetch=ok before the excerpt"
 elif ! grep -q "cpu_cores" "$tmp/scoped.sql" 2>/dev/null; then
     no "scoped: the query did not ask for cpu_cores"
+elif ! grep -q "AVG(swap_percent) AS swap_avg" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not ask for the swap average"
+elif ! grep -q "MAX(memory_total_bytes) AS memory_total_bytes" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not ask for total memory"
+elif ! grep -q "MAX(memory_used_bytes) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS memory_used_bytes_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take the latest memory used"
+elif ! grep -q "MAX(process_count) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS process_count_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take the latest process count"
+elif ! grep -q "MAX(network_rx_mb) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS network_rx_mb_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take the latest network receive figure"
+elif ! grep -q "MAX(network_tx_mb) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS network_tx_mb_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take the latest network transmit figure"
+elif ! grep -q "MAX(host_count) AS host_count" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not ask for the host count"
+elif ! grep -q "MAX(updated_at) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS updated_at_latest" "$tmp/scoped.sql" 2>/dev/null; then
+    no "scoped: the query did not take the latest update time"
+elif ! grep -Fq '"swap_avg":2.3' "$tmp/scoped"; then
+    no "scoped: instruction lost the swap average"
+elif ! grep -Fq '"swap_peak":6.1' "$tmp/scoped"; then
+    no "scoped: instruction lost the swap peak"
+elif ! grep -Fq '"memory_total_bytes":8589934592' "$tmp/scoped"; then
+    no "scoped: instruction lost total memory"
+elif ! grep -Fq '"memory_used_bytes_latest":1395864371' "$tmp/scoped"; then
+    no "scoped: instruction lost memory used"
+elif ! grep -Fq '"process_count_latest":165' "$tmp/scoped"; then
+    no "scoped: instruction lost the process count"
+elif ! grep -Fq '"network_rx_mb_latest":75.0' "$tmp/scoped"; then
+    no "scoped: instruction lost network receive"
+elif ! grep -Fq '"network_tx_mb_latest":31.0' "$tmp/scoped"; then
+    no "scoped: instruction lost network transmit"
+elif ! grep -Fq '"host_count":3' "$tmp/scoped"; then
+    no "scoped: instruction lost the host count"
+elif ! grep -Fq '"updated_at_latest":"2026-11-03T08:00:00+00:00"' "$tmp/scoped"; then
+    no "scoped: instruction lost the update time"
 elif ! grep -q "host_label IN ('host1.example.com','host2.example.com')" "$tmp/scoped.sql" 2>/dev/null; then
     no "scoped: the query did not restrict itself to the delivery scope"
 elif contains "$prompt" "host3.example.com"; then
@@ -532,8 +621,37 @@ elif ! sed -n '1p' "$tmp/cores.sql" | grep -q "cpu_cores"; then
     no "ORA-00904: the first query did not ask for cpu_cores"
 elif sed -n '2p' "$tmp/cores.sql" | grep -q "cpu_cores"; then
     no "ORA-00904: the retry still asked for cpu_cores"
+elif ! sed -n '2p' "$tmp/cores.sql" | grep -q "memory_total_bytes"; then
+    no "ORA-00904: the retry dropped the new view columns as well"
 else
     pass "ORA-00904 retries without cpu_cores and keeps the digest"
+fi
+
+# 4b. A database whose view lacks both cpu_cores and the newer columns still
+#     produces a payload: drop cores first, then the extended group.
+run_case legacy_view automations NOTIFY_PREFETCH=host_stats \
+    PREFETCH_CORES_MISSING=1 PREFETCH_EXTENDED_MISSING=1
+prompt=$(cat "$tmp/legacy_view" 2>/dev/null || true)
+err=$(cat "$tmp/legacy_view.stderr" 2>/dev/null || true)
+queries=$(wc -l < "$tmp/legacy_view.sql" 2>/dev/null | tr -d ' ' || printf '0')
+if [ "$rc" -ne 0 ]; then
+    no "legacy view: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "legacy view: the fallback did not produce statistics"
+elif ! contains "$err" "run-prompt: prefetch: cpu_cores not exposed yet"; then
+    no "legacy view: the cpu_cores retry was not logged"
+elif ! contains "$err" "run-prompt: prefetch: new host-statistics columns not exposed yet"; then
+    no "legacy view: the extended-column retry was not logged"
+elif ! contains "$err" "prefetch=ok"; then
+    no "legacy view: run summary did not record prefetch=ok"
+elif [ "$queries" != "3" ]; then
+    no "legacy view: expected three queries, got $queries"
+elif sed -n '3p' "$tmp/legacy_view.sql" | grep -qE "cpu_cores|memory_total_bytes"; then
+    no "legacy view: the last retry still asked for a column the view lacks"
+elif ! grep -Fq '"memory_avg":33.3' "$tmp/legacy_view"; then
+    no "legacy view: the fallback lost the existing figures"
+else
+    pass "an older view still produces a payload without the optional columns"
 fi
 
 # 5. Unset NOTIFY_PREFETCH changes nothing except the summary field.
@@ -686,6 +804,40 @@ elif ! grep -Fq '"ssh_logins_today_since_latest":null' "$tmp/all_null"; then
     no "all null: the day's start time was not null"
 else
     pass "a window of all nulls stays null"
+fi
+
+# 10b. A sample older than the new view columns carries nulls for every new
+#      figure while the existing figures stay intact.
+run_case extended_null automations NOTIFY_PREFETCH=host_stats \
+    PREFETCH_EXTENDED_WINDOW=null
+prompt=$(cat "$tmp/extended_null" 2>/dev/null || true)
+err=$(cat "$tmp/extended_null.stderr" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "extended null: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "## Host statistics for this run"; then
+    no "extended null: instruction did not carry the statistics section"
+elif ! grep -Fq '"swap_avg":null' "$tmp/extended_null"; then
+    no "extended null: the swap average was not null"
+elif ! grep -Fq '"swap_peak":null' "$tmp/extended_null"; then
+    no "extended null: the swap peak was not null"
+elif ! grep -Fq '"memory_total_bytes":null' "$tmp/extended_null"; then
+    no "extended null: total memory was not null"
+elif ! grep -Fq '"memory_used_bytes_latest":null' "$tmp/extended_null"; then
+    no "extended null: memory used was not null"
+elif ! grep -Fq '"process_count_latest":null' "$tmp/extended_null"; then
+    no "extended null: the process count was not null"
+elif ! grep -Fq '"network_rx_mb_latest":null' "$tmp/extended_null"; then
+    no "extended null: network receive was not null"
+elif ! grep -Fq '"network_tx_mb_latest":null' "$tmp/extended_null"; then
+    no "extended null: network transmit was not null"
+elif ! grep -Fq '"host_count":null' "$tmp/extended_null"; then
+    no "extended null: the host count was not null"
+elif ! grep -Fq '"updated_at_latest":null' "$tmp/extended_null"; then
+    no "extended null: the update time was not null"
+elif ! grep -Fq '"cpu_avg":12.5' "$tmp/extended_null"; then
+    no "extended null: the existing figures were lost"
+else
+    pass "an older sample keeps the new figures null instead of inventing them"
 fi
 
 # 11. NOTIFY_PREFETCH=ssh supplies the probe results before the model starts,

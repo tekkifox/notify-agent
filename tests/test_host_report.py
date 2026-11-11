@@ -44,6 +44,15 @@ def row(
     cpu_avg: float | None = 20.0,
     cpu_peak: float | None = 40.0,
     memory_avg: float | None = 30.0,
+    memory_used_bytes: float | None = None,
+    memory_total_bytes: float | None = None,
+    swap_avg: float | None = None,
+    swap_peak: float | None = None,
+    process_count: int | None = None,
+    network_rx_mb: float | None = None,
+    network_tx_mb: float | None = None,
+    host_count: int | None = None,
+    updated_at: str | None = None,
     load_avg: float | None = 1.0,
     load_peak: float | None = 2.0,
     disk: float | None = 50.0,
@@ -56,6 +65,15 @@ def row(
         "cpu_avg": cpu_avg,
         "cpu_peak": cpu_peak,
         "memory_avg": memory_avg,
+        "memory_used_bytes_latest": memory_used_bytes,
+        "memory_total_bytes": memory_total_bytes,
+        "swap_avg": swap_avg,
+        "swap_peak": swap_peak,
+        "process_count_latest": process_count,
+        "network_rx_mb_latest": network_rx_mb,
+        "network_tx_mb_latest": network_tx_mb,
+        "host_count": host_count,
+        "updated_at_latest": updated_at,
         "load_avg": load_avg,
         "load_peak": load_peak,
         "disk": disk,
@@ -118,6 +136,126 @@ class ShapeTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["host_label"], "host1.example.com")
         self.assertEqual(rows[0]["sample_count"], 3)
+
+
+class SnapshotFigureTests(unittest.TestCase):
+    """The new view figures are carried on the summary, not rendered in the
+    scheduled digest, which keeps its percentage-only shape."""
+
+    def summary(self, **values):
+        return host_report._summarise(
+            "host1.example.com",
+            row("host1.example.com", **values),
+            now=NOW,
+            stale_minutes=20,
+        )
+
+    def test_full_row_carries_every_snapshot_figure(self) -> None:
+        summary = self.summary(
+            memory_used_bytes=1395864371,
+            memory_total_bytes=8375186227,
+            swap_avg=2.3,
+            swap_peak=6.1,
+            process_count=165,
+            network_rx_mb=75.0,
+            network_tx_mb=31.0,
+            host_count=3,
+            updated_at="2026-10-31T08:59:00+00:00",
+        )
+        self.assertEqual(summary.memory_used_bytes, 1395864371)
+        self.assertEqual(summary.memory_total_bytes, 8375186227)
+        self.assertEqual(summary.swap_avg, 2.3)
+        self.assertEqual(summary.swap_peak, 6.1)
+        self.assertEqual(summary.process_count, 165)
+        self.assertEqual(summary.network_rx_mb, 75.0)
+        self.assertEqual(summary.network_tx_mb, 31.0)
+        self.assertEqual(summary.host_count, 3)
+        self.assertEqual(
+            summary.updated_at, datetime(2026, 10, 31, 8, 59, tzinfo=timezone.utc)
+        )
+
+    def test_an_older_sample_carries_none(self) -> None:
+        summary = self.summary()
+        self.assertIsNone(summary.memory_used_bytes)
+        self.assertIsNone(summary.memory_total_bytes)
+        self.assertIsNone(summary.swap_avg)
+        self.assertIsNone(summary.swap_peak)
+        self.assertIsNone(summary.process_count)
+        self.assertIsNone(summary.network_rx_mb)
+        self.assertIsNone(summary.network_tx_mb)
+        self.assertIsNone(summary.host_count)
+        self.assertIsNone(summary.updated_at)
+
+    def test_the_digest_line_stays_percentages_only(self) -> None:
+        # The cron digest shape is frozen: CPU and memory as percentages, no
+        # amounts, and no swap, network or process count.
+        text = host_report.build_report(
+            [
+                row(
+                    "host1.example.com",
+                    memory_used_bytes=1395864371,
+                    memory_total_bytes=8375186227,
+                    swap_avg=2.3,
+                    swap_peak=6.1,
+                    process_count=165,
+                    network_rx_mb=75.0,
+                    network_tx_mb=31.0,
+                    host_count=3,
+                )
+            ],
+            now=NOW,
+            known_hosts=("host1.example.com",),
+        )
+        self.assertIn(
+            "- host1.example.com: 10 samples, last-seen 4m ago; 2 cores; "
+            "CPU 20.0% avg / 40.0% peak; mem 30.0% avg; "
+            "load 1.00 avg / 2.00 peak; disk 50.0%",
+            text,
+        )
+        for fragment in ("GB", "swap", "net ", "procs", "165", "fleet", "None"):
+            self.assertNotIn(fragment, text)
+
+    def test_rows_from_oracle_carries_the_new_view_columns(self) -> None:
+        rows = host_report.rows_from_oracle(
+            {
+                "columns": [
+                    "HOST_LABEL",
+                    "SWAP_AVG",
+                    "SWAP_PEAK",
+                    "MEMORY_USED_BYTES_LATEST",
+                    "MEMORY_TOTAL_BYTES",
+                    "PROCESS_COUNT_LATEST",
+                    "NETWORK_RX_MB_LATEST",
+                    "NETWORK_TX_MB_LATEST",
+                    "HOST_COUNT",
+                    "UPDATED_AT_LATEST",
+                ],
+                "rows": [
+                    [
+                        "host1.example.com",
+                        2.3,
+                        6.1,
+                        1395864371,
+                        8375186227,
+                        165,
+                        75.0,
+                        31.0,
+                        3,
+                        "2026-10-31T08:59:00+00:00",
+                    ]
+                ],
+            }
+        )
+        record = rows[0]
+        self.assertEqual(record["swap_avg"], 2.3)
+        self.assertEqual(record["swap_peak"], 6.1)
+        self.assertEqual(record["memory_used_bytes_latest"], 1395864371)
+        self.assertEqual(record["memory_total_bytes"], 8375186227)
+        self.assertEqual(record["process_count_latest"], 165)
+        self.assertEqual(record["network_rx_mb_latest"], 75.0)
+        self.assertEqual(record["network_tx_mb_latest"], 31.0)
+        self.assertEqual(record["host_count"], 3)
+        self.assertEqual(record["updated_at_latest"], "2026-10-31T08:59:00+00:00")
 
 
 class OrderingTests(unittest.TestCase):

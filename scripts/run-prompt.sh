@@ -321,10 +321,24 @@ sys.exit(0 if initialized and {"query", "search_content"} <= tools else 1)
 # window the result stays NULL.
 prefetch_build_sql() {
     include_cores=$1
+    include_extended=${2:-1}
     if [ "$include_cores" -eq 1 ]; then
         cores_column='       MAX(cpu_cores) AS cpu_cores,'
     else
         cores_column=
+    fi
+    if [ "$include_extended" -eq 1 ]; then
+        extended_columns='       AVG(swap_percent) AS swap_avg,
+       MAX(swap_percent) AS swap_peak,
+       MAX(memory_total_bytes) AS memory_total_bytes,
+       MAX(memory_used_bytes) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS memory_used_bytes_latest,
+       MAX(process_count) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS process_count_latest,
+       MAX(network_rx_mb) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS network_rx_mb_latest,
+       MAX(network_tx_mb) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS network_tx_mb_latest,
+       MAX(host_count) AS host_count,
+       MAX(updated_at) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS updated_at_latest,'
+    else
+        extended_columns=
     fi
     cat <<EOF
 SELECT host_label,
@@ -336,6 +350,7 @@ SELECT host_label,
        AVG(load_avg) AS load_avg,
        MAX(load_avg) AS load_peak,
 $cores_column
+$extended_columns
        MAX(disk_percent) KEEP (DENSE_RANK LAST ORDER BY sampled_at) AS disk_latest,
        MAX(failed_logins) KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_logins IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_logins_latest,
        MAX(failed_login_users) KEEP (DENSE_RANK LAST ORDER BY CASE WHEN failed_login_users IS NOT NULL THEN sampled_at END NULLS FIRST) AS failed_login_users_latest,
@@ -354,8 +369,9 @@ EOF
 
 # Turn one tools/call response into the compact JSON object the instruction
 # carries. Only the tool payload is inspected; the server's protocol output is
-# never printed. Exit 3 means ORA-00904, so the caller retries without
-# cpu_cores. Any other failure exits 1 with a short, secret-free reason.
+# never printed. Exit 3 means ORA-00904, so the caller retries without the
+# optional column groups. Any other failure exits 1 with a short, secret-free
+# reason.
 prefetch_parse() {
     python3 -c '
 import json
@@ -473,7 +489,8 @@ prefetch_check_timeout() {
 
 prefetch_query() {
     include_cores=$1
-    sql=$(prefetch_build_sql "$include_cores") || return 1
+    include_extended=${2:-1}
+    sql=$(prefetch_build_sql "$include_cores" "$include_extended") || return 1
     requests=$(jq -cn --arg sql "$sql" '
         {jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"run-prompt-prefetch",version:"1.0"}}},
         {jsonrpc:"2.0",method:"notifications/initialized"},
@@ -525,11 +542,16 @@ prefetch_host_stats() {
     }
 
     rc=0
-    data=$(prefetch_query 1 2>/dev/null) || rc=$?
+    data=$(prefetch_query 1 1 2>/dev/null) || rc=$?
     if [ "$rc" -eq 3 ]; then
         printf 'run-prompt: prefetch: cpu_cores not exposed yet\n' >&2
         rc=0
-        data=$(prefetch_query 0 2>/dev/null) || rc=$?
+        data=$(prefetch_query 0 1 2>/dev/null) || rc=$?
+    fi
+    if [ "$rc" -eq 3 ]; then
+        printf 'run-prompt: prefetch: new host-statistics columns not exposed yet\n' >&2
+        rc=0
+        data=$(prefetch_query 0 0 2>/dev/null) || rc=$?
     fi
 
     if [ "$rc" -ne 0 ]; then
