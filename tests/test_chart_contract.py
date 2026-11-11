@@ -90,6 +90,9 @@ class WiringTests(unittest.TestCase):
         self.assertIn("files[", NOTIFY)
         self.assertIn("sending without images", NOTIFY)
         self.assertIn("discord_post_json", NOTIFY)
+        # curl reads ';' inside a -F value as a form modifier, which truncates
+        # a message containing semicolons; the JSON part must be literal.
+        self.assertIn('--form-string "payload_json=$payload"', NOTIFY)
         # curl owns the multipart boundary; a manual header would break it.
         self.assertNotIn("Content-Type: multipart/form-data", NOTIFY)
 

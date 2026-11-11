@@ -59,7 +59,7 @@ class NotifyAttachTests(unittest.TestCase):
             "multipart=0\n"
             "url=\n"
             "for arg do\n"
-            "  [ \"$arg\" = '-F' ] && multipart=1\n"
+            "  case \"$arg\" in -F|--form-string) multipart=1 ;; esac\n"
             "  url=$arg\n"
             "done\n"
             "if [ \"$multipart\" -eq 1 ]; then\n"
@@ -230,6 +230,46 @@ class NotifyAttachTests(unittest.TestCase):
             self.files_from(args),
             [(0, "a.example.com.png"), (1, "b.example.com.png")],
         )
+
+    def test_form_modifier_characters_in_a_message_keep_the_json_literal(self) -> None:
+        # curl reads ';' inside a -F value as a form modifier; a digest has
+        # semicolons between figures. --form-string sends the JSON literally.
+        message = (
+            'CPU 14.0% avg / 18.4% peak; memory 71.7% avg; '
+            'load 0.42, 0.55, "quoted" = 1 @here'
+        )
+        cases = (
+            ("global webhook", {}),
+            (
+                "target webhook",
+                {
+                    "target": "admin-chat",
+                    "extra_env": {"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+                },
+            ),
+        )
+        for label, kwargs in cases:
+            with self.subTest(path=label):
+                self.log.unlink(missing_ok=True)
+                pathlib.Path(str(self.log) + ".body").unlink(missing_ok=True)
+                attach = self.charts()
+                result = self.run_notify(message, attach=attach, **kwargs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.calls()[0]
+                self.assertIn("--form-string", args)
+                index = args.index("--form-string")
+                self.assertTrue(args[index + 1].startswith("payload_json="))
+                self.assertEqual(
+                    self.payload_from(args),
+                    {
+                        "content": message,
+                        "allowed_mentions": {"parse": []},
+                    },
+                )
+                files = self.files_from(args)
+                self.assertEqual(files, [(0, "a.example.com.png")])
+                # The JSON part is not a -F value; only the files are.
+                self.assertEqual(args.count("-F"), len(files))
 
     def test_at_most_ten_direct_pngs_are_attached(self) -> None:
         attach = self.dir / "charts"
