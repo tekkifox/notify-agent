@@ -15,6 +15,10 @@ ARG PARAMIKO_VERSION=3.5.1
 ARG BCRYPT_VERSION=4.2.1
 ARG CRYPTOGRAPHY_VERSION=44.0.0
 ARG PYNACL_VERSION=1.5.0
+# Charts are rendered inside the container by scripts/host_chart.py. Pillow is
+# a prebuilt wheel on both supported architectures and installs into the same
+# target directory as the MCP dependencies.
+ARG PILLOW_VERSION=11.3.0
 
 # Runtime tools only. supercronic is a static Go binary, so no Cron daemon and
 # no root-owned cron spool are needed. python3 is only for the MCP server; the
@@ -55,7 +59,8 @@ RUN python3 -m pip install --no-cache-dir --disable-pip-version-check \
       "paramiko==${PARAMIKO_VERSION}" \
       "bcrypt==${BCRYPT_VERSION}" \
       "cryptography==${CRYPTOGRAPHY_VERSION}" \
-      "PyNaCl==${PYNACL_VERSION}"
+      "PyNaCl==${PYNACL_VERSION}" \
+      "Pillow==${PILLOW_VERSION}"
 
 # Fixed unprivileged identity. The numeric uid is what compose enforces.
 RUN groupadd --gid 10001 agent \

@@ -172,6 +172,7 @@ class Resolution:
     host_ports_json: str = ""
     host_tailnets_json: str = ""
     hosts_json: str = ""
+    chart_hosts_json: str = ""
     hosts_total: int = 0
     host_ports_count: int = 0
     hosts_dropped: int = 0
@@ -273,6 +274,7 @@ def _env_resolution(
         reason=reason,
         host_ports_json=host_ports_json,
         host_tailnets_json=_env_host_tailnets(environ),
+        chart_hosts_json=environ.get("NOTIFY_CHART_HOSTS") or "",
         hosts_total=host_ports_count,
         host_ports_count=host_ports_count,
     )
@@ -425,8 +427,10 @@ def _usable_tailnet(entry: object) -> str | None:
 
 def _validate_hosts(
     hosts: object,
-) -> tuple[dict[str, int], dict[str, str], tuple[str, ...], int, int]:
-    """Return the per-host maps, the host names, the array length and drops.
+) -> tuple[
+    dict[str, int], dict[str, str], tuple[str, ...], tuple[str, ...], int, int
+]:
+    """Return the per-host maps, host names, charted names, length and drops.
 
     ``hosts`` is optional: a panel that predates the per-host ports change
     simply leaves the global ``SSH_PORT`` in charge.  A non-array value is a
@@ -436,17 +440,20 @@ def _validate_hosts(
     port and a malformed optional tailnet keeps its port and is absent from
     the tailnet map.  The returned names are the usable entries in array
     order, deduplicated: they are what "all hosts" resolves to and what the
-    SSH allowlist becomes when the CMS supplied the configuration.
+    SSH allowlist becomes when the CMS supplied the configuration.  The
+    second tuple is the subset whose entry has ``charts: true``; missing or
+    non-boolean values are not charted.
     """
 
     if hosts is None:
-        return {}, {}, (), 0, 0
+        return {}, {}, (), (), 0, 0
     if not isinstance(hosts, list):
         raise DocumentProblem("document hosts must be a JSON array")
 
     mapping: dict[str, int] = {}
     tailnets: dict[str, str] = {}
     names: list[str] = []
+    chart_names: list[str] = []
     dropped = 0
     for entry in hosts:
         pair = _usable_host_port(entry)
@@ -457,10 +464,13 @@ def _validate_hosts(
         mapping[host] = port
         if host not in names:
             names.append(host)
+        if isinstance(entry, dict) and entry.get("charts") is True:
+            if host not in chart_names:
+                chart_names.append(host)
         target = _usable_tailnet(entry)
         if target is not None:
             tailnets[host] = target
-    return mapping, tailnets, tuple(names), len(hosts), dropped
+    return mapping, tailnets, tuple(names), tuple(chart_names), len(hosts), dropped
 
 
 def _expand_all_hosts(
@@ -494,6 +504,7 @@ def validate_document(
     dict[str, int],
     dict[str, str],
     tuple[str, ...],
+    tuple[str, ...],
     int,
     int,
 ]:
@@ -516,7 +527,7 @@ def validate_document(
         raise DocumentProblem("document sources must be a JSON array")
     _validate_targets(targets)
     _validate_sources(environ, targets, sources)
-    host_ports, host_tailnets, host_names, hosts_total, dropped = _validate_hosts(
+    host_ports, host_tailnets, host_names, chart_names, hosts_total, dropped = _validate_hosts(
         document.get("hosts")
     )
     targets = _expand_all_hosts(targets, host_names)
@@ -526,6 +537,7 @@ def validate_document(
         host_ports,
         host_tailnets,
         host_names,
+        chart_names,
         hosts_total,
         dropped,
     )
@@ -629,6 +641,7 @@ def _document_resolution(
     host_ports: Mapping[str, int],
     host_tailnets: Mapping[str, str],
     host_names: tuple[str, ...],
+    chart_names: tuple[str, ...],
     hosts_total: int,
     dropped: int,
     reason: str = "",
@@ -643,6 +656,7 @@ def _document_resolution(
             "" if not host_tailnets else _encode(host_tailnets)
         ),
         hosts_json=_encode(list(host_names)),
+        chart_hosts_json="" if not chart_names else _encode(list(chart_names)),
         hosts_total=hosts_total,
         host_ports_count=len(host_ports),
         hosts_dropped=dropped,
@@ -670,6 +684,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
             host_ports,
             host_tailnets,
             host_names,
+            chart_names,
             hosts_total,
             dropped,
         ) = validate_document(_parse_document(raw), env)
@@ -690,6 +705,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
                 host_ports,
                 host_tailnets,
                 host_names,
+                chart_names,
                 hosts_total,
                 dropped,
             ) = validate_document(_parse_document(cached_raw), env)
@@ -704,6 +720,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
             host_ports,
             host_tailnets,
             host_names,
+            chart_names,
             hosts_total,
             dropped,
             reason=reason,
@@ -723,6 +740,7 @@ def resolve(environ: Mapping[str, str] | None = None) -> Resolution:
         host_ports,
         host_tailnets,
         host_names,
+        chart_names,
         hosts_total,
         dropped,
     )
@@ -764,6 +782,7 @@ def _main(argv: list[str]) -> int:
                     "host_tailnets": resolution.host_tailnets_json,
                     "source": resolution.source,
                     "hosts": resolution.hosts_json,
+                    "chart_hosts": resolution.chart_hosts_json,
                 }
             )
         )
