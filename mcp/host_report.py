@@ -17,8 +17,22 @@ are rendered:
   to this, so a null count means the load rule cannot apply
 * ``cpu_avg`` / ``cpu_peak`` — average and maximum ``cpu_percent``
 * ``memory_avg`` — average ``memory_percent`` (average only, deliberately)
+* ``swap_avg`` / ``swap_peak`` — average and maximum ``swap_percent``
+* ``memory_used_bytes_latest`` / ``memory_total_bytes`` — memory used in the
+  newest sample and the host's total
+* ``process_count_latest`` — processes in the newest sample
+* ``network_rx_mb_latest`` / ``network_tx_mb_latest`` — network in and out in
+  the newest sample
+* ``host_count`` — hosts covered by the snapshot
+* ``updated_at_latest`` — when the snapshot was rolled up
 * ``load_avg`` / ``load_peak`` — average and maximum ``load_avg``
 * ``disk`` — ``disk_percent`` from the newest sample (latest only, deliberately)
+
+The newer view columns are carried on the summary so an ad-hoc request can
+answer with swap, memory amounts, process count, network and the sample time.
+The scheduled digest line deliberately keeps its established shape: CPU and
+memory as percentages, never an amount, and no swap or network. A host that
+predates the new columns simply has them as ``None``; they are never invented.
 
 A host is flagged only on a sustained signal: average CPU, average memory, the
 latest disk reading, or an average load at least twice the host's own core
@@ -141,6 +155,16 @@ def _as_cores(value: Any) -> int | None:
     return cores if cores >= 1 else None
 
 
+def _as_optional_int(value: Any) -> int | None:
+    """Return a non-negative count, or ``None`` when the host did not report it."""
+
+    number = _as_float(value)
+    if number is None:
+        return None
+    count = int(number)
+    return count if count >= 0 else None
+
+
 def _record(row: Mapping[str, Any] | Sequence[Any], columns: Sequence[str] | None) -> dict[str, Any]:
     """Normalise one row to lower-case keys.
 
@@ -177,6 +201,15 @@ class HostSummary:
     cpu_avg: float | None = None
     cpu_peak: float | None = None
     memory_avg: float | None = None
+    memory_used_bytes: float | None = None
+    memory_total_bytes: float | None = None
+    swap_avg: float | None = None
+    swap_peak: float | None = None
+    process_count: int | None = None
+    network_rx_mb: float | None = None
+    network_tx_mb: float | None = None
+    host_count: int | None = None
+    updated_at: datetime | None = None
     load_avg: float | None = None
     load_peak: float | None = None
     disk: float | None = None
@@ -198,9 +231,28 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
             cpu_avg=_as_float(record.get("cpu_avg")),
             cpu_peak=_as_float(record.get("cpu_peak")),
             memory_avg=_as_float(record.get("memory_avg")),
+            memory_used_bytes=_as_float(
+                record.get("memory_used_bytes_latest", record.get("memory_used_bytes"))
+            ),
+            memory_total_bytes=_as_float(record.get("memory_total_bytes")),
+            swap_avg=_as_float(record.get("swap_avg")),
+            swap_peak=_as_float(record.get("swap_peak")),
+            process_count=_as_optional_int(
+                record.get("process_count_latest", record.get("process_count"))
+            ),
+            network_rx_mb=_as_float(
+                record.get("network_rx_mb_latest", record.get("network_rx_mb"))
+            ),
+            network_tx_mb=_as_float(
+                record.get("network_tx_mb_latest", record.get("network_tx_mb"))
+            ),
+            host_count=_as_optional_int(record.get("host_count")),
+            updated_at=parse_timestamp(
+                record.get("updated_at_latest", record.get("updated_at"))
+            ),
             load_avg=_as_float(record.get("load_avg")),
             load_peak=_as_float(record.get("load_peak")),
-            disk=_as_float(record.get("disk")),
+            disk=_as_float(record.get("disk", record.get("disk_latest"))),
         )
 
     age = None if summary.last_seen is None else now - summary.last_seen
@@ -283,6 +335,16 @@ def _ssh_text(result: Mapping[str, Any] | None) -> str:
     if message:
         return f"; SSH {status} ({message})"
     return f"; SSH {status}"
+
+
+def _summary_line(summaries: Sequence[HostSummary]) -> str:
+    reported = sum(1 for summary in summaries if summary.samples)
+    stale = sum(1 for summary in summaries if summary.stale)
+    flagged = sum(1 for summary in summaries if summary.flags)
+    return (
+        f"{reported}/{len(summaries)} hosts reported, {stale} stale, "
+        f"{flagged} flagged"
+    )
 
 
 def _host_line(summary: HostSummary, now: datetime, ssh: Mapping[str, Any] | None = None) -> str:
@@ -400,14 +462,9 @@ def build_report(
         stale_minutes=stale_minutes,
     )
 
-    reported = sum(1 for summary in summaries if summary.samples)
-    stale = sum(1 for summary in summaries if summary.stale)
-    flagged = sum(1 for summary in summaries if summary.flags)
-
     header = (
         f"**Host report** \u2014 {current.strftime('%Y-%m-%d %H:%M')} UTC\n"
-        f"{reported}/{len(summaries)} hosts reported, {stale} stale, "
-        f"{flagged} flagged"
+        f"{_summary_line(summaries)}"
     )
     lines = [_host_line(summary, current) for summary in summaries]
     return _fit(header, lines, limit)
@@ -447,14 +504,7 @@ def build_digest(
         if host:
             ssh_by_host[host] = result
 
-    reported = sum(1 for summary in summaries if summary.samples)
-    stale = sum(1 for summary in summaries if summary.stale)
-    flagged = sum(1 for summary in summaries if summary.flags)
-
-    summary_line = (
-        f"{reported}/{len(summaries)} hosts reported, {stale} stale, "
-        f"{flagged} flagged"
-    )
+    summary_line = _summary_line(summaries)
     header = (
         f"**Host report** \u2014 {current.strftime('%Y-%m-%d %H:%M')} UTC\n"
         f"{summary_line}"
