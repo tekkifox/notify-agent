@@ -571,7 +571,10 @@ post_discord_webhook() {
     # by name. Anything else in the directory is ignored. With no eligible
     # file the request is exactly today's plain JSON request.
     attach_count=0
-    set -- -F "payload_json=$payload"
+    # --form-string, not -F: curl reads ';' inside a -F value as a form
+    # modifier, which truncates a message that contains a semicolon and makes
+    # Discord reject payload_json as invalid JSON. The file parts keep -F.
+    set -- --form-string "payload_json=$payload"
     if [ -n "${NOTIFY_ATTACH_DIR:-}" ] && [ -d "$NOTIFY_ATTACH_DIR" ]; then
         for attach_file in "$NOTIFY_ATTACH_DIR"/*.png; do
             [ -f "$attach_file" ] || continue
