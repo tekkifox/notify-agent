@@ -1094,6 +1094,35 @@ post fails, the failure is logged and the plain JSON post is retried, so an
 attachment can never turn a delivered message into a failed run. The Composio
 path has no file upload, so it sends text and logs one warning.
 
+A named target reaches a webhook through its own variable. When the run names a
+target and `NOTIFY_ATTACH_DIR` holds a PNG, `notify.sh` reads
+`NOTIFY_WEBHOOK_<TARGET>`, where `<TARGET>` is the target name uppercased with
+every character that is not `A-Z0-9` replaced by `_`:
+
+| target | variable |
+| --- | --- |
+| `admin-chat` | `NOTIFY_WEBHOOK_ADMIN_CHAT` |
+| `automations` | `NOTIFY_WEBHOOK_AUTOMATIONS` |
+| `ops.eu` | `NOTIFY_WEBHOOK_OPS_EU` |
+
+A webhook URL is a credential: it is never printed, neither on success nor in a
+warning or an error. Each target has its own, so a chart is never posted to the
+wrong chat, and a target never falls back to `DISCORD_WEBHOOK_URL` (the script
+still refuses that combination). Only `https://discord.com/api/webhooks/...`
+and `https://discordapp.com/api/webhooks/...` are accepted; any other value
+logs one line naming the target and sends text only. A variable that is unset
+keeps today's behaviour exactly: Composio text with its attachment warning. A
+chat with no variable therefore gets text only, whatever another target has
+configured. A message with no attached PNG never uses this path.
+
+```sh
+NOTIFY_WEBHOOK_ADMIN_CHAT='https://discord.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN'
+NOTIFY_WEBHOOK_AUTOMATIONS='https://discord.com/api/webhooks/111111111111111111/EXAMPLE-TOKEN'
+```
+
+Those values are placeholders. Put the real webhooks only in `stack.env`, which
+is gitignored and mode `0600`.
+
 ### Composio path
 
 The Composio path is behind `COMPOSIO_API_KEY` + `COMPOSIO_TOOL`, uses the

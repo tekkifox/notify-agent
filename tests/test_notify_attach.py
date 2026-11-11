@@ -6,6 +6,9 @@ No network is used. A fake curl records each invocation and its arguments, so
 script would have made. A failed multipart request is simulated with an HTTP
 status or a curl exit code.
 
+The per-target webhook tests use the same fake: a chart reaches Discord only
+through a webhook, and a named target takes its own NOTIFY_WEBHOOK_* variable.
+
 Run with:
     python3 -m unittest discover -s tests -p 'test_*.py' -v
 """
@@ -24,6 +27,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NOTIFY = ROOT / "scripts" / "notify.sh"
 WEBHOOK = "https://discord.example.test/webhook"
+TARGET_WEBHOOK = "https://discord.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN"
+FOREIGN_WEBHOOK = "https://example.test/webhook"
 FILE_PART = re.compile(r"^files\[(\d+)\]=@(.+)$")
 
 
@@ -69,6 +74,8 @@ class NotifyAttachTests(unittest.TestCase):
         attach: pathlib.Path | None = None,
         *,
         composio: bool = False,
+        target: str | None = None,
+        extra_env: dict[str, str] | None = None,
         multipart_status: str | None = None,
         multipart_exit: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -85,16 +92,26 @@ class NotifyAttachTests(unittest.TestCase):
                     "COMPOSIO_ARGS": '{"channel_id":"000000000000000000"}',
                 }
             )
-        else:
+        elif target is None:
             env["DISCORD_WEBHOOK_URL"] = WEBHOOK
+        if target is not None:
+            env["NOTIFY_TARGETS"] = json.dumps(
+                {target: {"channel_id": "222222222222222222"}}
+            )
         if attach is not None:
             env["NOTIFY_ATTACH_DIR"] = str(attach)
         if multipart_status is not None:
             env["NOTIFY_TEST_MULTIPART_STATUS"] = multipart_status
         if multipart_exit is not None:
             env["NOTIFY_TEST_MULTIPART_EXIT"] = multipart_exit
+        if extra_env:
+            env.update(extra_env)
+        command = [str(NOTIFY)]
+        if target is not None:
+            command += ["-t", target]
+        command += ["-m", message]
         return subprocess.run(
-            [str(NOTIFY), "-m", message],
+            command,
             env=env,
             text=True,
             capture_output=True,
@@ -225,6 +242,235 @@ class NotifyAttachTests(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(len(calls), 1)
         self.assertNotIn("-F", calls[0])
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertEqual(body["arguments"]["content"], "the digest")
+
+    # --- Per-target webhooks: the only route that carries a chart ----------
+
+    def charts(self, names: tuple[str, ...] = ("a.example.com.png",)) -> pathlib.Path:
+        attach = self.dir / "charts"
+        attach.mkdir(exist_ok=True)
+        for name in names:
+            self.png(attach, name)
+        return attach
+
+    def test_a_target_webhook_posts_multipart_and_marks_sent(self) -> None:
+        attach = self.charts(("b.example.com.png", "a.example.com.png"))
+        marker = self.dir / "marker"
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            target="admin-chat",
+            extra_env={
+                "NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK,
+                "NOTIFY_SEND_MARKER": str(marker),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists(), "a delivered send must write the marker")
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        args = calls[0]
+        self.assertIn("-F", args)
+        self.assertEqual(args[-1], TARGET_WEBHOOK)
+        self.assertEqual(
+            self.files_from(args),
+            [(0, "a.example.com.png"), (1, "b.example.com.png")],
+        )
+        payload = self.payload_from(args)
+        self.assertEqual(payload["content"], "the digest")
+        self.assertEqual(payload["allowed_mentions"], {"parse": []})
+        self.assertNotIn(TARGET_WEBHOOK, result.stdout)
+        self.assertNotIn(TARGET_WEBHOOK, result.stderr)
+        self.assertIn("with 2 image(s)", result.stdout)
+
+    def test_a_target_without_its_webhook_keeps_the_composio_text_path(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest", attach=attach, composio=True, target="admin-chat"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("only supported on the Discord webhook path", result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("-F", calls[0])
+        self.assertIn(
+            "https://api.example.test/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE",
+            calls[0],
+        )
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertEqual(body["arguments"]["content"], "the digest")
+        self.assertEqual(body["arguments"]["channel_id"], "222222222222222222")
+
+    def test_a_non_discord_webhook_is_refused_and_falls_back_to_text(self) -> None:
+        for url in (
+            FOREIGN_WEBHOOK,
+            "http://discord.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN",
+            "https://discord.com.example.test/api/webhooks/000000000000000000/x",
+            "https://discord.com/api/webhooks/",
+        ):
+            with self.subTest(url=url):
+                self.log.unlink(missing_ok=True)
+                pathlib.Path(str(self.log) + ".body").unlink(missing_ok=True)
+                attach = self.charts()
+                result = self.run_notify(
+                    "the digest",
+                    attach=attach,
+                    composio=True,
+                    target="admin-chat",
+                    extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": url},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('target "admin-chat"', result.stderr)
+                self.assertIn("not a Discord webhook URL", result.stderr)
+                self.assertNotIn(url, result.stderr)
+                self.assertNotIn(url, result.stdout)
+                calls = self.calls()
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("-F", calls[0])
+                body = json.loads(
+                    pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+                )
+                self.assertEqual(body["arguments"]["content"], "the digest")
+
+    def test_a_target_webhook_attaches_at_most_ten_images(self) -> None:
+        attach = self.charts(tuple(f"{index:02d}.png" for index in range(12)))
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            target="admin-chat",
+            extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = self.files_from(self.calls()[0])
+        self.assertEqual(len(files), 10)
+        self.assertEqual([index for index, _ in files], list(range(10)))
+        self.assertEqual(
+            [name for _, name in files],
+            [f"{index:02d}.png" for index in range(10)],
+        )
+
+    def test_a_failed_target_webhook_post_falls_back_to_text(self) -> None:
+        for kwargs, expected in (
+            ({"multipart_status": "500"}, "HTTP 500"),
+            ({"multipart_exit": "7"}, "curl exit 7"),
+        ):
+            with self.subTest(**kwargs):
+                self.log.unlink(missing_ok=True)
+                pathlib.Path(str(self.log) + ".body").unlink(missing_ok=True)
+                attach = self.charts()
+                result = self.run_notify(
+                    "the digest",
+                    attach=attach,
+                    target="admin-chat",
+                    extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+                    **kwargs,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("sending without images", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn(TARGET_WEBHOOK, result.stderr)
+                calls = self.calls()
+                self.assertEqual(len(calls), 2)
+                self.assertIn("-F", calls[0])
+                self.assertEqual(calls[0][-1], TARGET_WEBHOOK)
+                self.assertNotIn("-F", calls[1])
+                self.assertEqual(calls[1][-1], TARGET_WEBHOOK)
+                body = json.loads(
+                    pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+                )
+                self.assertEqual(body["content"], "the digest")
+
+    def test_the_webhook_variable_name_is_derived_from_the_target(self) -> None:
+        cases = (
+            ("admin-chat", "NOTIFY_WEBHOOK_ADMIN_CHAT"),
+            ("automations", "NOTIFY_WEBHOOK_AUTOMATIONS"),
+            ("ops.eu", "NOTIFY_WEBHOOK_OPS_EU"),
+            ("Ops EU.v2", "NOTIFY_WEBHOOK_OPS_EU_V2"),
+        )
+        for target, variable in cases:
+            with self.subTest(target=target):
+                self.log.unlink(missing_ok=True)
+                pathlib.Path(str(self.log) + ".body").unlink(missing_ok=True)
+                attach = self.charts()
+                result = self.run_notify(
+                    "the digest",
+                    attach=attach,
+                    target=target,
+                    extra_env={variable: TARGET_WEBHOOK},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.calls()
+                self.assertEqual(len(calls), 1)
+                self.assertIn("-F", calls[0])
+                self.assertEqual(calls[0][-1], TARGET_WEBHOOK)
+
+    def test_a_discordapp_webhook_is_accepted(self) -> None:
+        attach = self.charts()
+        url = "https://discordapp.com/api/webhooks/000000000000000000/EXAMPLE-TOKEN"
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            target="admin-chat",
+            extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": url},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-F", calls[0])
+        self.assertEqual(calls[0][-1], url)
+
+    def test_a_global_webhook_is_still_refused_for_a_named_target(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            target="admin-chat",
+            extra_env={
+                "DISCORD_WEBHOOK_URL": WEBHOOK,
+                "NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK,
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("a webhook has no targets", result.stderr)
+        self.assertNotIn(TARGET_WEBHOOK, result.stderr)
+        self.assertNotIn(WEBHOOK, result.stderr)
+
+    def test_only_the_exact_derived_variable_is_read(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            extra_env={"NOTIFY_WEBHOOK_ADMINCHAT": TARGET_WEBHOOK},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("-F", calls[0])
+
+    def test_a_set_target_webhook_does_not_change_a_message_without_images(self) -> None:
+        attach = self.dir / "charts"
+        attach.mkdir()
+        (attach / "notes.txt").write_text("ignore me", encoding="utf-8")
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            composio=True,
+            target="admin-chat",
+            extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("-F", calls[0])
+        self.assertNotIn(TARGET_WEBHOOK, calls[0])
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )

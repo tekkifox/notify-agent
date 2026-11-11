@@ -760,6 +760,83 @@ for shell in sh bash; do
     fi
 done
 
+# 20. A named target with a chart but no per-target webhook keeps the Composio
+#     text path and its existing attachment warning.
+charts="$tmp/charts"
+mkdir -p "$charts"
+printf 'not-a-real-png' > "$charts/chart.png"
+before=$(count_requests)
+set +e
+out=$(send_target admin-chat NOTIFY_TARGETS="$targets" NOTIFY_ATTACH_DIR="$charts" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "target chart without webhook: notify.sh failed: $out"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "target chart without webhook: expected one text request"
+elif ! contains "$out" "only supported on the Discord webhook path"; then
+    no "target chart without webhook: the attachment warning is missing"
+elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
+    no "target chart without webhook: the message was lost"
+elif [ "$(path_of "$((after - 1))")" != "/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE" ]; then
+    no "target chart without webhook: the text did not go through Composio"
+else
+    pass "a target chart with no webhook keeps the Composio text path"
+fi
+
+# 21. The per-target variable is derived from the target name (odd name
+#     included), and a URL that is not a Discord webhook is refused with one
+#     line naming the target only. The URL itself never reaches the output.
+odd_targets='{"Odd.Name":{"channel_id":"777777777777777777"}}'
+before=$(count_requests)
+set +e
+out=$(send_target "Odd.Name" NOTIFY_TARGETS="$odd_targets" \
+    NOTIFY_ATTACH_DIR="$charts" \
+    NOTIFY_WEBHOOK_ODD_NAME="$api_base/webhook" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "non-discord target webhook: notify.sh failed: $out"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "non-discord target webhook: expected one text request"
+elif ! contains "$out" 'target "Odd.Name"'; then
+    no "non-discord target webhook: the warning did not name the target"
+elif ! contains "$out" "not a Discord webhook URL"; then
+    no "non-discord target webhook: the warning did not explain the refusal"
+elif contains "$out" "$api_base"; then
+    no "non-discord target webhook: the webhook URL leaked into the output"
+elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
+    no "non-discord target webhook: the message was lost"
+else
+    pass "a non-Discord target webhook is refused by name and falls back to text"
+fi
+
+# 22. A set target webhook does not change a message with no chart.
+text_only="$tmp/no-charts"
+mkdir -p "$text_only"
+printf 'ignore me' > "$text_only/notes.txt"
+before=$(count_requests)
+set +e
+out=$(send_target admin-chat NOTIFY_TARGETS="$targets" \
+    NOTIFY_ATTACH_DIR="$text_only" \
+    NOTIFY_WEBHOOK_ADMIN_CHAT="$api_base/webhook" 2>&1)
+rc=$?
+set -e
+after=$(count_requests)
+if [ "$rc" -ne 0 ]; then
+    no "target webhook without a chart: notify.sh failed: $out"
+elif [ "$after" -ne $((before + 1)) ]; then
+    no "target webhook without a chart: expected one text request"
+elif contains "$out" "not a Discord webhook URL"; then
+    no "target webhook without a chart: the webhook path was consulted"
+elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
+    no "target webhook without a chart: the message was lost"
+else
+    pass "a target webhook is ignored when the message has no image"
+fi
+
 if [ "$failures" -ne 0 ]; then
     if [ -s "$tmp/stub.log" ]; then
         printf 'test: stub log follows\n' >&2
