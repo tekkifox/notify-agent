@@ -760,8 +760,10 @@ for shell in sh bash; do
     fi
 done
 
-# 20. A named target with a chart but no per-target webhook keeps the Composio
-#     text path and its existing attachment warning.
+# 20. A named target with a chart, no NOTIFY_WEBHOOK_* override, and a webhook
+#     lookup the bot cannot use falls back to the Composio text path. The stub
+#     answers 200 with {"}, which is not a successful tool response, so the
+#     failure must be one line naming the target, not a response body.
 charts="$tmp/charts"
 mkdir -p "$charts"
 printf 'not-a-real-png' > "$charts/chart.png"
@@ -772,17 +774,23 @@ rc=$?
 set -e
 after=$(count_requests)
 if [ "$rc" -ne 0 ]; then
-    no "target chart without webhook: notify.sh failed: $out"
-elif [ "$after" -ne $((before + 1)) ]; then
-    no "target chart without webhook: expected one text request"
+    no "target chart lookup failure: notify.sh failed: $out"
+elif [ "$after" -ne $((before + 2)) ]; then
+    no "target chart lookup failure: expected a lookup and one text request"
+elif [ "$(path_of "$before")" != "/api/v3.1/tools/execute/DISCORDBOT_LIST_CHANNEL_WEBHOOKS" ]; then
+    no "target chart lookup failure: the first request was not the webhook lookup"
+elif ! contains "$out" 'target "admin-chat"'; then
+    no "target chart lookup failure: the warning did not name the target"
+elif ! contains "$out" "could not resolve a Discord webhook"; then
+    no "target chart lookup failure: the warning did not explain the fallback"
 elif ! contains "$out" "only supported on the Discord webhook path"; then
-    no "target chart without webhook: the attachment warning is missing"
+    no "target chart lookup failure: the attachment warning is missing"
 elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
-    no "target chart without webhook: the message was lost"
+    no "target chart lookup failure: the message was lost"
 elif [ "$(path_of "$((after - 1))")" != "/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE" ]; then
-    no "target chart without webhook: the text did not go through Composio"
+    no "target chart lookup failure: the text did not go through Composio"
 else
-    pass "a target chart with no webhook keeps the Composio text path"
+    pass "a target chart whose webhook lookup fails falls back to text by name"
 fi
 
 # 21. The per-target variable is derived from the target name (odd name

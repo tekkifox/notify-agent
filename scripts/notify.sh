@@ -17,6 +17,8 @@ set -eu
 PROG=notify
 MAX_CHARS=2000
 MAX_STDIN_BYTES=65536
+# The one webhook this agent reuses or creates per channel. Matching is exact.
+WEBHOOK_NAME='Server Notification Agent'
 
 usage() {
     cat <<'EOF'
@@ -74,18 +76,26 @@ Optional Discord attachments:
                        multipart post is retried once without images.
 
 Per-target webhook for attachments:
-  NOTIFY_WEBHOOK_<TARGET>  Discord webhook URL for one named target. The name
-                       is the target uppercased with every character that is
-                       not A-Z0-9 replaced by "_": admin-chat ->
-                       NOTIFY_WEBHOOK_ADMIN_CHAT, operations.eu ->
+  NOTIFY_WEBHOOK_<TARGET>  optional Discord webhook URL override for one named
+                       target. The name is the target uppercased with every
+                       character that is not A-Z0-9 replaced by "_": admin-chat
+                       -> NOTIFY_WEBHOOK_ADMIN_CHAT, operations.eu ->
                        NOTIFY_WEBHOOK_OPERATIONS_EU. It is a secret and is
-                       never printed. When NOTIFY_ATTACH_DIR holds a PNG and
-                       the run names a target, a set variable posts the message
-                       and its images to that webhook. Unset, or set to a URL
-                       that is not https://discord.com/api/webhooks/... or
-                       https://discordapp.com/api/webhooks/..., means text only
-                       through Composio and its usual warning. A target never
-                       uses DISCORD_WEBHOOK_URL.
+                       never printed.
+
+                       When it is unset and NOTIFY_ATTACH_DIR holds a PNG,
+                       notify.sh asks the target's bot connection through
+                       Composio for a webhook in the target channel: it reuses
+                       the webhook named "Server Notification Agent", or
+                       creates one. The target's connected_account_id is used
+                       for both calls. A lookup or creation failure sends text
+                       only and logs one line naming the target, never a
+                       response body or a token.
+
+                       Unset with no usable bot connection, or set to a URL that
+                       is not https://discord.com/api/webhooks/... or
+                       https://discordapp.com/api/webhooks/..., also means text
+                       only. A target never uses DISCORD_WEBHOOK_URL.
 
 The message is truncated to 2000 characters. Discord mentions are suppressed.
 The webhook URL and API keys are never printed.
@@ -413,30 +423,138 @@ send_text() {
 }
 
 # A named target may carry its own Discord webhook, the only route that can
-# carry a file. The URL is a credential: it is never printed, including in a
-# warning or a failure, and it is never taken from DISCORD_WEBHOOK_URL.
+# carry a file. When the operator sets NOTIFY_WEBHOOK_<TARGET> it wins. When it
+# is unset, the bot resolves a webhook in the target channel through Composio:
+# it reuses the one named WEBHOOK_NAME, or creates it once. A webhook URL is a
+# credential: it is never printed and never taken from DISCORD_WEBHOOK_URL.
 send_target_webhook() {
     webhook_var=$(target_webhook_var "$target_name") \
         || fail "could not derive the webhook variable for target \"${target_name}\""
     eval "target_webhook_url=\${${webhook_var}:-}"
 
-    if [ -z "$target_webhook_url" ]; then
+    if [ -n "$target_webhook_url" ]; then
+        case "$target_webhook_url" in
+            https://discord.com/api/webhooks/?*|https://discordapp.com/api/webhooks/?*)
+                ;;
+            *)
+                printf '%s: warning: target "%s" has a webhook that is not a Discord webhook URL; sending text only\n' \
+                    "$PROG" "$target_name" >&2
+                send_text
+                return 0
+                ;;
+        esac
+
+        post_discord_webhook "$target_webhook_url"
+        return 0
+    fi
+
+    # No override: ask the target's own bot connection for a webhook in its
+    # channel. A failure names the target only: a response body can carry a
+    # token, so no part of it is repeated here.
+    if ! resolve_target_webhook; then
+        printf '%s: warning: could not resolve a Discord webhook for target "%s"; sending text only\n' \
+            "$PROG" "$target_name" >&2
         send_text
         return 0
     fi
 
-    case "$target_webhook_url" in
-        https://discord.com/api/webhooks/?*|https://discordapp.com/api/webhooks/?*)
-            ;;
-        *)
-            printf '%s: warning: target "%s" has a webhook that is not a Discord webhook URL; sending text only\n' \
-                "$PROG" "$target_name" >&2
-            send_text
-            return 0
-            ;;
+    post_discord_webhook "$resolved_webhook_url"
+}
+
+# Execute one Composio tool and print its `data` field as JSON. The response
+# can carry a webhook token, so nothing about it is logged: on any failure this
+# returns non-zero with no output and prints no message.
+composio_tool_data() {
+    cw_tool=$1
+    cw_args=$2
+    cw_api_key=${COMPOSIO_API_KEY:-}
+    cw_api_base=${COMPOSIO_API_BASE:-https://backend.composio.dev}
+    cw_user_id=${COMPOSIO_USER_ID:-default}
+    cw_connected_account_id=${target_connected_account_id:-${COMPOSIO_CONNECTED_ACCOUNT_ID:-}}
+
+    [ -n "$cw_api_key" ] || return 1
+    case "$cw_api_base" in
+        https://*) ;;
+        *) return 1 ;;
     esac
 
-    post_discord_webhook "$target_webhook_url"
+    cw_payload=$(jq -cn \
+        --arg user_id "$cw_user_id" \
+        --argjson args "$cw_args" \
+        --arg connected_account_id "$cw_connected_account_id" \
+        '{user_id: $user_id}
+         + (if $connected_account_id == "" then {} else {connected_account_id: $connected_account_id} end)
+         + {arguments: $args}') || return 1
+
+    cw_endpoint="${cw_api_base%/}/api/v3.1/tools/execute/${cw_tool}"
+
+    cw_response=$(printf '%s' "$cw_payload" \
+        | curl -sS -f --proto '=https' --tlsv1.2 --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: ${cw_api_key}" \
+            --data-binary @- \
+            "$cw_endpoint" 2>/dev/null) || return 1
+
+    printf '%s' "$cw_response" | jq -ce '
+        if type == "object" and .successful == true then
+            (if has("data") then .data else error("no data") end)
+        else error("tool execution failed") end
+    ' 2>/dev/null
+}
+
+# Resolve this target's webhook through its bot connection: list the channel's
+# webhooks, reuse the one named WEBHOOK_NAME, or create it if the list has none.
+# Sets resolved_webhook_url only on success. A webhook the list returns without
+# a token cannot be reused, and creating a duplicate every run is worse than a
+# text-only message, so that case fails.
+resolve_target_webhook() {
+    resolved_webhook_url=
+    [ -n "$target_channel_id" ] || return 1
+
+    cw_list_args=$(jq -cn --arg channel_id "$target_channel_id" \
+        '{channel_id: $channel_id}') || return 1
+    cw_list_data=$(composio_tool_data \
+        DISCORDBOT_LIST_CHANNEL_WEBHOOKS "$cw_list_args") || return 1
+
+    # Accept a bare Discord array or a {"webhooks": [...]} wrapper, then pick
+    # the entry with the exact name.
+    cw_webhook=$(printf '%s' "$cw_list_data" | jq -c --arg name "$WEBHOOK_NAME" '
+        if type == "array" then .
+        elif type == "object" and (.webhooks | type) == "array" then .webhooks
+        else [] end
+        | map(select(type == "object" and .name == $name))
+        | .[0] // empty
+    ' 2>/dev/null) || return 1
+
+    if [ -n "$cw_webhook" ]; then
+        cw_id=$(printf '%s' "$cw_webhook" | jq -r '.id // ""' 2>/dev/null) || return 1
+        cw_token=$(printf '%s' "$cw_webhook" | jq -r '.token // ""' 2>/dev/null) || return 1
+        [ -n "$cw_token" ] || return 1
+    else
+        cw_create_args=$(jq -cn \
+            --arg channel_id "$target_channel_id" \
+            --arg name "$WEBHOOK_NAME" \
+            '{channel_id: $channel_id, name: $name}') || return 1
+        cw_created=$(composio_tool_data \
+            DISCORDBOT_CREATE_WEBHOOK "$cw_create_args") || return 1
+        cw_webhook=$(printf '%s' "$cw_created" | jq -c '
+            if type == "object" and (.webhook | type) == "object" then .webhook else . end
+        ' 2>/dev/null) || return 1
+        cw_id=$(printf '%s' "$cw_webhook" | jq -r '.id // ""' 2>/dev/null) || return 1
+        cw_token=$(printf '%s' "$cw_webhook" | jq -r '.token // ""' 2>/dev/null) || return 1
+    fi
+
+    # Build the URL only from a snowflake id and a Discord token, so a malformed
+    # response can never redirect the post to another host or path.
+    case "$cw_id" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$cw_token" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+
+    resolved_webhook_url="https://discord.com/api/webhooks/${cw_id}/${cw_token}"
+    return 0
 }
 
 # Post the message to one Discord webhook. With no eligible PNG this is the
