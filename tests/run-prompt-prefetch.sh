@@ -1136,8 +1136,12 @@ elif ! contains "$prompt" "## Host statistics for this run"; then
     no "charts: instruction lost the statistics section"
 elif contains "$prompt" "[!]"; then
     no "charts: the digest was unexpectedly flagged"
-elif ! contains "$prompt" "attached to the notification automatically"; then
-    no "charts: instruction did not say the chart is attached"
+elif ! contains "$prompt" "CPU and memory charts are attached to this notification for: \`host1.example.com\`"; then
+    no "charts: instruction did not name the charted host"
+elif contains "$prompt" "Do not mention, link or name an image file"; then
+    no "charts: instruction still told the model not to mention the chart"
+elif ! contains "$prompt" "Never name an image file and never add an image URL"; then
+    no "charts: instruction stopped forbidding image file names and URLs"
 elif ! contains "$files" "host1.example.com.png"; then
     no "charts: the ticked host was not charted"
 elif contains "$files" "host2.example.com.png"; then
@@ -1156,6 +1160,26 @@ elif [ -e "$attach" ]; then
     no "charts: the chart directory was not cleaned up"
 else
     pass "a ticked host is charted with no flag raised and an unticked host is not"
+fi
+
+# 16a. Every charted host is named, sorted, in one comma-separated list.
+run_case charts_two admin-chat NOTIFY_PREFETCH=host_stats \
+    NOTIFY_CHART_HOSTS='["host2.example.com","host1.example.com"]'
+prompt=$(cat "$tmp/charts_two" 2>/dev/null || true)
+err=$(cat "$tmp/charts_two.stderr" 2>/dev/null || true)
+files=$(cat "$tmp/charts_two.files" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "charts two: run-prompt.sh failed: $err"
+elif ! contains "$prompt" "for: \`host1.example.com\`, \`host2.example.com\`."; then
+    no "charts two: the notice did not name both charted hosts in order"
+elif contains "$prompt" "for: \`host2.example.com\`, \`host1.example.com\`"; then
+    no "charts two: the host list was not sorted"
+elif ! contains "$files" "host1.example.com.png"; then
+    no "charts two: the first host was not charted"
+elif ! contains "$files" "host2.example.com.png"; then
+    no "charts two: the second host was not charted"
+else
+    pass "the notice names every charted host in sorted order"
 fi
 
 # 16b. A day-long window uses hourly buckets.
@@ -1184,6 +1208,8 @@ if [ "$rc" -ne 0 ]; then
     no "charts empty: an empty series failed the run: $err"
 elif ! contains "$prompt" "## Host statistics for this run"; then
     no "charts empty: the digest was lost"
+elif contains "$prompt" "CPU and memory charts are attached"; then
+    no "charts empty: a chart notice survived an empty series"
 elif [ -s "$tmp/charts_empty.attach" ]; then
     no "charts empty: an attach directory was exported with no image"
 elif ! contains "$err" "run-prompt: charts: no samples for the requested window"; then
@@ -1201,6 +1227,8 @@ if [ "$rc" -ne 0 ]; then
     no "charts fail: a failed series failed the run: $err"
 elif ! contains "$prompt" "## Host statistics for this run"; then
     no "charts fail: the digest was lost"
+elif contains "$prompt" "CPU and memory charts are attached"; then
+    no "charts fail: a chart notice survived a failed render"
 elif [ -s "$tmp/charts_fail.attach" ]; then
     no "charts fail: an attach directory was exported after a failure"
 elif ! contains "$err" "run-prompt: charts failed: host_series: oracle error ORA-00942"; then
@@ -1211,12 +1239,15 @@ fi
 
 # 16e. An absent host chart list is off, even after a successful pre-fetch.
 run_case charts_absent admin-chat NOTIFY_PREFETCH=host_stats
+prompt=$(cat "$tmp/charts_absent" 2>/dev/null || true)
 err=$(cat "$tmp/charts_absent.stderr" 2>/dev/null || true)
 chart_queries=$(wc -l < "$tmp/charts_absent.sql" 2>/dev/null | tr -d ' ' || printf '0')
 if [ "$rc" -ne 0 ]; then
     no "charts absent: run-prompt.sh failed: $err"
 elif [ "$chart_queries" != "1" ]; then
     no "charts absent: a chart query ran without a ticked host"
+elif contains "$prompt" "CPU and memory charts are attached"; then
+    no "charts absent: a chart notice appeared with charts disabled"
 elif [ -s "$tmp/charts_absent.attach" ]; then
     no "charts absent: an attach directory was exported"
 else

@@ -1623,7 +1623,10 @@ def _operator_message_from_instruction(instruction: str) -> str | None:
 # On-demand charts
 # ---------------------------------------------------------------------------
 
-CHART_KEYWORD_RE = re.compile(r"\b(?:graphs?|charts?|plots?)\b", re.IGNORECASE)
+CHART_KEYWORD_RE = re.compile(
+    r"\b(?:graphs?|charts?|plots?|host\s+(?:reports?|digests?))\b",
+    re.IGNORECASE,
+)
 CHART_WINDOW_RE = re.compile(
     r"(?<![\w.])(?:(?:last|past|previous|for)\s+)?"
     r"(?P<amount>\d+)\s*"

@@ -2382,7 +2382,7 @@ class ChartRequestTests(unittest.TestCase):
         "ops.example.com",
     ]
 
-    def test_every_keyword_triggers_a_chart(self) -> None:
+    def test_every_graph_keyword_triggers_a_chart(self) -> None:
         for word in ("graph", "graphs", "chart", "charts", "plot", "plots"):
             with self.subTest(word=word):
                 request = discord_inbound.chart_request(
@@ -2391,6 +2391,67 @@ class ChartRequestTests(unittest.TestCase):
                 self.assertIsNotNone(request)
                 self.assertEqual(request[0], 60)
                 self.assertEqual(request[1], self.HOSTS)
+
+    def test_host_report_and_host_digest_trigger_a_chart(self) -> None:
+        for phrase in (
+            "host report",
+            "host reports",
+            "host digest",
+            "host digests",
+            "host   report",
+            "HOST DIGEST",
+        ):
+            with self.subTest(phrase=phrase):
+                request = discord_inbound.chart_request(
+                    f"show me {phrase}", self.HOSTS, self.HOSTS
+                )
+                self.assertIsNotNone(request)
+                self.assertEqual(request, (60, self.HOSTS))
+
+    def test_show_me_host_report_requests_a_chart(self) -> None:
+        request = discord_inbound.chart_request(
+            "show me host report", self.HOSTS, self.HOSTS
+        )
+        self.assertEqual(request, (60, self.HOSTS))
+
+    def test_host_report_naming_a_host_charts_that_host(self) -> None:
+        request = discord_inbound.chart_request(
+            "show me the host report for media.example.com",
+            self.HOSTS,
+            ["host1.example.com"],
+        )
+        self.assertEqual(request, (60, ["media.example.com"]))
+
+    def test_host_digest_with_chart_naming_a_host_charts_that_host(self) -> None:
+        request = discord_inbound.chart_request(
+            "show me host digest with chart for ops.example.com",
+            self.HOSTS,
+            ["host1.example.com"],
+        )
+        self.assertEqual(request, (60, ["ops.example.com"]))
+
+    def test_report_or_digest_without_the_host_word_does_not_trigger(self) -> None:
+        for message in (
+            "report a bug",
+            "digest of the logs",
+            "the reports are late",
+            "send the user a digest",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(
+                    discord_inbound.chart_request(message, self.HOSTS, self.HOSTS)
+                )
+
+    def test_an_unrelated_sentence_is_not_a_chart_request(self) -> None:
+        for message in (
+            "good morning, all quiet here",
+            "the weather is mild today",
+            "thanks, noted",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(
+                    discord_inbound.chart_request(message, self.HOSTS, self.HOSTS)
+                )
 
     def test_the_keyword_is_a_whole_word_and_case_insensitive(self) -> None:
         self.assertIsNone(
