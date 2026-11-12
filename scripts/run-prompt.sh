@@ -1419,9 +1419,17 @@ Do not call oracle_query for host statistics in this run; the data above is comp
 fi
 
 if [ "$charts_status" = "ok" ] && [ -n "${NOTIFY_ATTACH_DIR:-}" ]; then
-    prompt="${prompt}
+    # Name the hosts the charts were actually drawn for so the digest can say
+    # so on each of those host lines. host_list is the list chart_prefetch
+    # passed to host_series.py; sort it for a stable sentence.
+    chart_notice_hosts=$(printf '%s\n' "${host_list:-}" | LC_ALL=C sort | awk '
+        NF { printf "%s`%s`", sep, $0; sep = ", " }
+    ')
+    if [ -n "$chart_notice_hosts" ]; then
+        prompt="${prompt}
 
-A CPU and memory chart for this run is attached to the notification automatically. Do not mention, link or name an image file, and do not add an image URL."
+CPU and memory charts are attached to this notification for: ${chart_notice_hosts}. Add a short clause to each of those host lines saying a chart is attached, for example \"(chart attached)\". Never name an image file and never add an image URL."
+    fi
 fi
 
 if [ "$ssh_prefetch_status" = "ok" ]; then

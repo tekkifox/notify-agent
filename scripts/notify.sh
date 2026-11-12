@@ -73,7 +73,10 @@ Optional Discord attachments:
                        attachments; the Composio path sends text and logs one
                        warning. When the directory is unset or has no PNG the
                        request is exactly the plain JSON post. A failed
-                       multipart post is retried once without images.
+                       multipart post is retried once without images. When
+                       PNGs exist but cannot be delivered, one plain line is
+                       appended to the message: no file name, URL, token or
+                       error body.
 
 Per-target webhook for attachments:
   NOTIFY_WEBHOOK_<TARGET>  optional Discord webhook URL override for one named
@@ -412,6 +415,27 @@ has_attachments() {
     return 1
 }
 
+# Tell the channel, in one plain line, that charts exist but could not be
+# posted. It is added at most once per run, only when there are PNGs to lose,
+# and it never names a file, a URL, a token or an error body. The line is kept
+# inside Discord's limit: a long message is shortened to leave room for it.
+attach_note_added=0
+attach_note() {
+    has_attachments || return 0
+    [ "$attach_note_added" -eq 0 ] || return 0
+    attach_note_added=1
+    note="Charts can be displayed, but this channel has no Discord webhook I can post them to — please give me permission to create webhooks."
+    message=$(printf '%s' "$message" \
+        | jq -Rs --argjson max "$MAX_CHARS" --arg note "$note" '
+            ($note | length) as $n
+            | if (length + $n + 2) > $max
+              then .[0:($max - $n - 2)] + "\n\n" + $note
+              else . + "\n\n" + $note
+              end
+        ' -r 2>/dev/null) \
+        || fail "could not add the chart notice"
+}
+
 # The text-only delivery path. This is what every named target used before a
 # per-target webhook existed, so it stays byte for byte the same.
 send_text() {
@@ -439,6 +463,7 @@ send_target_webhook() {
             *)
                 printf '%s: warning: target "%s" has a webhook that is not a Discord webhook URL; sending text only\n' \
                     "$PROG" "$target_name" >&2
+                attach_note
                 send_text
                 return 0
                 ;;
@@ -454,6 +479,7 @@ send_target_webhook() {
     if ! resolve_target_webhook; then
         printf '%s: warning: could not resolve a Discord webhook for target "%s"; sending text only\n' \
             "$PROG" "$target_name" >&2
+        attach_note
         send_text
         return 0
     fi
@@ -600,6 +626,10 @@ post_discord_webhook() {
     if [ "$rc" -ne 0 ]; then
         printf '%s: warning: discord attachment post failed (curl exit %s); sending without images\n' \
             "$PROG" "$rc" >&2
+        attach_note
+        payload=$(jq -cn --arg content "$message" \
+            '{content: $content, allowed_mentions: {parse: []}}') \
+            || fail "could not build Discord payload"
         discord_post_json "$payload" "$post_url"
         return 0
     fi
@@ -613,6 +643,10 @@ post_discord_webhook() {
         *)
             printf '%s: warning: discord attachment post failed (HTTP %s); sending without images\n' \
                 "$PROG" "${status:-unknown}" >&2
+            attach_note
+            payload=$(jq -cn --arg content "$message" \
+                '{content: $content, allowed_mentions: {parse: []}}') \
+                || fail "could not build Discord payload"
             discord_post_json "$payload" "$post_url"
             ;;
     esac
@@ -659,6 +693,7 @@ send_composio() {
 
     if [ -n "${NOTIFY_ATTACH_DIR:-}" ] && [ -d "$NOTIFY_ATTACH_DIR" ]; then
         printf '%s: warning: attachments are only supported on the Discord webhook path; sending text only\n' "$PROG" >&2
+        attach_note
     fi
 
     case "$api_base" in

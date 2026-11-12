@@ -1699,8 +1699,11 @@ alternative capability and no suggestion to enable anything. All the existing
 rules remain in force: one message per run, no mentions, no fabrication,
 read-only SQL, and no credentials in messages or logs.
 
-An inbound message that contains `graph`, `graphs`, `chart`, `charts`, `plot`
-or `plots` (any case, whole words) also gets a chart before the model starts.
+An inbound message that contains `graph`, `graphs`, `chart`, `charts`, `plot`,
+`plots` or the phrase `host report`/`host digest` (singular or plural, any case,
+whole words) also gets a chart before the model starts. Those two phrases are
+matched as a pair, so `report a bug` and `digest of the logs` do not trigger a
+chart.
 A host named in the message gets its chart; with none named, the ticked hosts
 in the target's scope are charted. `NOTIFY_CHARTS=1`/`0` are test overrides.
 The listener parses the timeframe from the same message without the model:
@@ -1710,7 +1713,10 @@ default. A number with no unit is ignored. A host named in the message wins;
 with no host named, every host in the run's delivery scope is charted, capped
 at ten images. The series is bucketed to roughly 40–60 points, rendered by
 `scripts/host_chart.py`, and attached to the reply through `NOTIFY_ATTACH_DIR`.
-A chart failure is logged and the reply still goes out as text.
+A chart failure is logged and the reply still goes out as text. When charts
+were rendered but cannot be delivered (no resolvable Discord webhook, or a
+failed multipart upload), the message carries one extra plain line saying so;
+it names no file, URL, token or error body.
 
 ## Security posture
 

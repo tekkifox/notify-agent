@@ -38,6 +38,10 @@ CREATED_TOKEN = "CREATEDTOKEN0987654321"
 TARGET_CHANNEL = "222222222222222222"
 TARGET_ACCOUNT = "bbbbbbbb-2222-2222-2222-222222222222"
 FILE_PART = re.compile(r"^files\[(\d+)\]=@(.+)$")
+ATTACH_NOTE = (
+    "Charts can be displayed, but this channel has no Discord webhook I can "
+    "post them to — please give me permission to create webhooks."
+)
 
 
 @unittest.skipUnless(shutil.which("jq"), "jq is required to exercise notify.sh")
@@ -203,6 +207,10 @@ class NotifyAttachTests(unittest.TestCase):
         self.assertIn("--data-binary", calls[0])
         self.assertNotIn("-F", calls[0])
         self.assertIn("Content-Type: application/json", calls[0])
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("Charts can be displayed", body["content"])
 
     def test_an_empty_or_non_png_directory_posts_plain_json(self) -> None:
         attach = self.dir / "charts"
@@ -306,7 +314,8 @@ class NotifyAttachTests(unittest.TestCase):
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )
-        self.assertEqual(body["content"], "the digest")
+        self.assertEqual(body["content"], "the digest\n\n" + ATTACH_NOTE)
+        self.assertEqual(body["content"].count(ATTACH_NOTE), 1)
 
     def test_a_curl_failure_falls_back_to_plain_json(self) -> None:
         attach = self.dir / "charts"
@@ -332,7 +341,7 @@ class NotifyAttachTests(unittest.TestCase):
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )
-        self.assertEqual(body["arguments"]["content"], "the digest")
+        self.assertEqual(body["arguments"]["content"], "the digest\n\n" + ATTACH_NOTE)
 
     # --- Per-target webhooks: the only route that carries a chart ----------
 
@@ -514,7 +523,8 @@ class NotifyAttachTests(unittest.TestCase):
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )
-        self.assertEqual(body["arguments"]["content"], "the digest")
+        self.assertEqual(body["arguments"]["content"], "the digest\n\n" + ATTACH_NOTE)
+        self.assertEqual(body["arguments"]["content"].count(ATTACH_NOTE), 1)
         self.assertEqual(body["arguments"]["channel_id"], TARGET_CHANNEL)
 
     def test_a_failed_webhook_creation_falls_back_to_text(self) -> None:
@@ -538,7 +548,8 @@ class NotifyAttachTests(unittest.TestCase):
         body = json.loads(
             pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
         )
-        self.assertEqual(body["arguments"]["content"], "the digest")
+        self.assertEqual(body["arguments"]["content"], "the digest\n\n" + ATTACH_NOTE)
+        self.assertEqual(body["arguments"]["content"].count(ATTACH_NOTE), 1)
 
     def test_an_existing_webhook_without_a_token_is_not_recreated(self) -> None:
         attach = self.charts()
@@ -599,7 +610,9 @@ class NotifyAttachTests(unittest.TestCase):
                 body = json.loads(
                     pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
                 )
-                self.assertEqual(body["arguments"]["content"], "the digest")
+                self.assertEqual(
+                    body["arguments"]["content"], "the digest\n\n" + ATTACH_NOTE
+                )
 
     def test_a_target_webhook_attaches_at_most_ten_images(self) -> None:
         attach = self.charts(tuple(f"{index:02d}.png" for index in range(12)))
@@ -647,7 +660,46 @@ class NotifyAttachTests(unittest.TestCase):
                 body = json.loads(
                     pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
                 )
-                self.assertEqual(body["content"], "the digest")
+                self.assertEqual(body["content"], "the digest\n\n" + ATTACH_NOTE)
+                self.assertEqual(body["content"].count(ATTACH_NOTE), 1)
+
+    def test_a_long_message_still_fits_the_note_and_the_2000_limit(self) -> None:
+        attach = self.charts()
+        body_text = "x" * 3000
+        result = self.run_notify(
+            body_text,
+            attach=attach,
+            target="admin-chat",
+            extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+            multipart_status="500",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        content = body["content"]
+        self.assertEqual(len(content), 2000)
+        self.assertIn(ATTACH_NOTE, content)
+        self.assertEqual(content.count(ATTACH_NOTE), 1)
+
+    def test_the_note_has_no_url_token_or_error_body(self) -> None:
+        attach = self.charts()
+        result = self.run_notify(
+            "the digest",
+            attach=attach,
+            target="admin-chat",
+            multipart_status="500",
+            extra_env={"NOTIFY_WEBHOOK_ADMIN_CHAT": TARGET_WEBHOOK},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(
+            pathlib.Path(str(self.log) + ".body").read_text(encoding="utf-8")
+        )
+        self.assertIn(ATTACH_NOTE, body["content"])
+        self.assertNotIn("http://", body["content"])
+        self.assertNotIn("https://", body["content"])
+        self.assertNotIn("EXAMPLE-TOKEN", body["content"])
+        self.assertNotIn("500", body["content"])
 
     def test_the_webhook_variable_name_is_derived_from_the_target(self) -> None:
         cases = (

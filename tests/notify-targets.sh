@@ -767,6 +767,8 @@ done
 charts="$tmp/charts"
 mkdir -p "$charts"
 printf 'not-a-real-png' > "$charts/chart.png"
+attach_note='Charts can be displayed, but this channel has no Discord webhook I can post them to — please give me permission to create webhooks.'
+expected_attach_text=$(printf 'hello\n\n%s' "$attach_note")
 before=$(count_requests)
 set +e
 out=$(send_target admin-chat NOTIFY_TARGETS="$targets" NOTIFY_ATTACH_DIR="$charts" 2>&1)
@@ -785,7 +787,7 @@ elif ! contains "$out" "could not resolve a Discord webhook"; then
     no "target chart lookup failure: the warning did not explain the fallback"
 elif ! contains "$out" "only supported on the Discord webhook path"; then
     no "target chart lookup failure: the attachment warning is missing"
-elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
+elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "$expected_attach_text" ]; then
     no "target chart lookup failure: the message was lost"
 elif [ "$(path_of "$((after - 1))")" != "/api/v3.1/tools/execute/DISCORDBOT_CREATE_MESSAGE" ]; then
     no "target chart lookup failure: the text did not go through Composio"
@@ -815,7 +817,7 @@ elif ! contains "$out" "not a Discord webhook URL"; then
     no "non-discord target webhook: the warning did not explain the refusal"
 elif contains "$out" "$api_base"; then
     no "non-discord target webhook: the webhook URL leaked into the output"
-elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "hello" ]; then
+elif [ "$(printf '%s' "$(body_of "$((after - 1))")" | jq -r '.arguments.content')" != "$expected_attach_text" ]; then
     no "non-discord target webhook: the message was lost"
 else
     pass "a non-Discord target webhook is refused by name and falls back to text"

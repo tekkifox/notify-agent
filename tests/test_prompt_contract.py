@@ -923,5 +923,47 @@ class FlagGuardScheduleTests(unittest.TestCase):
         self.assertIn("never name, link or embed an image file", FLAT_PROMPT)
 
 
+class ChartNoticePromptTests(unittest.TestCase):
+    """The chart notice names the charted hosts and asks the digest to mention
+    the chart, while still keeping file names and URLs out of the message."""
+
+    def test_the_notice_only_exists_when_a_chart_was_attached(self) -> None:
+        self.assertIn(
+            'if [ "$charts_status" = "ok" ] && [ -n "${NOTIFY_ATTACH_DIR:-}" ]; then',
+            RUN_PROMPT,
+        )
+
+    def test_the_notice_names_the_charted_hosts(self) -> None:
+        self.assertIn(
+            "CPU and memory charts are attached to this notification for: "
+            "${chart_notice_hosts}.",
+            RUN_PROMPT,
+        )
+        # The names come from the list handed to the chart helper, sorted so
+        # the sentence is stable.
+        self.assertIn('printf \'%s\\n\' "${host_list:-}" | LC_ALL=C sort', RUN_PROMPT)
+
+    def test_the_notice_asks_for_a_short_mention_on_each_host_line(self) -> None:
+        self.assertIn(
+            "Add a short clause to each of those host lines saying a chart is "
+            "attached",
+            RUN_PROMPT,
+        )
+        self.assertIn("(chart attached)", RUN_PROMPT)
+
+    def test_the_notice_no_longer_forbids_mentioning_the_chart(self) -> None:
+        self.assertNotIn("Do not mention, link or name an image file", RUN_PROMPT)
+        self.assertNotIn(
+            "A CPU and memory chart for this run is attached to the notification "
+            "automatically",
+            RUN_PROMPT,
+        )
+
+    def test_the_notice_still_forbids_file_names_and_urls(self) -> None:
+        self.assertIn(
+            "Never name an image file and never add an image URL.", RUN_PROMPT
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
