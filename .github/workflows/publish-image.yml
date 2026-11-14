@@ -178,20 +178,39 @@ jobs:
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/amd64/digest)" \
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/arm64/digest)"
 
-  # The fleet's stacks are Ansible-managed files on disk. The reusable workflow
-  # joins the tailnet, then asks the deploy seat on mgmt to pull and recreate
-  # exactly these stacks on exactly this host. The seat refuses a stack the host
-  # does not declare.
+  # The fleet's stacks are Ansible-managed files on disk. This job only joins
+  # the tailnet and asks the deploy seat on mgmt to pull and recreate the stack;
+  # the seat validates the host and stacks, refuses a stack the host does not
+  # declare, and prints the image id afterwards.
+  #
+  # This is deliberately self-contained rather than a call to the fleet's
+  # reusable deploy-stack.yml: that workflow lives in the private
+  # tekkifox/infrastructure-as-code repository, and GitHub does not let a public
+  # repository call a reusable workflow in a private one. The duplicated lines
+  # here are only transport, and the price of this repository being public.
   deploy:
     name: Deploy notify-agent
-    needs:
-      - merge
+    needs: merge
     if: github.ref == 'refs/heads/main'
-    uses: tekkifox/infrastructure-as-code/.github/workflows/deploy-stack.yml@main
-    with:
-      host: photos
-      stacks: photos-notify-agent
-      action: deploy
-    secrets:
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gh-notify-agent-${{ github.run_id }}
+
+      - name: Ask the fleet deploy seat to deploy
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          TARGET_HOST: photos
+          TARGET_STACKS: photos-notify-agent
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy"
+          chmod 0600 "$HOME/.ssh/deploy"
+          ssh -i "$HOME/.ssh/deploy" -p 32 \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            root@mgmt-01.tail81cbd2.ts.net \
+            "fleet-deploy $TARGET_HOST $TARGET_STACKS deploy"
