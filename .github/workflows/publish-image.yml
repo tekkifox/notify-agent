@@ -188,6 +188,8 @@ jobs:
   # tekkifox/infrastructure-as-code repository, and GitHub does not let a public
   # repository call a reusable workflow in a private one. The duplicated lines
   # here are only transport, and the price of this repository being public.
+  # The seat address is a repo secret (DEPLOY_SEAT_HOST) so no real hostname is
+  # published here.
   deploy:
     name: Deploy notify-agent
     needs: merge
@@ -203,6 +205,7 @@ jobs:
       - name: Ask the fleet deploy seat to deploy
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SEAT_HOST: ${{ secrets.DEPLOY_SEAT_HOST }}
           TARGET_HOST: photos
           TARGET_STACKS: photos-notify-agent
         run: |
@@ -212,5 +215,5 @@ jobs:
           chmod 0600 "$HOME/.ssh/deploy"
           ssh -i "$HOME/.ssh/deploy" -p 32 \
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            root@mgmt-01.tail81cbd2.ts.net \
+            root@"$DEPLOY_SEAT_HOST" \
             "fleet-deploy $TARGET_HOST $TARGET_STACKS deploy"
