@@ -65,9 +65,9 @@ services:
       # Oracle wallet, mounted read-only at runtime. Wallet contents are never
       # baked into the public image. Set ORACLE_WALLET_HOST_DIR to the host
       # directory that holds tnsnames.ora, ewallet.pem and sqlnet.ora (default
-      # ./oracle-wallet, which is gitignored). In Portainer, either define the
-      # same stack environment variable or replace the left side with the
-      # absolute host path. The container path must stay /wallet, matching
+      # ./oracle-wallet, which is gitignored). In the fleet stack's compose,
+      # set the same variable or replace the left side with the absolute host
+      # path. The container path must stay /wallet, matching
       # ORACLE_WALLET_DIR.
       - ${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}:/wallet:ro
       # SSH private key for the read-only health probe, mounted read-only.

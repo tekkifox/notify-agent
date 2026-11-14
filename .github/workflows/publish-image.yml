@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 # A new push to a pull request (or a non-main ref) cancels its previous run.
-# Runs on main are never cancelled, so an in-progress Portainer deploy finishes.
+# Runs on main are never cancelled, so an in-progress deploy finishes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -178,94 +178,20 @@ jobs:
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/amd64/digest)" \
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/arm64/digest)"
 
+  # The fleet's stacks are Ansible-managed files on disk. The reusable workflow
+  # joins the tailnet, then asks the deploy seat on mgmt to pull and recreate
+  # exactly these stacks on exactly this host. The seat refuses a stack the host
+  # does not declare.
   deploy:
-    name: Redeploy Portainer stack
-    runs-on: ubuntu-latest
+    name: Deploy notify-agent
     needs:
       - merge
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      # Portainer lives on the tailnet and answers on a MagicDNS name with a
-      # self-signed certificate, so the hosted runner joins the tailnet first.
-      - name: Join the tailnet
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-          hostname: gh-notify-agent-${{ github.run_id }}
-
-      - name: Redeploy stack via Portainer API
-        shell: bash
-        env:
-          PORTAINER_URL: ${{ secrets.PORTAINER_URL }}
-          PORTAINER_API_KEY: ${{ secrets.PORTAINER_API_KEY }}
-        run: |
-          set -euo pipefail
-
-          stack_name="notify-agent"
-
-          # Stack and endpoint ids change when a stack is re-created, so discover
-          # them by name instead of hardcoding them.
-          list_response=$(curl -k -sS -w "\n%{http_code}" \
-            -H "X-API-Key: ${PORTAINER_API_KEY}" \
-            "${PORTAINER_URL}/api/stacks")
-          list_status=$(printf '%s\n' "$list_response" | tail -n 1)
-          list_body=$(printf '%s\n' "$list_response" | sed '$d')
-
-          if [ "$list_status" -lt 200 ] || [ "$list_status" -ge 300 ]; then
-            echo "Portainer GET /api/stacks failed with HTTP status ${list_status}"
-            printf '%s\n' "$list_body"
-            exit 1
-          fi
-
-          stack_id=$(printf '%s\n' "$list_body" | \
-            jq -r --arg name "$stack_name" 'first(.[] | select(.Name == $name) | .Id) // empty')
-          endpoint_id=$(printf '%s\n' "$list_body" | \
-            jq -r --arg name "$stack_name" 'first(.[] | select(.Name == $name) | .EndpointId) // empty')
-
-          if [ -z "$stack_id" ] || [ -z "$endpoint_id" ]; then
-            echo "Portainer stack '${stack_name}' not found in GET /api/stacks response"
-            printf '%s\n' "$list_body"
-            exit 1
-          fi
-
-          echo "Discovered Portainer stack '${stack_name}' (id=${stack_id}, endpointId=${endpoint_id})"
-
-          # Read the current stack to preserve its Env array (never send an empty Env).
-          get_response=$(curl -k -sS -w "\n%{http_code}" \
-            -H "X-API-Key: ${PORTAINER_API_KEY}" \
-            "${PORTAINER_URL}/api/stacks/${stack_id}")
-          get_status=$(printf '%s\n' "$get_response" | tail -n 1)
-          get_body=$(printf '%s\n' "$get_response" | sed '$d')
-
-          if [ "$get_status" -lt 200 ] || [ "$get_status" -ge 300 ]; then
-            echo "Portainer GET /api/stacks/${stack_id} failed with HTTP status ${get_status}"
-            printf '%s\n' "$get_body"
-            exit 1
-          fi
-
-          env_array=$(printf '%s\n' "$get_body" | jq '.Env')
-
-          # Build the request body with jq; compose.deploy.yaml contains newlines/quotes/${...}.
-          body=$(jq -n \
-            --rawfile compose compose.deploy.yaml \
-            --argjson env "$env_array" \
-            '{StackFileContent: $compose, Env: $env, PullImage: true}')
-
-          put_response=$(curl -k -sS -w "\n%{http_code}" \
-            -X PUT "${PORTAINER_URL}/api/stacks/${stack_id}?endpointId=${endpoint_id}" \
-            -H "X-API-Key: ${PORTAINER_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "$body")
-          put_status=$(printf '%s\n' "$put_response" | tail -n 1)
-          put_body=$(printf '%s\n' "$put_response" | sed '$d')
-
-          if [ "$put_status" -lt 200 ] || [ "$put_status" -ge 300 ]; then
-            echo "Portainer PUT /api/stacks/${stack_id} failed with HTTP status ${put_status}"
-            printf '%s\n' "$put_body"
-            exit 1
-          fi
-
-          echo "Portainer stack redeployed"
+    if: github.ref == 'refs/heads/main'
+    uses: tekkifox/infrastructure-as-code/.github/workflows/deploy-stack.yml@main
+    with:
+      host: photos
+      stacks: photos-notify-agent
+      action: deploy
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}

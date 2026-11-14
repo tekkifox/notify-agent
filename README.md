@@ -14,7 +14,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Pinned OpenCode `2.2.1`, supercronic `0.2.51`, non-root uid `10001`. |
-| `.github/workflows/publish-image.yml` | Runs the test suites on pull requests; on `main`, builds and publishes `ghcr.io/tekkifox/notify-agent`, then redeploys the Portainer stack through its API. |
+| `.github/workflows/publish-image.yml` | Runs the test suites on pull requests; on `main`, builds and publishes `ghcr.io/tekkifox/notify-agent`, then asks the fleet's Ansible deploy seat to pull and recreate `photos-notify-agent` on `photos`. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
 | `crontab` | Default supercronic schedules, mirroring `crontab.live`. Also the default host source for the mount; one line per schedule. |
 | `crontab.live` | Byte-for-byte mirror of the live operator schedule on the host. |
@@ -61,14 +61,14 @@ Production runs the image published from GitHub, not a local build.
 
 A pull request (opened, updated or reopened) runs `.github/workflows/publish-image.yml` as **tests only**: the Python suite (`python3 -m unittest discover -s tests -p 'test_*.py' -v`) and the shell suites under `tests/` (`tests/run-prompt-*.sh` and `tests/notify-targets.sh`) on a clean `ubuntu-latest` runner. The shell suites are self-contained: they start their own fake `opencode` and stub MCP servers, and require only `python3`, `jq`, `curl`, `openssl`, `flock`, `timeout` and `bash`, which the runner provides. A pull request never builds an image, publishes a manifest or deploys. A `concurrency` group cancels the previous run when the same pull request is pushed again.
 
-A push to `main` runs the build and deploy jobs: it builds `linux/amd64` and `linux/arm64` on native runners, publishes the multi-arch manifest to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then redeploys the Portainer stack through its API. `workflow_dispatch` runs the same jobs by hand. The build, manifest and deploy jobs are gated to non-pull-request events, and the deploy job additionally to `refs/heads/main`, so a pull request cannot deploy. Runs on `main` are not cancelled, so a deploy in progress always finishes.
+A push to `main` runs the build and deploy jobs: it builds `linux/amd64` and `linux/arm64` on native runners, publishes the multi-arch manifest to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then calls the fleet's reusable `deploy-stack.yml` from `tekkifox/infrastructure-as-code` to pull and recreate exactly `photos-notify-agent` on `photos`. `workflow_dispatch` runs the same jobs by hand. The build, manifest and deploy jobs are gated to non-pull-request events, and the deploy job additionally to `refs/heads/main`, so a pull request cannot deploy. Runs on `main` are not cancelled, so a deploy in progress always finishes.
 
-- The Portainer stack's compose must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`.
-- The deploy job reads the stack through the Portainer API to preserve its `Env` array, then sends `compose.deploy.yaml` back with `PullImage: true`, so Portainer pulls the new image and recreates the `agent` container.
-- `compose.deploy.yaml` is the definition Portainer runs (sent by the API on each deploy); `compose.yaml` is for local development. Edit the deploy file, not the dev one, when changing the running stack.
-- The deploy uses two repository secrets: `PORTAINER_URL` (the Portainer base URL) and `PORTAINER_API_KEY` (an API key with access to the stack). Without them the deploy job fails rather than skipping the redeploy.
-- Recreating the container keeps the named `opencode-data` volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
-- The stack directory owns the schedule file, and the stack's compose sets `SCHEDULES_FILE` to it (as an interpolation variable, not in `stack.env`). A redeploy re-reads whatever the host file contains, so schedule changes do not need an image build or a push.
+- The stack's compose is declared in `tekkifox/infrastructure-as-code` (`ansible/files/stacks/photos/photos-notify-agent/compose.yaml`) and must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`. Edit that file, not the files in this repository, when changing the running stack.
+- The reusable workflow joins the tailnet, then over SSH asks the deploy seat on `mgmt` to pull and recreate the named stacks on the named host, and prints the image id afterwards. The seat refuses a stack the host does not declare.
+- `compose.deploy.yaml` is the old deploy payload and is no longer sent by the publish job; `compose.yaml` is for local development.
+- The deploy uses two repository secrets: `DEPLOY_SSH_KEY` (the deploy-only SSH key) and `TS_AUTHKEY` (the Tailscale auth key). A repository that has not added `DEPLOY_SSH_KEY` yet fails the deploy job, so the first run on `main` is the real proof.
+- Recreating the container keeps the named OpenCode data volume, so the OpenCode login survives a redeploy. Only `docker compose down -v` removes it.
+- The stack directory owns the schedule file, and the stack's compose mounts it at `/app/crontab` read-only. A redeploy re-reads whatever the host file contains, so schedule changes do not need an image build or a push.
 
 ## One-time authentication
 
@@ -269,8 +269,8 @@ error rather than a silent fallback to the operator's CMS.
 
 ### Configuration
 
-Add these to `stack.env` for a plain compose run, or as stack environment
-variables in Portainer:
+Add these to `stack.env` for a plain compose run, or as the stack's
+environment variables in `tekkifox/infrastructure-as-code`:
 
 | Variable | Purpose |
 | --- | --- |
@@ -332,14 +332,10 @@ so any prompt fails immediately instead of consuming JSON-RPC traffic.
 ORACLE_WALLET_HOST_DIR=/opt/notify-agent/oracle-wallet
 ```
 
-For the Portainer stack, open **Stacks → notify-agent → Editor** and either add
-a stack environment variable `ORACLE_WALLET_HOST_DIR` with the absolute host
-path, or replace `${ORACLE_WALLET_HOST_DIR:-./oracle-wallet}` with the absolute
-path directly. Keep the `:/wallet:ro` suffix, and keep
-`ORACLE_WALLET_DIR=/wallet` in the stack environment. Portainer substitutes
-stack environment variables while rendering the compose file; `stack.env` only
-supplies container environment variables and cannot choose the bind-mount
-source.
+For the fleet stack, the deploy definition in `tekkifox/infrastructure-as-code`
+mounts the stack directory's `wallet/` at `/wallet` read-only; keep
+`ORACLE_WALLET_DIR=/wallet` in the stack environment. `stack.env` only supplies
+container environment variables and cannot choose the bind-mount source.
 
 `docker compose config` still validates on a fresh checkout because the mount
 falls back to `./oracle-wallet`. That default directory is gitignored. The
