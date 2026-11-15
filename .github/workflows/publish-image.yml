@@ -62,19 +62,13 @@ jobs:
             echo "::endgroup::"
           done
 
+  # The image's only consumer is `photos`, which is an aarch64 host, so only
+  # linux/arm64 is built. The build runs on GitHub's hosted arm64 runner, so it
+  # is native: no QEMU and no `platforms:` override are needed.
   build:
-    name: Build linux/${{ matrix.arch }}
+    name: Build linux/arm64
     if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Native runners per architecture: no QEMU.
-          - arch: amd64
-            os: ubuntu-latest
-          - arch: arm64
-            os: ubuntu-24.04-arm
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -105,17 +99,16 @@ jobs:
             type=sha,prefix=
 
       # Push by digest only. The merge job publishes the tagged manifest.
-      - name: Build and push linux/${{ matrix.arch }} by digest
+      - name: Build and push linux/arm64 by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=notify-agent-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=notify-agent-${{ matrix.arch }}
+          cache-from: type=gha,scope=notify-agent-arm64
+          cache-to: type=gha,mode=max,scope=notify-agent-arm64
 
       - name: Export digest
         run: |
@@ -125,12 +118,12 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-arm64
           path: /tmp/digests/digest
           retention-days: 1
 
   merge:
-    name: Publish multi-arch manifest
+    name: Publish arm64 manifest
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     needs:
@@ -152,30 +145,22 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=
 
-      - name: Download linux/amd64 digest
-        uses: actions/download-artifact@v8
-        with:
-          name: digest-amd64
-          path: /tmp/digests/amd64
-
       - name: Download linux/arm64 digest
         uses: actions/download-artifact@v8
         with:
           name: digest-arm64
           path: /tmp/digests/arm64
 
-      - name: Verify both digests exist
+      - name: Verify the digest exists
         run: |
-          test -s /tmp/digests/amd64/digest
           test -s /tmp/digests/arm64/digest
 
-      # Tags are applied here, once, to the combined manifest.
-      - name: Publish multi-arch manifest
+      # Tags are applied here, once, to the pushed image.
+      - name: Publish arm64 manifest
         run: |
           set -euo pipefail
           docker buildx imagetools create \
             $(jq -r '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/amd64/digest)" \
             "${{ env.IMAGE_NAME }}@$(cat /tmp/digests/arm64/digest)"
 
   # The fleet's stacks are Ansible-managed files on disk. This job only joins

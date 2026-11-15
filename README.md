@@ -61,7 +61,7 @@ Production runs the image published from GitHub, not a local build.
 
 A pull request (opened, updated or reopened) runs `.github/workflows/publish-image.yml` as **tests only**: the Python suite (`python3 -m unittest discover -s tests -p 'test_*.py' -v`) and the shell suites under `tests/` (`tests/run-prompt-*.sh` and `tests/notify-targets.sh`) on a clean `ubuntu-latest` runner. The shell suites are self-contained: they start their own fake `opencode` and stub MCP servers, and require only `python3`, `jq`, `curl`, `openssl`, `flock`, `timeout` and `bash`, which the runner provides. A pull request never builds an image, publishes a manifest or deploys. A `concurrency` group cancels the previous run when the same pull request is pushed again.
 
-A push to `main` runs the build and deploy jobs: it builds `linux/amd64` and `linux/arm64` on native runners, publishes the multi-arch manifest to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then joins the tailnet and asks the fleet's deploy seat on `mgmt` to pull and recreate exactly `photos-notify-agent` on `photos`. `workflow_dispatch` runs the same jobs by hand. The build, manifest and deploy jobs are gated to non-pull-request events, and the deploy job additionally to `refs/heads/main`, so a pull request cannot deploy. Runs on `main` are not cancelled, so a deploy in progress always finishes.
+A push to `main` runs the build and deploy jobs: it builds `linux/arm64` on GitHub's hosted arm64 runner (`ubuntu-24.04-arm`, so the build is native and needs no QEMU), publishes the manifest to GitHub Container Registry tagged `latest` plus a short commit-SHA tag, and then joins the tailnet and asks the fleet's deploy seat on `mgmt` to pull and recreate exactly `photos-notify-agent` on `photos`. Only arm64 is built, because the image's one consumer, `photos`, is an aarch64 host. `workflow_dispatch` runs the same jobs by hand. The build, manifest and deploy jobs are gated to non-pull-request events, and the deploy job additionally to `refs/heads/main`, so a pull request cannot deploy. Runs on `main` are not cancelled, so a deploy in progress always finishes.
 
 - The stack's compose is declared in `tekkifox/infrastructure-as-code` (`ansible/files/stacks/photos/photos-notify-agent/compose.yaml`) and must reference `ghcr.io/tekkifox/notify-agent:latest`, for example `image: ghcr.io/tekkifox/notify-agent:latest`. Edit that file, not the files in this repository, when changing the running stack.
 - The deploy job is self-contained transport: it joins the tailnet, then over SSH asks the deploy seat on `mgmt` to pull and recreate the named stacks on the named host, and prints the image id afterwards. The seat validates the host and stacks and refuses a stack the host does not declare. This repository cannot call the fleet's reusable `deploy-stack.yml` because that workflow lives in the private `tekkifox/infrastructure-as-code` repository and a public repository cannot call a reusable workflow in a private one, so the same few lines live here.
@@ -1815,13 +1815,13 @@ This is a small, single-tenant agent, not a sandbox for untrusted users.
 Verified while building this branch:
 
 - `docker compose config` validates.
-- The image builds with `--platform linux/amd64` (the target host architecture).
+- The image builds for `linux/arm64`, the architecture of the target host (`photos` is aarch64).
 - `docker compose config` resolves the schedule mount to `./crontab` by default and to the `SCHEDULES_FILE` path when that variable is set.
 - With `/app/crontab` missing, or present as a directory (the shape a missing bind-mount source can produce), the entrypoint exits `1` before supercronic starts, printing `FATAL: schedule file /app/crontab is missing or unreadable` and naming `/app/crontab`.
 - On Docker `29.8.0`, a `SCHEDULES_FILE` path that does not exist fails even earlier, at container creation: the daemon creates a host directory and `runc` refuses to mount it over the image's `/app/crontab` file. The container does not start, so there is no silent empty schedule either.
 - With a mounted crontab whose schedules are commented out, supercronic logs `read crontab: /app/crontab`; after replacing the host file and restarting, it logs the same line and a newly added schedule runs.
 - `SIGHUP` was tested against supercronic `0.2.51` in this image: sending it terminated the process (exit `129`) without re-reading the file. A container restart is the documented way to apply an edit.
-- `docker run --rm --platform linux/amd64 --entrypoint sh <image> -c 'id; supercronic -version'` prints:
+- `docker run --rm --platform linux/arm64 --entrypoint sh <image> -c 'id; supercronic -version'` prints:
   `uid=10001(agent) gid=10001(agent) groups=10001(agent)` and `v0.2.51`.
 - The same image reports `opencode v2.2.1`.
 - `opencode auth login --help` in the image lists `--method`, and
