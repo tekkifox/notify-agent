@@ -2,7 +2,7 @@
 
 # Deliberately based on the official Node slim image: it is multi-arch and
 # carries the glibc/libstdc++ runtime the standalone OpenCode binary expects.
-FROM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
+FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc
 
 ARG OPENCODE_VERSION=2.2.1
 ARG SUPERCRONIC_VERSION=0.2.51
