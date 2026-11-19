@@ -257,6 +257,9 @@ class Config:
     state_file: Path
     opencode_model: str
     opencode_bin: str
+    # Agent definition selected by NOTIFY_PROMPT_MODE: "notify" for the full
+    # prompt (the default) or "notify-free" for the shorter free-model prompt.
+    prompt_agent: str
     delivery: str
     webhook_mode: bool
     opencode_model_fallback: str | None
@@ -835,6 +838,14 @@ def load_config(environ: Mapping[str, str]) -> Config:
 
     opencode_bin = _which_opencode(env)
 
+    prompt_mode = (env.get("NOTIFY_PROMPT_MODE") or "").strip()
+    if prompt_mode in ("", "full"):
+        prompt_agent = "notify"
+    elif prompt_mode == "free":
+        prompt_agent = "notify-free"
+    else:
+        raise ConfigError('NOTIFY_PROMPT_MODE must be "full" or "free"')
+
     state_raw = (env.get("NOTIFY_INBOUND_STATE_FILE") or DEFAULT_STATE_FILE).strip()
     if not state_raw:
         state_raw = DEFAULT_STATE_FILE
@@ -916,6 +927,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         state_file=state_path,
         opencode_model=model,
         opencode_bin=opencode_bin,
+        prompt_agent=prompt_agent,
         delivery=delivery,
         webhook_mode=webhook_mode,
         opencode_model_fallback=opencode_model_fallback,
@@ -2129,7 +2141,7 @@ def _run_agent_once(
     command.extend(
         [
             "--agent",
-            "notify",
+            config.prompt_agent,
             "--model",
             effective_model,
             "--",

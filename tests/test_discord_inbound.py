@@ -113,6 +113,24 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.target.allow_runbooks)
         self.assertIn("host3.example.com", config.target.host_scope)
 
+    def test_prompt_mode_defaults_to_the_full_agent(self) -> None:
+        self.assertEqual(self.load().prompt_agent, "notify")
+
+    def test_prompt_mode_full_selects_the_full_agent(self) -> None:
+        self.assertEqual(
+            self.load(NOTIFY_PROMPT_MODE="full").prompt_agent, "notify"
+        )
+
+    def test_prompt_mode_free_selects_the_free_agent(self) -> None:
+        self.assertEqual(
+            self.load(NOTIFY_PROMPT_MODE="free").prompt_agent, "notify-free"
+        )
+
+    def test_unknown_prompt_mode_refuses_to_start(self) -> None:
+        with self.assertRaises(discord_inbound.ConfigError) as raised:
+            self.load(NOTIFY_PROMPT_MODE="frobnitz")
+        self.assertIn("NOTIFY_PROMPT_MODE", str(raised.exception))
+
     def test_empty_allowlist_refuses_to_start(self) -> None:
         with self.assertRaises(discord_inbound.ConfigError):
             self.load(NOTIFY_INBOUND_ALLOWED_AUTHORS="")
@@ -1391,6 +1409,18 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
         self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertIn("NOTIFY_SEND_MARKER", environment)
+
+    def test_free_prompt_mode_uses_the_notify_free_agent(self) -> None:
+        env = dict(self.env)
+        env["NOTIFY_PROMPT_MODE"] = "free"
+        config = discord_inbound.load_config(env)
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", return_value=FakeProcess(0)
+        ) as popen:
+            discord_inbound.run_agent(config, "instruction text")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], [TRUE_BIN, "run", "--agent", "notify-free"])
+        self.assertEqual(command[-2:], ["--", "instruction text"])
 
     def test_content_flag_is_not_exported_for_an_allowing_target(self) -> None:
         env = dict(self.env)

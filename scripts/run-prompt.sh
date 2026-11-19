@@ -2,7 +2,7 @@
 # Run one unattended OpenCode prompt with the locked-down `notify` agent.
 #
 # The agent can compose text and call /app/scripts/notify.sh, nothing else.
-# See prompts/notify.md and opencode.json.
+# See prompts/notify.md, prompts/notify-free.md and opencode.json.
 #
 # Usage:
 #   run-prompt.sh "Compose and send a short status message"
@@ -30,6 +30,24 @@ preflight_retry_delay=${NOTIFY_PREFLIGHT_RETRY_DELAY:-60}
 case "$preflight_retry_delay" in
     ''|*[!0-9]*)
         printf 'run-prompt: NOTIFY_PREFLIGHT_RETRY_DELAY must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
+
+# Prompt profile. The full prompt stays the default; "free" selects the
+# shorter agent definition for free or smaller models. Both agents have the
+# same locked-down permission set and are wired to prompts/{notify,notify-free}.md
+# in opencode.json. An unknown value fails before OpenCode starts.
+prompt_mode=${NOTIFY_PROMPT_MODE:-}
+case "$prompt_mode" in
+    ""|full)
+        notify_agent=notify
+        ;;
+    free)
+        notify_agent=notify-free
+        ;;
+    *)
+        printf 'run-prompt: NOTIFY_PROMPT_MODE must be "full" or "free"\n' >&2
         exit 1
         ;;
 esac
@@ -1495,7 +1513,7 @@ run_attempt() {
         set -- "$@" --print-logs --log-level debug
     fi
     set -- "$@" \
-        --agent notify \
+        --agent "$notify_agent" \
         --model "$attempt_model" \
         -- "$prompt"
 
