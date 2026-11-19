@@ -988,6 +988,57 @@ else
     pass "unset URL keeps the environment path silent and unchanged"
 fi
 
+# 20. The default prompt profile still selects the full notify agent.
+set +e
+capture "$tmp/agent-default" \
+    CAPTURE_ARGS="$tmp/agent-default.args" \
+    "$run_prompt" "Compose a status message."
+rc=$?
+set -e
+agent=$(awk 'prev == "--agent" { print; exit } { prev = $0 }' "$tmp/agent-default.args" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "default mode: run-prompt.sh failed: $(cat "$tmp/agent-default.stderr")"
+elif [ "$agent" != "notify" ]; then
+    no "default mode: expected --agent notify, got '$agent'"
+else
+    pass "default mode keeps --agent notify"
+fi
+
+# 21. NOTIFY_PROMPT_MODE=free selects the free-model agent definition.
+set +e
+capture "$tmp/agent-free" \
+    CAPTURE_ARGS="$tmp/agent-free.args" \
+    NOTIFY_PROMPT_MODE=free \
+    "$run_prompt" "Compose a status message."
+rc=$?
+set -e
+agent=$(awk 'prev == "--agent" { print; exit } { prev = $0 }' "$tmp/agent-free.args" 2>/dev/null || true)
+if [ "$rc" -ne 0 ]; then
+    no "free mode: run-prompt.sh failed: $(cat "$tmp/agent-free.stderr")"
+elif [ "$agent" != "notify-free" ]; then
+    no "free mode: expected --agent notify-free, got '$agent'"
+else
+    pass "NOTIFY_PROMPT_MODE=free selects --agent notify-free"
+fi
+
+# 22. An unknown prompt profile fails before opencode runs.
+set +e
+capture "$tmp/agent-bad" \
+    CAPTURE_ARGS="$tmp/agent-bad.args" \
+    NOTIFY_PROMPT_MODE=frobnitz \
+    "$run_prompt" "Compose a status message."
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    no "bad mode: run-prompt.sh accepted an unknown NOTIFY_PROMPT_MODE"
+elif ! contains "$(cat "$tmp/agent-bad.stderr")" 'NOTIFY_PROMPT_MODE must be "full" or "free"'; then
+    no "bad mode: the failure did not name the accepted values"
+elif [ -e "$tmp/agent-bad.args" ]; then
+    no "bad mode: opencode was started despite the invalid profile"
+else
+    pass "an unknown NOTIFY_PROMPT_MODE fails before opencode"
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf '%d test(s) failed\n' "$failures" >&2
     exit 1

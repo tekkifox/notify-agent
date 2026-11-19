@@ -131,6 +131,42 @@
           "/bin/sleep 5": "allow"
         }
       }
+    },
+    "notify-free": {
+      "description": "Free-model variant of the notify agent. Same locked-down tools and delivery boundary, with the shorter prompts/notify-free.md. Selected by NOTIFY_PROMPT_MODE=free.",
+      "mode": "primary",
+      "steps": 18,
+      "prompt": "{file:./prompts/notify-free.md}",
+      "permission": {
+        "*": "deny",
+        "read": "deny",
+        "edit": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "task": "deny",
+        "todowrite": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "opencode_list_mcp_resources": "deny",
+        "opencode_read_mcp_resource": "deny",
+        "oracle_query": "allow",
+        "oracle_search_content": "allow",
+        "ssh_probe": "allow",
+        "bookstack_search": "allow",
+        "bookstack_read": "allow",
+        "bash": {
+          "*": "deny",
+          "/app/scripts/notify.sh -m *": "allow",
+          "/app/scripts/notify.sh -t * -m *": "allow",
+          "/bin/sleep 5": "allow"
+        }
+      }
     }
   }
 }
