@@ -263,6 +263,10 @@ class Config:
     delivery: str
     webhook_mode: bool
     opencode_model_fallback: str | None
+    # Bounded retries for a transient transport/model-run failure (ECONNRESET,
+    # socket closed unexpectedly, etc.) when nothing has been sent.
+    transient_retry_max: int = 2
+    transient_retry_delay_seconds: float = 2.0
     # The effective (CMS, cache or environment) configuration.  It is passed
     # to the agent child so notify.sh resolves the same targets the listener
     # validated, instead of the stale environment copy.
@@ -898,6 +902,20 @@ def load_config(environ: Mapping[str, str]) -> Config:
         MAX_LOCK_WAIT_SECONDS,
     )
     run_lock = _run_lock_path(env)
+    transient_retry_max = _positive_int(
+        env,
+        "NOTIFY_TRANSIENT_RETRY_MAX",
+        2,
+        0,
+        10,
+    )
+    transient_retry_delay = _positive_float(
+        env,
+        "NOTIFY_TRANSIENT_RETRY_DELAY",
+        2.0,
+        0.0,
+        300.0,
+    )
 
     sources, delivery = _load_sources(
         env,
@@ -931,6 +949,8 @@ def load_config(environ: Mapping[str, str]) -> Config:
         delivery=delivery,
         webhook_mode=webhook_mode,
         opencode_model_fallback=opencode_model_fallback,
+        transient_retry_max=transient_retry_max,
+        transient_retry_delay_seconds=transient_retry_delay,
         targets_json=env.get("NOTIFY_TARGETS") or "",
         sources_json=env.get("NOTIFY_INBOUND_SOURCES") or "",
         host_ports_json=env.get("NOTIFY_HOST_PORTS") or "",
@@ -2790,6 +2810,32 @@ def run_agent(
         _release_run_lock(lock_descriptor)
 
 
+_TRANSIENT_PATTERNS = (
+    "econnreset",
+    "socket connection was closed unexpectedly",
+    "socket hang up",
+    "connection reset",
+    "broken pipe",
+    "epipe",
+    "etimedout",
+    "econnaborted",
+    "eai_again",
+)
+
+
+def _is_transient_transport_failure(text: str) -> bool:
+    low = (text or "").lower()
+    return any(pattern in low for pattern in _TRANSIENT_PATTERNS)
+
+
+def _transient_failure_reason(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped and _is_transient_transport_failure(stripped):
+            return stripped[:200]
+    return "transient transport failure"
+
+
 def _run_agent_locked(
     config: Config,
     chosen: InboundSource,
@@ -2860,12 +2906,62 @@ def _run_agent_locked(
                     return stripped
         return "model unavailable"
 
-    before = _log_size()
-    clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event,
-        summary_text=summary_text, model=preferred, extra_env=extra_env,
-    )
-    after_text = _read_slice(before)
+    def _run_with_transient_retry(model: str) -> tuple[bool, bool, str]:
+        tries = 0
+        last_text = ""
+        last_clean = False
+        last_sent = False
+        while True:
+            tries += 1
+            before_attempt = _log_size()
+            last_clean, last_sent = _run_agent_once(
+                config,
+                chosen,
+                instruction,
+                stop_event,
+                summary_text=summary_text,
+                model=model,
+                extra_env=extra_env,
+            )
+            last_text = _read_slice(before_attempt)
+            if last_sent or last_clean:
+                return last_clean, last_sent, last_text
+            if (
+                tries > config.transient_retry_max
+                or not _is_transient_transport_failure(last_text)
+            ):
+                return last_clean, last_sent, last_text
+            reason = _transient_failure_reason(last_text)
+            LOG.warning(
+                "agent transient transport failure: source=%s model=%s (%s); "
+                "retrying in %.1fs (%d/%d)",
+                chosen.name,
+                model,
+                reason,
+                config.transient_retry_delay_seconds,
+                tries,
+                config.transient_retry_max,
+            )
+            try:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"transient-retry: model {model} failed ({reason}); "
+                        f"retrying in {config.transient_retry_delay_seconds:g}s "
+                        f"({tries}/{config.transient_retry_max})\n"
+                    )
+            except OSError:
+                pass
+            if stop_event is not None and stop_event.is_set():
+                LOG.info("agent transient retry skipped: shutdown requested")
+                return last_clean, last_sent, last_text
+            if stop_event is not None:
+                if stop_event.wait(config.transient_retry_delay_seconds):
+                    LOG.info("agent transient retry skipped: shutdown requested")
+                    return last_clean, last_sent, last_text
+            else:
+                time.sleep(config.transient_retry_delay_seconds)
+
+    clean_exit, sent, after_text = _run_with_transient_retry(preferred)
     if not clean_exit and not sent and fallback and _model_unavailable(after_text):
         reason = _failure_reason(after_text)
         # Make the fallback visible in the transcript.
@@ -2873,7 +2969,7 @@ def _run_agent_locked(
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     f"fallback: preferred model {preferred} failed "
-                    f"({reason}); retrying with {fallback}\\n"
+                    f"({reason}); retrying with {fallback}\n"
                 )
         except OSError:
             pass
@@ -2887,11 +2983,7 @@ def _run_agent_locked(
         if stop_event is not None and stop_event.is_set():
             LOG.info("agent retry skipped: shutdown requested")
             return False
-        before2 = _log_size()
-        clean_exit2, sent2 = _run_agent_once(
-            config, chosen, instruction, stop_event,
-            summary_text=summary_text, model=fallback, extra_env=extra_env,
-        )
+        clean_exit2, sent2, _ = _run_with_transient_retry(fallback)
         if not clean_exit2:
             LOG.warning(
                 "agent fallback failed: source=%s log=%s; not retrying again",
@@ -2923,10 +3015,7 @@ def _run_agent_locked(
         LOG.info("agent retry skipped: shutdown requested")
         return False
 
-    clean_exit, sent = _run_agent_once(
-        config, chosen, instruction, stop_event,
-        summary_text=summary_text, model=preferred, extra_env=extra_env,
-    )
+    clean_exit, sent, _ = _run_with_transient_retry(preferred)
     if not clean_exit:
         LOG.warning(
             "agent retry failed: source=%s log=%s; not retrying again",

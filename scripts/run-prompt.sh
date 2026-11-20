@@ -137,6 +137,25 @@ case "$quota_memo_seconds" in
         exit 1
         ;;
 esac
+
+# A transient transport/model-run failure (for example ECONNRESET, or the
+# socket closing unexpectedly) is retried a small, bounded number of times
+# while nothing has been sent, so a blip does not lose the run. Never retry
+# after a confirmed send. Zero disables the retry.
+transient_retry_max=${NOTIFY_TRANSIENT_RETRY_MAX:-2}
+case "$transient_retry_max" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_TRANSIENT_RETRY_MAX must be a whole number\n' >&2
+        exit 1
+        ;;
+esac
+transient_retry_delay=${NOTIFY_TRANSIENT_RETRY_DELAY:-2}
+case "$transient_retry_delay" in
+    ''|*[!0-9]*)
+        printf 'run-prompt: NOTIFY_TRANSIENT_RETRY_DELAY must be a whole number of seconds\n' >&2
+        exit 1
+        ;;
+esac
 if [ -n "${XDG_STATE_HOME:-}" ]; then
     state_home=$XDG_STATE_HOME
 elif [ -n "${HOME:-}" ]; then
@@ -1674,8 +1693,55 @@ model_unavailable() {
     return 1
 }
 
+transient_transport_failure() {
+    # $1: output file. A transport/reset blip that can lose a run even though
+    # nothing was sent (ECONNRESET, a closed socket, a broken connection).
+    grep -Eiq 'ECONNRESET|socket connection was closed unexpectedly|socket hang up|connection reset|broken pipe|EPIPE|ETIMEDOUT|ECONNABORTED|EAI_AGAIN' "$1" 2>/dev/null
+}
+
 send_marker_present() {
     [ -f "$1.sent" ]
+}
+
+# Run one logical attempt, retrying a transient transport/model-run failure a
+# small, bounded number of times while nothing has been sent. Leaves ATTEMPT_RC
+# and attempt_output (and its .sent marker) describing the final attempt. A
+# confirmed send is never retried.
+run_attempt_with_transient_retry() {
+    transient_model=$1
+    transient_output=$2
+    transient_tries=0
+
+    while :; do
+        transient_tries=$((transient_tries + 1))
+        set +e
+        run_attempt "$transient_model" "$transient_output"
+        set -e
+
+        # A confirmed send must never be retried.
+        if send_marker_present "$transient_output"; then
+            return 0
+        fi
+        # A success, a non-transient failure, or exhausted retries: stop here so
+        # the caller can apply the existing fallback/failure rules.
+        if [ "$ATTEMPT_RC" -eq 0 ] \
+            || [ "$transient_tries" -gt "$transient_retry_max" ] \
+            || ! transient_transport_failure "$transient_output"; then
+            return 0
+        fi
+
+        transient_reason=$(grep -Eim1 'ECONNRESET|socket connection was closed unexpectedly|socket hang up|connection reset|broken pipe|EPIPE|ETIMEDOUT|ECONNABORTED|EAI_AGAIN' "$transient_output" 2>/dev/null | head -n1 | tr -d '\r')
+        [ -n "$transient_reason" ] || transient_reason="transient transport failure"
+        transient_reason=$(printf '%s' "$transient_reason" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | cut -c1-200)
+
+        printf 'run-prompt: transient transport failure (%s); retrying in %ss (%s/%s)\n' \
+            "$transient_reason" "$transient_retry_delay" "$transient_tries" "$transient_retry_max" >&2
+        if [ -n "${debug_log:-}" ]; then
+            printf 'transient-retry: model %s failed (%s); retrying in %ss (%s/%s)\n' \
+                "$transient_model" "$transient_reason" "$transient_retry_delay" "$transient_tries" "$transient_retry_max" >> "$debug_log" 2>/dev/null || true
+        fi
+        sleep "$transient_retry_delay"
+    done
 }
 
 fallback="${OPENCODE_MODEL_FALLBACK:-}"
@@ -1714,15 +1780,14 @@ sent=0
 if [ -n "$skip_until" ]; then
     printf 'run-prompt: preferred model %s skipped until %sZ (quota)\n' \
         "$OPENCODE_MODEL" "$skip_until" >&2
-    set +e
-    run_attempt "$fallback" "$attempt_output"
-    set -e
+    run_attempt_with_transient_retry "$fallback" "$attempt_output"
     rc=$ATTEMPT_RC
+    if send_marker_present "$attempt_output"; then
+        sent=1
+    fi
 else
-    # First attempt on the preferred model.
-    set +e
-    run_attempt "$OPENCODE_MODEL" "$attempt_output"
-    set -e
+    # First logical attempt on the preferred model (with transient retries).
+    run_attempt_with_transient_retry "$OPENCODE_MODEL" "$attempt_output"
     rc=$ATTEMPT_RC
 
     if send_marker_present "$attempt_output"; then
@@ -1750,9 +1815,7 @@ else
         fi
         printf 'run-prompt: preferred model unavailable; retrying with %s\n' "$fallback" >&2
 
-        set +e
-        run_attempt "$fallback" "$attempt_output"
-        set -e
+        run_attempt_with_transient_retry "$fallback" "$attempt_output"
         rc=$ATTEMPT_RC
     fi
 fi

@@ -1903,6 +1903,92 @@ class RunAgentTests(unittest.TestCase):
         self.assertIn("sent=no", lines[0])
         self.assertIn("sent=yes", lines[1])
 
+    def _popen_transient_side_effect(
+        self, attempts: list[tuple[int, bool, str]]
+    ) -> tuple[object, list[dict[str, object]]]:
+        """Simulate attempts with captured output for transient retry tests."""
+
+        pending = list(attempts)
+        calls: list[dict[str, object]] = []
+
+        def fake(command: object, **kwargs: object) -> FakeProcess:
+            returncode, send, output = pending.pop(0)
+            calls.append({"command": command, "env": kwargs["env"]})
+            marker = kwargs["env"]["NOTIFY_SEND_MARKER"]  # type: ignore[index]
+            if send:
+                pathlib.Path(marker).write_text("", encoding="utf-8")
+            return FakeProcess(returncode, io.BytesIO(output.encode("utf-8")))
+
+        return fake, calls
+
+    def _config_with_transient_retry(self, **changes: str) -> discord_inbound.Config:
+        env = dict(self.env)
+        env.setdefault("NOTIFY_TRANSIENT_RETRY_DELAY", "0")
+        env.update(changes)
+        return discord_inbound.load_config(env)
+
+    def test_transient_transport_failure_is_retried_and_can_succeed(self) -> None:
+        config = self._config_with_transient_retry(NOTIFY_TRANSIENT_RETRY_MAX="2")
+        side_effect, calls = self._popen_transient_side_effect(
+            [
+                (1, False, "Transport: ECONNRESET: The socket connection was closed unexpectedly\n"),
+                (0, True, "ok\n"),
+            ]
+        )
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with self.assertLogs("discord-inbound", level="INFO") as logs:
+                result = discord_inbound.run_agent(config, "instruction")
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("agent transient transport failure", "\n".join(logs.output))
+
+    def test_transient_failure_after_confirmed_send_is_not_retried(self) -> None:
+        config = self._config_with_transient_retry(NOTIFY_TRANSIENT_RETRY_MAX="2")
+        side_effect, calls = self._popen_transient_side_effect(
+            [
+                (1, True, "Transport: ECONNRESET: The socket connection was closed unexpectedly\n"),
+            ]
+        )
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            result = discord_inbound.run_agent(config, "instruction")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(result)
+
+    def test_exhausted_transient_retries_fail_without_retrying_a_send(self) -> None:
+        config = self._config_with_transient_retry(NOTIFY_TRANSIENT_RETRY_MAX="2")
+        side_effect, calls = self._popen_transient_side_effect(
+            [
+                (1, False, "socket connection was closed unexpectedly\n"),
+                (1, False, "socket connection was closed unexpectedly\n"),
+                (1, False, "socket connection was closed unexpectedly\n"),
+            ]
+        )
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            with self.assertLogs("discord-inbound", level="WARNING") as logs:
+                result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 3)
+        output = "\n".join(logs.output)
+        self.assertEqual(output.count("agent transient transport failure"), 2)
+
+    def test_non_transient_failure_is_not_retried_as_transient(self) -> None:
+        config = self._config_with_transient_retry(NOTIFY_TRANSIENT_RETRY_MAX="2")
+        side_effect, calls = self._popen_transient_side_effect(
+            [(1, False, "something broke\n")]
+        )
+        with mock.patch.object(
+            discord_inbound.subprocess, "Popen", side_effect=side_effect
+        ):
+            result = discord_inbound.run_agent(config, "instruction")
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 1)
+
 
 class SingleFlightTests(unittest.TestCase):
     """The shared run lock, the busy line and the per-attempt timeout."""
