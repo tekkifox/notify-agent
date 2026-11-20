@@ -1795,18 +1795,19 @@ def _chart_reason(output: bytes) -> str:
 
 def prepare_chart_run(
     config: Config, chosen: InboundSource, instruction: str
-) -> tuple[Path | None, dict[str, str]]:
+) -> tuple[Path | None, dict[str, str], list[str]]:
     """Render charts for a graph request before the model starts.
 
     A host named in the message wins. With none named, the ticked hosts in the
     chat's scope are charted; ``NOTIFY_CHARTS=1``/``0`` are explicit test
-    overrides. Returns the directory to clean up and the environment additions
-    for the reply. A failure is logged once and leaves the reply on text only.
+    overrides. Returns the directory to clean up, the environment additions for
+    the reply, and the charted host names (in request order) when images are
+    attached. A failure is logged once and leaves the reply on text only.
     """
 
     override = os.environ.get("NOTIFY_CHARTS")
     if override == "0":
-        return None, {}
+        return None, {}, []
 
     message = _operator_message_from_instruction(instruction)
     if message is None:
@@ -1821,12 +1822,12 @@ def prepare_chart_run(
         ]
     request = chart_request(message, scope, default_hosts)
     if request is None:
-        return None, {}
+        return None, {}, []
 
     window, selected = request
     if not selected:
         LOG.info("chart requested but no charted host is in this run's scope")
-        return None, {}
+        return None, {}, []
 
     directory: Path | None = None
     environment: dict[str, str] = {}
@@ -1857,7 +1858,7 @@ def prepare_chart_run(
                 _chart_reason(completed.stderr or b""),
             )
             shutil.rmtree(directory, ignore_errors=True)
-            return None, environment
+            return None, {}, []
         images = [
             path
             for path in directory.iterdir()
@@ -1866,7 +1867,7 @@ def prepare_chart_run(
         if not images:
             LOG.info("chart produced no image for the requested window; text only")
             shutil.rmtree(directory, ignore_errors=True)
-            return None, environment
+            return None, {}, []
         environment["NOTIFY_ATTACH_DIR"] = str(directory)
         LOG.info(
             "chart prepared for this reply: images=%d window=%dm hosts=%d",
@@ -1874,7 +1875,7 @@ def prepare_chart_run(
             window,
             len(selected),
         )
-        return directory, environment
+        return directory, environment, list(selected)
     except subprocess.TimeoutExpired:
         LOG.warning("chart unavailable for this reply: timed out")
     except OSError as error:
@@ -1883,7 +1884,7 @@ def prepare_chart_run(
         LOG.warning("chart unavailable for this reply: %s", type(error).__name__)
     if directory is not None:
         shutil.rmtree(directory, ignore_errors=True)
-    return None, environment
+    return None, {}, []
 
 
 def _terminate(process: subprocess.Popen[Any]) -> None:
@@ -2756,13 +2757,25 @@ def run_agent(
         # must not silence the reply path: run unlocked, exactly as before.
         LOG.warning("%s; running without the single-flight lock", error)
     try:
-        chart_directory, chart_environment = prepare_chart_run(
+        chart_directory, chart_environment, chart_hosts = prepare_chart_run(
             config, chosen, instruction
         )
     except Exception as error:  # the reply must never depend on a chart
         LOG.warning("chart unavailable for this reply: %s", type(error).__name__)
-        chart_directory, chart_environment = None, {}
+        chart_directory, chart_environment, chart_hosts = None, {}, []
     try:
+        if chart_environment.get("NOTIFY_ATTACH_DIR") and chart_hosts:
+            chart_notice_hosts = ", ".join(
+                f"`{host}`" for host in sorted(chart_hosts)
+            )
+            instruction = (
+                f"{instruction}\n\n"
+                "CPU and memory charts are attached to this notification for: "
+                f"{chart_notice_hosts}. Add a short clause to each of those "
+                'host lines saying a chart is attached, for example '
+                '"(chart attached)". Never name an image file and never add an '
+                "image URL."
+            )
         return _run_agent_locked(
             config,
             chosen,

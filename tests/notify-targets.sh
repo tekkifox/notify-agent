@@ -760,7 +760,35 @@ for shell in sh bash; do
     fi
 done
 
-# 20. A named target with a chart, no NOTIFY_WEBHOOK_* override, and a webhook
+# 20. A repeated call in the same run (marker already exists) is idempotent:
+#     exit 0 without sending again so duplicate notify.sh invocations do not
+#     duplicate delivery.
+marker="$tmp/marker-idempotent"
+rm -f "$marker"
+before=$(count_requests)
+set +e
+out1=$(send NOTIFY_SEND_MARKER="$marker" 2>&1)
+rc1=$?
+set -e
+mid=$(count_requests)
+if [ "$rc1" -ne 0 ] || [ ! -f "$marker" ] || [ "$mid" -ne $((before + 1)) ]; then
+    no "send marker idempotent: first send did not deliver as expected: $out1"
+else
+    set +e
+    out2=$(send NOTIFY_SEND_MARKER="$marker" 2>&1)
+    rc2=$?
+    set -e
+    after=$(count_requests)
+    if [ "$rc2" -ne 0 ]; then
+        no "send marker idempotent: repeated send exited non-zero: $out2"
+    elif [ "$after" -ne "$mid" ]; then
+        no "send marker idempotent: repeated send delivered again"
+    else
+        pass "an existing send marker prevents duplicate delivery in the same run"
+    fi
+fi
+
+# 21. A named target with a chart, no NOTIFY_WEBHOOK_* override, and a webhook
 #     lookup the bot cannot use falls back to the Composio text path. The stub
 #     answers 200 with {"}, which is not a successful tool response, so the
 #     failure must be one line naming the target, not a response body.

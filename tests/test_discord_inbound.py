@@ -2618,7 +2618,7 @@ class ChartPrepareTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound.subprocess, "run", side_effect=self.fake_run(commands)
         ):
-            directory, environment = discord_inbound.prepare_chart_run(
+            directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNotNone(directory)
@@ -2627,6 +2627,7 @@ class ChartPrepareTests(unittest.TestCase):
         argv = commands[0]
         selected = [argv[index + 1] for index, value in enumerate(argv) if value == "--host"]
         self.assertEqual(selected, ["host1.example.com", "host2.example.com"])
+        self.assertEqual(chart_hosts, ["host1.example.com", "host2.example.com"])
         assert directory is not None
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -2637,7 +2638,7 @@ class ChartPrepareTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound.subprocess, "run", side_effect=self.fake_run(commands)
         ):
-            directory, _environment = discord_inbound.prepare_chart_run(
+            directory, _environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         argv = commands[0]
@@ -2654,13 +2655,14 @@ class ChartPrepareTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound.subprocess, "run", side_effect=self.fake_run(commands)
         ):
-            directory, _environment = discord_inbound.prepare_chart_run(
+            directory, _environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNotNone(directory)
         argv = commands[0]
         selected = [argv[index + 1] for index, value in enumerate(argv) if value == "--host"]
         self.assertEqual(selected, ["host3.example.com"])
+        self.assertEqual(chart_hosts, ["host3.example.com"])
         self.assertEqual(argv[argv.index("--window") + 1], "360")
         assert directory is not None
         shutil.rmtree(directory, ignore_errors=True)
@@ -2670,11 +2672,12 @@ class ChartPrepareTests(unittest.TestCase):
         config, chosen = self.config()
         instruction = discord_inbound.build_instruction(chosen, "show a graph")
         with mock.patch.object(discord_inbound.subprocess, "run") as run:
-            directory, environment = discord_inbound.prepare_chart_run(
+            directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNone(directory)
         self.assertEqual(environment, {})
+        self.assertEqual(chart_hosts, [])
         run.assert_not_called()
 
     def test_the_env_override_charts_the_whole_scope(self) -> None:
@@ -2688,12 +2691,13 @@ class ChartPrepareTests(unittest.TestCase):
                 "run",
                 side_effect=self.fake_run(commands),
             ):
-                directory, _environment = discord_inbound.prepare_chart_run(
+                directory, _environment, chart_hosts = discord_inbound.prepare_chart_run(
                     config, chosen, instruction
                 )
         argv = commands[0]
         selected = [argv[index + 1] for index, value in enumerate(argv) if value == "--host"]
         self.assertEqual(selected, self.HOSTS)
+        self.assertEqual(chart_hosts, self.HOSTS)
         assert directory is not None
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -2704,21 +2708,23 @@ class ChartPrepareTests(unittest.TestCase):
         )
         with mock.patch.dict(os.environ, {"NOTIFY_CHARTS": "0"}, clear=False):
             with mock.patch.object(discord_inbound.subprocess, "run") as run:
-                directory, environment = discord_inbound.prepare_chart_run(
+                directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                     config, chosen, instruction
                 )
         self.assertIsNone(directory)
         self.assertEqual(environment, {})
+        self.assertEqual(chart_hosts, [])
         run.assert_not_called()
 
     def test_a_graph_request_with_no_keyword_does_nothing(self) -> None:
         config, chosen = self.config()
         with mock.patch.object(discord_inbound.subprocess, "run") as run:
-            directory, environment = discord_inbound.prepare_chart_run(
+            directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, "what is the disk usage?"
             )
         self.assertIsNone(directory)
         self.assertEqual(environment, {})
+        self.assertEqual(chart_hosts, [])
         run.assert_not_called()
 
     def test_a_failed_chart_leaves_the_reply_text_only(self) -> None:
@@ -2729,11 +2735,12 @@ class ChartPrepareTests(unittest.TestCase):
             "run",
             side_effect=self.fake_run([], code=1),
         ):
-            directory, environment = discord_inbound.prepare_chart_run(
+            directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNone(directory)
         self.assertEqual(environment, {})
+        self.assertEqual(chart_hosts, [])
 
     def test_a_timeout_leaves_the_reply_text_only(self) -> None:
         config, chosen = self.config()
@@ -2743,11 +2750,12 @@ class ChartPrepareTests(unittest.TestCase):
             "run",
             side_effect=subprocess.TimeoutExpired([], 1),
         ):
-            directory, environment = discord_inbound.prepare_chart_run(
+            directory, environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNone(directory)
         self.assertEqual(environment, {})
+        self.assertEqual(chart_hosts, [])
 
     def test_a_target_without_scope_or_all_hosts_charts_nothing(self) -> None:
         self.env["NOTIFY_TARGETS"] = json.dumps(
@@ -2758,10 +2766,11 @@ class ChartPrepareTests(unittest.TestCase):
             chosen, "show a graph for host1.example.com"
         )
         with mock.patch.object(discord_inbound.subprocess, "run") as run:
-            directory, _environment = discord_inbound.prepare_chart_run(
+            directory, _environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         self.assertIsNone(directory)
+        self.assertEqual(chart_hosts, [])
         run.assert_not_called()
 
     def test_all_hosts_charts_the_ticked_hosts_in_the_run_universe(self) -> None:
@@ -2782,12 +2791,13 @@ class ChartPrepareTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound.subprocess, "run", side_effect=self.fake_run(commands)
         ):
-            directory, _environment = discord_inbound.prepare_chart_run(
+            directory, _environment, chart_hosts = discord_inbound.prepare_chart_run(
                 config, chosen, instruction
             )
         argv = commands[0]
         selected = [argv[index + 1] for index, value in enumerate(argv) if value == "--host"]
         self.assertEqual(selected, ["host2.example.com"])
+        self.assertEqual(chart_hosts, ["host2.example.com"])
         assert directory is not None
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -2797,8 +2807,13 @@ class ChartPrepareTests(unittest.TestCase):
         chart_dir.mkdir()
         (chart_dir / "host1.example.com.png").write_bytes(b"\x89PNG\r\n\x1a\n")
         captured: dict[str, str] = {}
+        seen_instruction = ""
 
-        def fake_popen(_command: object, **kwargs: object) -> "FakeProcess":
+        def fake_popen(command: object, **kwargs: object) -> "FakeProcess":
+            nonlocal seen_instruction
+            argv = list(command)  # type: ignore[arg-type]
+            if argv:
+                seen_instruction = str(argv[-1])
             environment = kwargs["env"]
             captured.update(environment)  # type: ignore[arg-type]
             marker = environment["NOTIFY_SEND_MARKER"]  # type: ignore[index]
@@ -2808,7 +2823,7 @@ class ChartPrepareTests(unittest.TestCase):
         with mock.patch.object(
             discord_inbound,
             "prepare_chart_run",
-            return_value=(chart_dir, {"NOTIFY_ATTACH_DIR": str(chart_dir)}),
+            return_value=(chart_dir, {"NOTIFY_ATTACH_DIR": str(chart_dir)}, ["host1.example.com"]),
         ):
             with mock.patch.object(
                 discord_inbound.subprocess, "Popen", side_effect=fake_popen
@@ -2822,6 +2837,15 @@ class ChartPrepareTests(unittest.TestCase):
                     )
         self.assertEqual(captured["NOTIFY_ATTACH_DIR"], str(chart_dir))
         self.assertFalse(chart_dir.exists())
+        self.assertIn(
+            "CPU and memory charts are attached to this notification for: "
+            "`host1.example.com`.",
+            seen_instruction,
+        )
+        self.assertIn(
+            'Add a short clause to each of those host lines saying a chart is attached, for example "(chart attached)".',
+            seen_instruction,
+        )
 
     def test_an_inherited_attach_dir_never_reaches_a_non_chart_run(self) -> None:
         config, chosen = self.config()
