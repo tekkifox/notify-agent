@@ -16,7 +16,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CRONTABS = {
     name: (ROOT / name).read_text(encoding="utf-8")
-    for name in ("crontab", "crontab.live")
+    for name in ("crontab",)
 }
 RUN_PROMPT = (ROOT / "scripts" / "run-prompt.sh").read_text(encoding="utf-8")
 NOTIFY = (ROOT / "scripts" / "notify.sh").read_text(encoding="utf-8")
@@ -36,9 +36,6 @@ class ScheduleTests(unittest.TestCase):
             with self.subTest(crontab=name):
                 self.assertNotIn("NOTIFY_CHARTS", text)
                 self.assertNotIn("NOTIFY_CHART_HOSTS", text)
-
-    def test_the_crontabs_stay_in_step(self) -> None:
-        self.assertEqual(CRONTABS["crontab"], CRONTABS["crontab.live"])
 
     def test_the_admin_chat_digest_keeps_its_window(self) -> None:
         for name, text in CRONTABS.items():

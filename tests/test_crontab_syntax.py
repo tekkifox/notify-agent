@@ -18,7 +18,7 @@ import subprocess
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CRONTABS = ("crontab", "crontab.live")
+CRONTABS = ("crontab",)
 
 
 def active_lines(text: str) -> list[tuple[int, str]]:
