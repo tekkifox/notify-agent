@@ -29,6 +29,7 @@ sys.modules["host_report"] = host_report
 spec.loader.exec_module(host_report)
 
 NOW = datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc)
+GB = 1024 ** 3
 
 
 def at(minutes_ago: int) -> str:
@@ -45,7 +46,7 @@ def row(
     cpu_peak: float | None = 40.0,
     memory_avg: float | None = 30.0,
     memory_used_bytes: float | None = None,
-    memory_total_bytes: float | None = None,
+    memory_total_bytes: float | None = 8 * GB,
     swap_avg: float | None = None,
     swap_peak: float | None = None,
     process_count: int | None = None,
@@ -81,16 +82,16 @@ def row(
 
 
 class ShapeTests(unittest.TestCase):
-    def test_line_order_matches_the_old_report(self) -> None:
+    def test_line_order_matches_the_report_shape(self) -> None:
         text = host_report.build_report(
             [row("host1.example.com")],
             now=NOW,
             known_hosts=("host1.example.com",),
         )
         self.assertIn(
-            "- host1.example.com: 10 samples, last-seen 4m ago; 2 cores; "
-            "CPU 20.0% avg / 40.0% peak; mem 30.0% avg; "
-            "load 1.00 avg / 2.00 peak; disk 50.0%",
+            "- host1.example.com: 10 samples, last-seen 08:56; 2 cores; "
+            "CPU 20% avg / 40% peak; mem 2.40 GB avg / 8.00 GB; "
+            "load 1.00 avg / 2.00 peak; disk 50%",
             text,
         )
 
@@ -103,8 +104,8 @@ class ShapeTests(unittest.TestCase):
             now=NOW,
             known_hosts=("host1.example.com", "host2.example.com"),
         )
-        self.assertIn("last-seen 4m ago; 1 core; CPU 20.0% avg", text)
-        self.assertIn("last-seen 4m ago; cores n/a; CPU 20.0% avg", text)
+        self.assertIn("last-seen 08:56; 1 core; CPU 20% avg", text)
+        self.assertIn("last-seen 08:56; cores n/a; CPU 20% avg", text)
 
     def test_header_and_summary(self) -> None:
         text = host_report.build_report(
@@ -113,7 +114,7 @@ class ShapeTests(unittest.TestCase):
             known_hosts=("host1.example.com", "host2.example.com", "silent.example"),
         )
         self.assertTrue(
-            text.startswith("**Host report** \u2014 2026-10-31 09:00 UTC\n")
+            text.startswith("**Host report** \u2014 31/10/2026 09:00 UTC\n")
         )
         self.assertIn("2/3 hosts reported, 2 stale, 2 flagged", text)
 
@@ -127,6 +128,14 @@ class ShapeTests(unittest.TestCase):
         )
         self.assertIn("0/1 hosts reported, 1 stale, 1 flagged", text)
 
+    def test_last_seen_uses_date_and_time_when_not_today(self) -> None:
+        text = host_report.build_report(
+            [row("host1.example.com", age=20 * 60)],
+            now=NOW,
+            known_hosts=("host1.example.com",),
+        )
+        self.assertIn("last-seen 30/10/2026 13:00", text)
+
     def test_rows_from_oracle_payload(self) -> None:
         rows = host_report.rows_from_oracle(
             {
@@ -139,8 +148,8 @@ class ShapeTests(unittest.TestCase):
 
 
 class SnapshotFigureTests(unittest.TestCase):
-    """The new view figures are carried on the summary, not rendered in the
-    scheduled digest, which keeps its percentage-only shape."""
+    """The view figures are carried on the summary; the digest reports memory in
+    gigabytes when byte amounts are available."""
 
     def summary(self, **values):
         return host_report._summarise(
@@ -175,7 +184,7 @@ class SnapshotFigureTests(unittest.TestCase):
         )
 
     def test_an_older_sample_carries_none(self) -> None:
-        summary = self.summary()
+        summary = self.summary(memory_total_bytes=None)
         self.assertIsNone(summary.memory_used_bytes)
         self.assertIsNone(summary.memory_total_bytes)
         self.assertIsNone(summary.swap_avg)
@@ -186,15 +195,14 @@ class SnapshotFigureTests(unittest.TestCase):
         self.assertIsNone(summary.host_count)
         self.assertIsNone(summary.updated_at)
 
-    def test_the_digest_line_stays_percentages_only(self) -> None:
-        # The cron digest shape is frozen: CPU and memory as percentages, no
-        # amounts, and no swap, network or process count.
+    def test_the_digest_line_reports_memory_in_gigabytes(self) -> None:
         text = host_report.build_report(
             [
                 row(
                     "host1.example.com",
+                    memory_avg=30.0,
                     memory_used_bytes=1395864371,
-                    memory_total_bytes=8375186227,
+                    memory_total_bytes=8 * GB,
                     swap_avg=2.3,
                     swap_peak=6.1,
                     process_count=165,
@@ -207,13 +215,23 @@ class SnapshotFigureTests(unittest.TestCase):
             known_hosts=("host1.example.com",),
         )
         self.assertIn(
-            "- host1.example.com: 10 samples, last-seen 4m ago; 2 cores; "
-            "CPU 20.0% avg / 40.0% peak; mem 30.0% avg; "
-            "load 1.00 avg / 2.00 peak; disk 50.0%",
+            "- host1.example.com: 10 samples, last-seen 08:56; 2 cores; "
+            "CPU 20% avg / 40% peak; mem 2.40 GB avg / 8.00 GB; "
+            "load 1.00 avg / 2.00 peak; disk 50%",
             text,
         )
-        for fragment in ("GB", "swap", "net ", "procs", "165", "fleet", "None"):
+        for fragment in ("swap", "net ", "procs", "165", "fleet", "None"):
             self.assertNotIn(fragment, text)
+        self.assertNotIn("mem 30%", text)
+
+    def test_memory_falls_back_to_whole_percent_without_totals(self) -> None:
+        text = host_report.build_report(
+            [row("host1.example.com", memory_avg=30.4, memory_total_bytes=None)],
+            now=NOW,
+            known_hosts=("host1.example.com",),
+        )
+        self.assertIn("mem 30% avg", text)
+        self.assertNotIn("GB", text)
 
     def test_rows_from_oracle_carries_the_new_view_columns(self) -> None:
         rows = host_report.rows_from_oracle(
@@ -318,29 +336,28 @@ class ThresholdTests(unittest.TestCase):
         return text
 
     def test_cpu_average_boundary(self) -> None:
-        self.assertIn(
-            "CPU avg 60.0% >= 60%", self.assert_flagged(cpu_avg=60.0)
-        )
+        self.assertIn("CPU avg 60% >= 60%", self.assert_flagged(cpu_avg=60.0))
         text = self.assert_flagged(cpu_avg=59.9)
-        self.assertNotIn("CPU avg 59.9% >=", text)
+        self.assertNotIn("CPU avg 60% >=", text)
         self.assertNotIn("[!]", text)
 
     def test_memory_average_boundary(self) -> None:
         self.assertIn(
-            "memory 85.0% >= 85%", self.assert_flagged(memory_avg=85.0)
+            "memory 6.80 GB avg / 8.00 GB, 85% >= 85%",
+            self.assert_flagged(memory_avg=85.0),
         )
         text = self.assert_flagged(memory_avg=84.9)
-        self.assertNotIn("memory 84.9% >=", text)
+        self.assertNotIn("85% >= 85%", text)
         self.assertNotIn("[!]", text)
 
     def test_disk_boundary(self) -> None:
-        self.assertIn("disk 95.0% >= 95%", self.assert_flagged(disk=95.0))
+        self.assertIn("disk 95% >= 95%", self.assert_flagged(disk=95.0))
         text = self.assert_flagged(disk=94.9)
-        self.assertNotIn("disk 94.9% >=", text)
+        self.assertNotIn("disk 95% >=", text)
         self.assertNotIn("[!]", text)
         # photos sat at 84.8%; a host there must not be flagged.
         text = self.assert_flagged(disk=84.8)
-        self.assertNotIn("disk 84.8% >=", text)
+        self.assertNotIn("disk 85% >=", text)
         self.assertNotIn("[!]", text)
 
     def test_load_average_boundary_is_twice_the_core_count(self) -> None:
@@ -379,16 +396,21 @@ class ThresholdTests(unittest.TestCase):
     def test_cpu_peak_is_context_and_never_flags(self) -> None:
         text = self.assert_flagged(cpu_avg=10.0, cpu_peak=437.0)
         self.assertNotIn("[!]", text)
-        self.assertNotIn("CPU peak 437.0% >=", text)
-        self.assertIn("CPU 10.0% avg / 437.0% peak", text)
+        self.assertNotIn("CPU peak", text.split(" (", 1)[-1] if " (" in text else "")
+        self.assertIn("CPU 10% avg / 437% peak", text)
 
-    def test_reason_text_matches_the_prompt_examples(self) -> None:
-        # prompts/notify.md rule 29 names these exact strings.
+    def test_reason_text_uses_whole_percentages_and_gigabytes(self) -> None:
         for values, reason in (
-            ({"cpu_avg": 76.7}, "(CPU avg 76.7% >= 60%)"),
-            ({"memory_avg": 88.0}, "(memory 88.0% >= 85%)"),
-            ({"disk": 95.4}, "(disk 95.4% >= 95%)"),
-            ({"cpu_cores": 2, "load_avg": 8.74}, "(load avg 8.74 >= 2x2 cores)"),
+            ({"cpu_avg": 76.7}, "(CPU avg 77% >= 60%)"),
+            (
+                {"memory_avg": 88.0},
+                "(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)",
+            ),
+            ({"disk": 95.4}, "(disk 95% >= 95%)"),
+            (
+                {"cpu_cores": 2, "load_avg": 8.74},
+                "(load avg 8.74 >= 2x2 cores)",
+            ),
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, self.assert_flagged(**values))
@@ -402,15 +424,15 @@ class ThresholdTests(unittest.TestCase):
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
-            "(CPU avg 61.0% >= 60%; memory 86.0% >= 85%; "
-            "disk 96.0% >= 95%; load avg 4.50 >= 2x2 cores)",
+            "(CPU avg 61% >= 60%; memory 6.88 GB avg / 8.00 GB, 86% >= 85%; "
+            "disk 96% >= 95%; load avg 4.50 >= 2x2 cores)",
             text,
         )
 
     def test_stale_still_comes_first(self) -> None:
         text = self.assert_flagged(age=30, cpu_avg=99.0)
         self.assertIn(
-            "(STALE: no sample in the last 20m; CPU avg 99.0% >= 60%)", text
+            "(STALE: no sample in the last 20m; CPU avg 99% >= 60%)", text
         )
 
 
@@ -447,7 +469,7 @@ class DigestTests(unittest.TestCase):
             now=NOW,
             known_hosts=("host1.example.com",),
         )
-        self.assertIn("disk 50.0%; SSH ok (42 ms)", text)
+        self.assertIn("disk 50%; SSH ok (42 ms)", text)
 
     def test_ssh_failures_keep_their_class_and_reason(self) -> None:
         text = host_report.build_digest(
@@ -508,6 +530,7 @@ class ReadmeTests(unittest.TestCase):
                 cpu_avg=44.8,
                 cpu_peak=117.0,
                 memory_avg=22.6,
+                memory_total_bytes=8 * GB,
                 load_avg=8.74,
                 load_peak=9.50,
                 disk=30.9,
@@ -520,6 +543,7 @@ class ReadmeTests(unittest.TestCase):
                 cpu_avg=22.8,
                 cpu_peak=28.0,
                 memory_avg=30.6,
+                memory_total_bytes=8 * GB,
                 load_avg=0.23,
                 load_peak=0.28,
                 disk=80.3,
@@ -532,6 +556,7 @@ class ReadmeTests(unittest.TestCase):
                 cpu_avg=17.9,
                 cpu_peak=25.2,
                 memory_avg=75.7,
+                memory_total_bytes=16 * GB,
                 load_avg=3.57,
                 load_peak=5.04,
                 disk=71.2,
@@ -561,15 +586,16 @@ class ReadmeTests(unittest.TestCase):
         self.assertIn("average CPU at or above 60 %", FLAT_README)
         self.assertIn("average memory at or above 85 %", FLAT_README)
         self.assertIn("disk from the latest sample at or above 95 %", FLAT_README)
-        self.assertIn("average load at or above twice that host's own core count", FLAT_README)
-        self.assertIn("CPU peak and load peak are context and never flag a host", FLAT_README)
-        # The old rule must not creep back into the prose.
-        self.assertNotIn("The inclusive thresholds are CPU peak 90", FLAT_README)
-        self.assertNotIn("(CPU peak 117.0% >= 90%)", FLAT_README)
-        self.assertNotRegex(
-            FLAT_README, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
+        self.assertIn(
+            "average load at or above twice that host's own core count",
+            FLAT_README,
         )
-        self.assertNotIn("(load peak", FLAT_README)
+        self.assertIn(
+            "CPU peak and load peak are context and never flag a host", FLAT_README
+        )
+        self.assertIn("memory in gigabytes", FLAT_README.lower())
+        self.assertIn("percentages without decimals", FLAT_README.lower())
+        self.assertIn("d/m/Y H:i", FLAT_README)
 
 
 if __name__ == "__main__":

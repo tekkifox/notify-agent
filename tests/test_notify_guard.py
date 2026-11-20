@@ -133,11 +133,14 @@ class NotifyFlagGuardTests(unittest.TestCase):
         self.capture.unlink()
         self.marker.unlink()
 
-        flagged = self.run_notify("- [!] host1.example.com: mem 88.0% avg >= 85%")
+        flagged = self.run_notify(
+            "- [!] host1.example.com: mem 7.04 GB avg / 8.00 GB, 88% >= 85%"
+        )
         self.assertEqual(flagged.returncode, 0)
         self.assertTrue(self.marker.exists())
         self.assertEqual(
-            self.sent_content(), "- [!] host1.example.com: mem 88.0% avg >= 85%"
+            self.sent_content(),
+            "- [!] host1.example.com: mem 7.04 GB avg / 8.00 GB, 88% >= 85%",
         )
 
     def test_a_value_other_than_one_keeps_the_old_behaviour(self) -> None:

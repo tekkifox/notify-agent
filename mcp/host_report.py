@@ -16,7 +16,7 @@ are rendered:
 * ``cpu_cores`` — the cores the host reported; the load threshold is relative
   to this, so a null count means the load rule cannot apply
 * ``cpu_avg`` / ``cpu_peak`` — average and maximum ``cpu_percent``
-* ``memory_avg`` — average ``memory_percent`` (average only, deliberately)
+* ``memory_avg`` — average ``memory_percent`` (the sustained memory signal)
 * ``swap_avg`` / ``swap_peak`` — average and maximum ``swap_percent``
 * ``memory_used_bytes_latest`` / ``memory_total_bytes`` — memory used in the
   newest sample and the host's total
@@ -28,11 +28,12 @@ are rendered:
 * ``load_avg`` / ``load_peak`` — average and maximum ``load_avg``
 * ``disk`` — ``disk_percent`` from the newest sample (latest only, deliberately)
 
-The newer view columns are carried on the summary so an ad-hoc request can
-answer with swap, memory amounts, process count, network and the sample time.
-The scheduled digest line deliberately keeps its established shape: CPU and
-memory as percentages, never an amount, and no swap or network. A host that
-predates the new columns simply has them as ``None``; they are never invented.
+Memory figures in user-facing output are reported in gigabytes. When byte
+amounts are available the report shows memory use and totals in GB; otherwise it
+falls back to the memory percentage (a whole percent). CPU and disk are
+percentages (whole percent, no decimals). Timestamps are shown as the time when
+the date is today, or as the date and time when it differs from today, in
+``d/m/Y H:i`` format.
 
 A host is flagged only on a sustained signal: average CPU, average memory, the
 latest disk reading, or an average load at least twice the host's own core
@@ -76,6 +77,8 @@ DISK_PERCENT = 95.0
 #: context only. A null core count makes the rule inapplicable — the formatter
 #: never guesses one.
 LOAD_CORES_MULTIPLIER = 2
+
+BYTES_PER_GB = 1024 ** 3
 
 #: Mirrors the old ``HOST_REPORT_HOSTS`` default. Override in the prompt
 #: instruction / environment; this is only the fallback.
@@ -262,15 +265,29 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
         summary.flags.append(f"STALE: no sample in the last {stale_minutes}m")
     if summary.cpu_avg is not None and summary.cpu_avg >= CPU_AVG_PERCENT:
         summary.flags.append(
-            f"CPU avg {summary.cpu_avg:.1f}% >= {CPU_AVG_PERCENT:.0f}%"
+            f"CPU avg {_percent(summary.cpu_avg)} >= {CPU_AVG_PERCENT:.0f}%"
         )
     if summary.memory_avg is not None and summary.memory_avg >= MEMORY_PERCENT:
-        summary.flags.append(
-            f"memory {summary.memory_avg:.1f}% >= {MEMORY_PERCENT:.0f}%"
-        )
+        avg_used = _average_memory_used_bytes(summary)
+        if avg_used is not None and summary.memory_total_bytes is not None:
+            summary.flags.append(
+                "memory "
+                f"{_gigabytes(avg_used)} avg / {_gigabytes(summary.memory_total_bytes)}, "
+                f"{_percent(summary.memory_avg)} >= {MEMORY_PERCENT:.0f}%"
+            )
+        elif avg_used is not None:
+            summary.flags.append(
+                "memory "
+                f"{_gigabytes(avg_used)} avg, "
+                f"{_percent(summary.memory_avg)} >= {MEMORY_PERCENT:.0f}%"
+            )
+        else:
+            summary.flags.append(
+                f"memory {_percent(summary.memory_avg)} >= {MEMORY_PERCENT:.0f}%"
+            )
     if summary.disk is not None and summary.disk >= DISK_PERCENT:
         summary.flags.append(
-            f"disk {summary.disk:.1f}% >= {DISK_PERCENT:.0f}%"
+            f"disk {_percent(summary.disk)} >= {DISK_PERCENT:.0f}%"
         )
     if summary.cpu_cores is not None and summary.load_avg is not None:
         cores = summary.cpu_cores
@@ -283,25 +300,59 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
 
 
 def _age(value: datetime | None, now: datetime) -> str:
+    """Return a recency timestamp for ``value`` relative to ``now``.
+
+    The time alone is shown when ``value`` falls on the same UTC day as ``now``;
+    otherwise the date and time are shown. Both use ``d/m/Y H:i``.
+    """
+
     if value is None:
         return "unknown"
-    seconds = int((now - value).total_seconds())
-    if seconds < 0:
-        seconds = 0
-    if seconds < 60:
-        return "just now"
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 48:
-        return f"{hours}h {minutes}m ago"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h ago"
+    if value.date() == now.date():
+        return value.strftime("%H:%M")
+    return value.strftime("%d/%m/%Y %H:%M")
 
 
 def _percent(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:.1f}%"
+    return "n/a" if value is None else f"{value:.0f}%"
+
+
+def _gigabytes(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value / BYTES_PER_GB:.2f} GB"
+
+
+def _average_memory_used_bytes(summary: HostSummary) -> float | None:
+    """Derive average memory used from the average percent and total bytes."""
+
+    if summary.memory_avg is None or summary.memory_total_bytes is None:
+        return None
+    return summary.memory_total_bytes * (summary.memory_avg / 100.0)
+
+
+def _memory_text(summary: HostSummary) -> str:
+    avg_used = _average_memory_used_bytes(summary)
+    if avg_used is not None and summary.memory_total_bytes is not None:
+        return (
+            f"mem {_gigabytes(avg_used)} avg / "
+            f"{_gigabytes(summary.memory_total_bytes)}"
+        )
+    if avg_used is not None:
+        return f"mem {_gigabytes(avg_used)} avg"
+    if (
+        summary.memory_used_bytes is not None
+        and summary.memory_total_bytes is not None
+    ):
+        return (
+            f"mem {_gigabytes(summary.memory_used_bytes)} / "
+            f"{_gigabytes(summary.memory_total_bytes)}"
+        )
+    if summary.memory_used_bytes is not None:
+        return f"mem {_gigabytes(summary.memory_used_bytes)}"
+    if summary.memory_avg is not None:
+        return f"mem {_percent(summary.memory_avg)} avg"
+    return "mem n/a"
 
 
 def _number(value: float | None) -> str:
@@ -357,7 +408,7 @@ def _host_line(summary: HostSummary, now: datetime, ssh: Mapping[str, Any] | Non
             f"{summary.samples} {noun}, last-seen {_age(summary.last_seen, now)}"
             f"; {_cores_text(summary.cpu_cores)}"
             f"; CPU {_percent(summary.cpu_avg)} avg / {_percent(summary.cpu_peak)} peak"
-            f"; mem {_percent(summary.memory_avg)} avg"
+            f"; {_memory_text(summary)}"
             f"; load {_number(summary.load_avg)} avg / {_number(summary.load_peak)} peak"
             f"; disk {_percent(summary.disk)}"
         )
@@ -463,7 +514,7 @@ def build_report(
     )
 
     header = (
-        f"**Host report** \u2014 {current.strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"**Host report** \u2014 {current.strftime('%d/%m/%Y %H:%M')} UTC\n"
         f"{_summary_line(summaries)}"
     )
     lines = [_host_line(summary, current) for summary in summaries]
@@ -506,7 +557,7 @@ def build_digest(
 
     summary_line = _summary_line(summaries)
     header = (
-        f"**Host report** \u2014 {current.strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"**Host report** \u2014 {current.strftime('%d/%m/%Y %H:%M')} UTC\n"
         f"{summary_line}"
     )
     if not ssh_configured:
