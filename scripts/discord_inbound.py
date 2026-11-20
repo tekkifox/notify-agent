@@ -2095,6 +2095,11 @@ def _runtime_config_for(agent: str) -> str | None:
     limit reached" while the same model works without ``--agent``. Selecting
     the agent via ``default_agent`` preserves its prompt, permissions, steps
     and MCP access. The full (default) prompt path keeps explicit ``--agent``.
+
+    For free mode, also strip MCP servers and deny MCP tool permissions to
+    reduce context overhead that can trigger free-tier limits for Iceman Free.
+    Prefetched data is injected into the instruction so the agent does not
+    need MCP tools.
     """
 
     if agent != "notify-free":
@@ -2113,6 +2118,24 @@ def _runtime_config_for(agent: str) -> str | None:
             if not isinstance(data, dict):
                 return None
             data["default_agent"] = agent
+            # Strip MCP servers for free mode to reduce context overhead.
+            mcp = data.get("mcp")
+            if isinstance(mcp, dict):
+                mcp.pop("servers", None)
+            agents = data.get("agent")
+            if isinstance(agents, dict):
+                agent_def = agents.get(agent)
+                if isinstance(agent_def, dict):
+                    perm = agent_def.get("permission")
+                    if isinstance(perm, dict):
+                        for tool in (
+                            "oracle_query",
+                            "oracle_search_content",
+                            "ssh_probe",
+                            "bookstack_search",
+                            "bookstack_read",
+                        ):
+                            perm[tool] = "deny"
             fd, path = tempfile.mkstemp(
                 prefix="notify-opencode-", suffix=".json"
             )
