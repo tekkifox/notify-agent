@@ -35,14 +35,15 @@ percentages (whole percent, no decimals). Timestamps are shown as the time when
 the date is today, or as the date and time when it differs from today, in
 ``d/m/Y H:i`` format.
 
-A host is flagged only on a sustained signal: average CPU, average memory, the
-latest disk reading, or an average load at least twice the host's own core
-count. CPU peak and load peak are context and never flag a host.
+Flagging follows sustained signals only. CPU and load peaks are reported as
+context but never cause a flag by themselves: a host is flagged for stale data
+(no sample in 20 minutes), average CPU >= 60%, average memory >= 85%, disk >=
+95%, or load peak >= twice the host's core count when core count is known.
 
 The prompt asks the agent to run one aggregate SQL query and then render the
 result with these rules. ``build_report`` and ``build_digest`` are the
 executable specification; ``tests/test_host_report.py`` pins the ordering,
-stale boundary, thresholds and truncation.
+stale boundary, sustained thresholds and truncation.
 
 SSH results are optional and are folded into the same per-host line, so
 dropping a line from the end drops both its statistics and its SSH status.
@@ -66,16 +67,17 @@ STALE_MINUTES = 20
 #: How much history the report covers.
 WINDOW_HOURS = 24
 
-#: Inclusive thresholds for sustained signals. Exactly 60% is a problem, just
-#: like 60.1%. CPU peaks are context and are deliberately not a threshold.
+#: Inclusive sustained-signal thresholds. Exactly at the boundary is a problem.
+#: CPU and load peaks are reported as context and are deliberately not
+#: thresholds on their own.
 CPU_AVG_PERCENT = 60.0
 MEMORY_PERCENT = 85.0
 DISK_PERCENT = 95.0
 
-#: The average load flags a host only at or above this multiple of its own core
-#: count. An absolute figure would flag every host that spikes, and a peak is
-#: context only. A null core count makes the rule inapplicable — the formatter
-#: never guesses one.
+#: The load peak flags a host only at or above this multiple of its own core
+#: count, as a sustained-capacity signal. A CPU or load peak is still reported
+#: as context and never flags by itself. A null core count makes the rule
+#: inapplicable — the formatter never guesses one.
 LOAD_CORES_MULTIPLIER = 2
 
 BYTES_PER_GB = 1024 ** 3
@@ -285,17 +287,18 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
             summary.flags.append(
                 f"memory {_percent(summary.memory_avg)} >= {MEMORY_PERCENT:.0f}%"
             )
+    if summary.cpu_cores is not None and summary.load_peak is not None:
+        cores = summary.cpu_cores
+        threshold = LOAD_CORES_MULTIPLIER * cores
+        if summary.load_peak >= threshold:
+            summary.flags.append(
+                f"load peak {summary.load_peak:.2f} >= "
+                f"{threshold:g} ({LOAD_CORES_MULTIPLIER}x{cores} {_cores_noun(cores)})"
+            )
     if summary.disk is not None and summary.disk >= DISK_PERCENT:
         summary.flags.append(
             f"disk {_percent(summary.disk)} >= {DISK_PERCENT:.0f}%"
         )
-    if summary.cpu_cores is not None and summary.load_avg is not None:
-        cores = summary.cpu_cores
-        if summary.load_avg >= LOAD_CORES_MULTIPLIER * cores:
-            summary.flags.append(
-                f"load avg {summary.load_avg:.2f} >= "
-                f"{LOAD_CORES_MULTIPLIER}x{cores} {_cores_noun(cores)}"
-            )
     return summary
 
 
@@ -555,10 +558,9 @@ def build_digest(
         if host:
             ssh_by_host[host] = result
 
-    summary_line = _summary_line(summaries)
     header = (
         f"**Host report** \u2014 {current.strftime('%d/%m/%Y %H:%M')} UTC\n"
-        f"{summary_line}"
+        f"{_summary_line(summaries)}"
     )
     if not ssh_configured:
         header += "\nSSH not configured; no SSH health was checked."
