@@ -243,7 +243,7 @@ class NotifyAttachTests(unittest.TestCase):
         # curl reads ';' inside a -F value as a form modifier; a digest has
         # semicolons between figures. --form-string sends the JSON literally.
         message = (
-            'CPU 14.0% avg / 18.4% peak; memory 71.7% avg; '
+            'CPU 14% avg / 18% peak; mem 1.40 GB avg / 1.95 GB; '
             'load 0.42, 0.55, "quoted" = 1 @here'
         )
         cases = (

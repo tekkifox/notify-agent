@@ -312,11 +312,14 @@ class PromptContractTests(unittest.TestCase):
 
     def test_old_report_format_is_pinned(self) -> None:
         self.assertIn(
-            "sample count, last-seen age, the CPU core count, CPU average and "
-            "peak, memory average, load average and peak",
+            "sample count, last-seen, the CPU core count, CPU average and "
+            "peak, memory average and total, load average and peak",
             FLAT_PROMPT,
         )
-        self.assertIn("memory is average only, disk is latest only", FLAT_PROMPT)
+        self.assertIn("disk is latest only", FLAT_PROMPT)
+        self.assertIn("Report memory figures in gigabytes", FLAT_PROMPT)
+        self.assertIn("Report percentages without decimals", FLAT_PROMPT)
+        self.assertIn("formatted `d/m/Y H:i`", FLAT_PROMPT)
         self.assertIn("STALE means no sample in the last 20 minutes, not 30", FLAT_PROMPT)
         self.assertIn(
             "Order known hosts first, in the order the instruction lists them",
@@ -347,8 +350,8 @@ class PromptContractTests(unittest.TestCase):
 
     def test_render_order_names_the_core_count(self) -> None:
         self.assertIn(
-            "Render one line per host in this order: sample count, last-seen "
-            "age, the CPU core count, CPU average and peak",
+            "Render one line per host in this order: sample count, last-seen, "
+            "the CPU core count, CPU average and peak",
             FLAT_PROMPT,
         )
         self.assertIn(
@@ -418,13 +421,15 @@ class PromptContractTests(unittest.TestCase):
         )
 
     def test_worked_example_shows_the_core_count(self) -> None:
-        self.assertIn("last-seen 4m ago; 2 cores; CPU 44.8% avg", FLAT_PROMPT)
+        self.assertIn("last-seen 08:56; 2 cores; CPU 45% avg / 117% peak", FLAT_PROMPT)
+        self.assertIn("mem 1.81 GB avg / 8.00 GB", FLAT_PROMPT)
 
     def test_aggregate_query_selects_the_core_count(self) -> None:
         self.assertIn(
             "`last_seen`, `cpu_cores`, `cpu_avg`, `cpu_peak`", FLAT_PROMPT
         )
         self.assertIn("MAX(cpu_cores) AS cpu_cores,", PROMPT)
+        self.assertIn("MAX(memory_total_bytes) AS memory_total_bytes,", PROMPT)
 
 
 class SustainedSignalRuleTests(unittest.TestCase):
@@ -442,17 +447,19 @@ class SustainedSignalRuleTests(unittest.TestCase):
     FLAG_REASON = re.compile(r"\(([^()]*>= [^()]*)\)")
     ALLOWED_REASON = re.compile(
         r"^(?:"
-        r"CPU avg \d+(?:\.\d+)?% >= 60%"
-        r"|memory \d+(?:\.\d+)?% >= 85%"
-        r"|disk \d+(?:\.\d+)?% >= 95%"
-        r"|load avg \d+(?:\.\d+)? >= 2x\d+ cores"
+        r"CPU avg \d+% >= 60%"
+        r"|memory \d+(?:\.\d+)? GB avg / \d+(?:\.\d+)? GB, \d+% >= 85%"
+        r"|memory \d+(?:\.\d+)? GB avg, \d+% >= 85%"
+        r"|memory \d+% >= 85%"
+        r"|disk \d+% >= 95%"
+        r"|load avg \d+(?:\.\d+)? >= 2x\d+ cores?"
         r")$"
     )
 
     def test_the_four_sustained_signals_are_named_with_their_numbers(self) -> None:
-        self.assertIn("average CPU >= 60 %", FLAT_PROMPT)
-        self.assertIn("average memory >= 85 %", FLAT_PROMPT)
-        self.assertIn("disk from the latest sample >= 95 %", FLAT_PROMPT)
+        self.assertIn("average CPU >= 60%", FLAT_PROMPT)
+        self.assertIn("average memory >= 85%", FLAT_PROMPT)
+        self.assertIn("disk from the latest sample >= 95%", FLAT_PROMPT)
         self.assertIn(
             "average load >= twice that host's own core count", FLAT_PROMPT
         )
@@ -482,9 +489,9 @@ class SustainedSignalRuleTests(unittest.TestCase):
 
     def test_flag_reasons_are_the_documented_examples(self) -> None:
         for reason in (
-            "(CPU avg 76.7% >= 60%)",
-            "(memory 88.0% >= 85%)",
-            "(disk 95.4% >= 95%)",
+            "(CPU avg 77% >= 60%)",
+            "(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)",
+            "(disk 95% >= 95%)",
             "(load avg 8.74 >= 2x2 cores)",
         ):
             with self.subTest(reason=reason):
@@ -746,6 +753,8 @@ class FleetDigestScheduleTests(unittest.TestCase):
                     "never flag a host because of a peak", line
                 )
                 self.assertNotIn("load peak >=", line)
+                self.assertIn("Report memory figures in gigabytes", line)
+                self.assertIn("Report percentages without decimals", line)
 
     def test_no_crontab_rule_flags_on_a_peak(self) -> None:
         """A peak may be context, never a flag condition or an old rule."""
@@ -1094,9 +1103,9 @@ class FreePromptContractTests(unittest.TestCase):
             "STALE means no sample in the last 20 minutes", FLAT_FREE_PROMPT
         )
         for threshold in (
-            "average CPU >= 60 %",
-            "average memory >= 85 %",
-            "latest disk >= 95 %",
+            "average CPU >= 60%",
+            "average memory >= 85%",
+            "latest disk >= 95%",
             "average load >= twice that host's own `cpu_cores`",
         ):
             with self.subTest(threshold=threshold):
@@ -1104,6 +1113,9 @@ class FreePromptContractTests(unittest.TestCase):
         self.assertIn(
             "… truncated: N host line(s) not shown", FLAT_FREE_PROMPT
         )
+        self.assertIn("Report memory figures in gigabytes", FLAT_FREE_PROMPT)
+        self.assertIn("percentages without decimals", FLAT_FREE_PROMPT)
+        self.assertIn("formatted `d/m/Y H:i`", FLAT_FREE_PROMPT)
         self.assertIn(
             "CPU peak and load peak are context only and never flag a host",
             FLAT_FREE_PROMPT,

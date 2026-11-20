@@ -110,27 +110,35 @@ from the latest sample, `swap_percent`, `memory_total_bytes`,
 `ssh_login_users`, `ssh_logins_today`, `ssh_login_users_today`,
 `ssh_logins_today_since`, `host_count`, and `updated_at`/`updated_at_latest`.
 
-For a digest, keep the old host report shape:
+Report memory figures in gigabytes (convert bytes or any other memory unit to
+GB; state the unit clearly and use sensible precision). Report percentages
+without decimals (round to a whole percent). When a timestamp is shown as a date
+stamp, show it as the time if the date is today, or as the date and time if the
+date is different from today, formatted `d/m/Y H:i`.
 
-    **Host report** — YYYY-MM-DD HH:MM UTC
+For a digest, keep the host report shape:
+
+    **Host report** — dd/mm/YYYY HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] host1.example.com: 53 samples, last-seen 4m ago; 2 cores; CPU 44.8% avg / 117.0% peak; mem 22.6% avg; load 8.74 avg / 9.50 peak; disk 30.9%; SSH ok (42 ms) (load avg 8.74 >= 2x2 cores)
+    - [!] host1.example.com: 53 samples, last-seen 08:56; 2 cores; CPU 45% avg / 117% peak; mem 1.81 GB avg / 8.00 GB; load 8.74 avg / 9.50 peak; disk 31%; SSH ok (42 ms) (load avg 8.74 >= 2x2 cores)
 
-The header is this run's UTC date and time. Count every host in the report,
-including a known host with no samples.
+The header is this run's UTC date and time, formatted `d/m/Y H:i`. Count every
+host in the report, including a known host with no samples.
 
-Per host line: sample count, last-seen age, core count (`2 cores`, `1 core`, or
-`cores n/a`), CPU average and peak, memory average, load average and peak, disk
-from the latest sample, failed logins, then accepted logins, then SSH result
-when supplied.
+Per host line: sample count, last-seen, core count (`2 cores`, `1 core`, or
+`cores n/a`), CPU average and peak, memory average and total in GB, load
+average and peak, disk from the latest sample, failed logins, then accepted
+logins, then SSH result when supplied. Write `last-seen` as the time if the
+sample is from today, or as the date and time if it is from a different day,
+formatted `d/m/Y H:i`.
 
 - Failed logins: `failed logins: 12 (root 9, admin 3)` with the top three
   usernames; `failed logins: 0` when zero; `failed logins: n/a` when null.
 - Accepted logins: `logins: 12 last hour (root 9, ross 3), 497 today`. Use
   `logins: n/a` or `today: n/a` when that figure is null, and omit the user list
   when the breakdown is null.
-- Keep memory average-only, disk latest-only, and load with both average and
-  peak. Never invent a number or username.
+- Keep disk latest-only and load with both average and peak. Never invent a
+  number or username.
 
 STALE means no sample in the last 20 minutes; a sample exactly 20 minutes old
 is still fresh. A host with no sample in the whole 24 hours is stale too:
@@ -138,16 +146,18 @@ render `no samples in the last 24h; last-seen unknown` and flag it.
 
 Thresholds are inclusive, on sustained values:
 
-- average CPU >= 60 %
-- average memory >= 85 %
-- latest disk >= 95 %
+- average CPU >= 60%
+- average memory >= 85%
+- latest disk >= 95%
 - average load >= twice that host's own `cpu_cores`
 
 A host at or above any threshold gets `[!]` and a short inline reason naming the
-signal and value, for example `(CPU avg 76.7% >= 60%)`. CPU peak and load peak
-are context only and never flag a host. When `cpu_cores` is null the load rule
-cannot apply; never guess a core count. Order the reasons: STALE, CPU, memory,
-disk, load. A value one below a threshold is not flagged.
+signal and value, for example `(CPU avg 77% >= 60%)` or
+`(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)`. Report percentages without
+decimals (round to a whole percent). CPU peak and load peak are context only and
+never flag a host. When `cpu_cores` is null the load rule cannot apply; never
+guess a core count. Order the reasons: STALE, CPU, memory, disk, load. A value
+one below a threshold is not flagged.
 
 Order known hosts as the instruction lists them, then other hosts by name, and
 include one line for every known host even with no samples. Keep the message
