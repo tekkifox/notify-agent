@@ -119,6 +119,8 @@ Use the integration name that matches the provider in `OPENCODE_MODEL` (the exam
 
 The preferred model is `OPENCODE_MODEL` (Beam Free); the optional `OPENCODE_MODEL_FALLBACK` (DeepSeek Flash 4.1) is used only when the preferred model cannot serve the request, such as Beam Free's "Free usage limit reached" or a model-not-found/unavailable error. The fallback fires at most once, never after a message was already sent, and never on an ordinary failure. A fallback run is visible in the transcript and the container summary shows the model that did the work. An exhausted free tier is remembered for fifteen minutes (`NOTIFY_QUOTA_MEMO_SECONDS`), so the next scheduled run goes straight to the fallback instead of probing the dead model again.
 
+A scheduled run and an inbound reply also retry a transient model/run transport failure automatically while nothing has been sent, so a blip such as `ECONNRESET` or "socket connection was closed unexpectedly" does not lose the run. Retries are small and bounded (`NOTIFY_TRANSIENT_RETRY_MAX`, default 2) with a short delay between attempts (`NOTIFY_TRANSIENT_RETRY_DELAY`, whole seconds, default 2), are logged clearly on stderr (and in the debug transcript when enabled), and never happen after a confirmed send. A non-transient failure, or a transient failure that is still failing after the retries are exhausted, is reported as a failure as before.
+
 An API key remains available as a second method:
 
 ```sh
