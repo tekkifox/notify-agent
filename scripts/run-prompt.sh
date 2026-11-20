@@ -239,14 +239,20 @@ quota_exhausted() {
     grep -Eiq 'free usage limit reached' "$1" 2>/dev/null
 }
 
-# Opt-in pre-fetch. NOTIFY_PREFETCH is a comma-separated list:
-#   host_stats  one aggregate row per in-scope host, fetched before OpenCode
+# Pre-fetch host statistics and/or SSH status before OpenCode runs. In free
+# mode (plain stripped run with no MCP tools) both are enabled by default so the
+# model can use supplied data instead of unavailable tools; NOTIFY_PREFETCH can
+# also enable them explicitly in full mode. Values: comma-separated list of
+#   host_stats  one aggregate row per in-scope host
 #   ssh         one SSH status result per in-scope host, from the same probe
 #               server and the same allowlist/run-scope rules the tool uses
-# Unset, or any other value, leaves today's instruction unchanged.
 prefetch_mode=${NOTIFY_PREFETCH:-}
 prefetch_stats=0
 prefetch_ssh=0
+if [ "$prompt_mode" = "free" ]; then
+    prefetch_stats=1
+    prefetch_ssh=1
+fi
 case ",$prefetch_mode," in
     *,host_stats,*) prefetch_stats=1 ;;
 esac
