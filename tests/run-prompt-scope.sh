@@ -32,6 +32,17 @@ for arg do last=$arg; done
 printf '%s' "$last" > "$CAPTURE"
 if [ -n "${CAPTURE_ARGS:-}" ]; then
     printf '%s\n' "$@" > "$CAPTURE_ARGS"
+    agent_arg=
+    prev=
+    for arg do
+        if [ "$prev" = "--agent" ]; then agent_arg=$arg; fi
+        prev=$arg
+    done
+    if [ -n "$agent_arg" ]; then
+        printf '%s' "$agent_arg" > "$CAPTURE_ARGS.agent"
+    elif [ -n "${OPENCODE_CONFIG:-}" ] && [ -f "${OPENCODE_CONFIG}" ] && command -v jq >/dev/null 2>&1; then
+        jq -r '.default_agent // empty' "$OPENCODE_CONFIG" 2>/dev/null > "$CAPTURE_ARGS.agent" || :
+    fi
 fi
 if [ -n "${CAPTURE_ENV:-}" ]; then
     printf '%s' "${NOTIFY_CONTENT_DISABLED-}" > "$CAPTURE_ENV"
@@ -995,11 +1006,13 @@ capture "$tmp/agent-default" \
     "$run_prompt" "Compose a status message."
 rc=$?
 set -e
-agent=$(awk 'prev == "--agent" { print; exit } { prev = $0 }' "$tmp/agent-default.args" 2>/dev/null || true)
+agent=$(cat "$tmp/agent-default.args.agent" 2>/dev/null || true)
 if [ "$rc" -ne 0 ]; then
     no "default mode: run-prompt.sh failed: $(cat "$tmp/agent-default.stderr")"
 elif [ "$agent" != "notify" ]; then
     no "default mode: expected --agent notify, got '$agent'"
+elif ! grep -qx -- '--agent' "$tmp/agent-default.args" 2>/dev/null; then
+    no "default mode: expected --agent notify for the full prompt path"
 else
     pass "default mode keeps --agent notify"
 fi
@@ -1012,13 +1025,15 @@ capture "$tmp/agent-free" \
     "$run_prompt" "Compose a status message."
 rc=$?
 set -e
-agent=$(awk 'prev == "--agent" { print; exit } { prev = $0 }' "$tmp/agent-free.args" 2>/dev/null || true)
+agent=$(cat "$tmp/agent-free.args.agent" 2>/dev/null || true)
 if [ "$rc" -ne 0 ]; then
     no "free mode: run-prompt.sh failed: $(cat "$tmp/agent-free.stderr")"
 elif [ "$agent" != "notify-free" ]; then
-    no "free mode: expected --agent notify-free, got '$agent'"
+    no "free mode: expected notify-free agent, got '$agent'"
+elif grep -qx -- '--agent' "$tmp/agent-free.args" 2>/dev/null; then
+    no "free mode: must not pass --agent when default_agent runtime config is used"
 else
-    pass "NOTIFY_PROMPT_MODE=free selects --agent notify-free"
+    pass "NOTIFY_PROMPT_MODE=free selects the notify-free agent"
 fi
 
 # 22. An unknown prompt profile fails before opencode runs.

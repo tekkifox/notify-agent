@@ -5,9 +5,9 @@ services:
     build:
       context: .
       args:
-        OPENCODE_VERSION: "2.2.1"
+        OPENCODE_VERSION: "2.3.2"
         SUPERCRONIC_VERSION: "0.2.51"
-    image: notify-agent:2.2.1
+    image: notify-agent:2.3.2
     container_name: notify-agent
 
     # With no arguments this dispatcher runs supercronic and, when an inbound

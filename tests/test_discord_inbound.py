@@ -1372,6 +1372,31 @@ class RunAgentTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.env = base_env(self.temp.name)
         self.config = discord_inbound.load_config(self.env)
+        # The runtime config selects the notify agent via default_agent instead
+        # of --agent so custom-agent runs work with opencode/zen free models.
+        discord_inbound._RUNTIME_CONFIG_PATH = None
+        discord_inbound._RUNTIME_CONFIG_AGENT = None
+        self.addCleanup(self._cleanup_runtime_config)
+        self.opencode_config = pathlib.Path(self.temp.name) / "opencode.json"
+        self.opencode_config.write_text(
+            json.dumps({"agent": {"notify": {}, "notify-free": {}}}),
+            encoding="utf-8",
+        )
+        self._opencode_config_env = mock.patch.dict(
+            os.environ, {"OPENCODE_CONFIG": str(self.opencode_config)}
+        )
+        self._opencode_config_env.start()
+        self.addCleanup(self._opencode_config_env.stop)
+
+    def _cleanup_runtime_config(self) -> None:
+        path = discord_inbound._RUNTIME_CONFIG_PATH
+        discord_inbound._RUNTIME_CONFIG_PATH = None
+        discord_inbound._RUNTIME_CONFIG_AGENT = None
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def test_command_shape_and_content_disabled(self) -> None:
         def fake(command: object, **kwargs: object) -> FakeProcess:
@@ -1419,8 +1444,15 @@ class RunAgentTests(unittest.TestCase):
         ) as popen:
             discord_inbound.run_agent(config, "instruction text")
         command = popen.call_args.args[0]
-        self.assertEqual(command[:4], [TRUE_BIN, "run", "--agent", "notify-free"])
+        environment = popen.call_args.kwargs["env"]
+        self.assertNotIn("--agent", command)
+        self.assertEqual(command[:3], [TRUE_BIN, "run", "--model"])
         self.assertEqual(command[-2:], ["--", "instruction text"])
+        runtime_config = pathlib.Path(environment["OPENCODE_CONFIG"])
+        self.assertEqual(
+            json.loads(runtime_config.read_text(encoding="utf-8"))["default_agent"],
+            "notify-free",
+        )
 
     def test_content_flag_is_not_exported_for_an_allowing_target(self) -> None:
         env = dict(self.env)

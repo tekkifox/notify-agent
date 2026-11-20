@@ -4,7 +4,7 @@
 # carries the glibc/libstdc++ runtime the standalone OpenCode binary expects.
 FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc
 
-ARG OPENCODE_VERSION=2.2.1
+ARG OPENCODE_VERSION=2.3.2
 ARG SUPERCRONIC_VERSION=0.2.51
 ARG ORACLEDB_VERSION=26.1.0
 # paramiko is the only SSH client the image needs. Pin it and its direct
