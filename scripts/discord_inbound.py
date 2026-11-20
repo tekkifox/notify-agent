@@ -2082,6 +2082,49 @@ def _agent_environment(
     return environment
 
 
+_RUNTIME_CONFIG_PATH: str | None = None
+_RUNTIME_CONFIG_AGENT: str | None = None
+_RUNTIME_CONFIG_LOCK = threading.Lock()
+
+
+def _runtime_config_for(agent: str) -> str | None:
+    """Return a temp config that makes *agent* the default agent.
+
+    Only the free-model agent path uses this: some OpenCode versions reject
+    custom ``--agent`` runs for opencode/zen free models with "Free usage
+    limit reached" while the same model works without ``--agent``. Selecting
+    the agent via ``default_agent`` preserves its prompt, permissions, steps
+    and MCP access. The full (default) prompt path keeps explicit ``--agent``.
+    """
+
+    if agent != "notify-free":
+        return None
+    global _RUNTIME_CONFIG_PATH, _RUNTIME_CONFIG_AGENT
+    with _RUNTIME_CONFIG_LOCK:
+        if _RUNTIME_CONFIG_PATH and _RUNTIME_CONFIG_AGENT == agent:
+            if os.path.exists(_RUNTIME_CONFIG_PATH):
+                return _RUNTIME_CONFIG_PATH
+            _RUNTIME_CONFIG_PATH = None
+            _RUNTIME_CONFIG_AGENT = None
+        source = os.environ.get("OPENCODE_CONFIG") or "/app/opencode.json"
+        try:
+            with open(source, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return None
+            data["default_agent"] = agent
+            fd, path = tempfile.mkstemp(
+                prefix="notify-opencode-", suffix=".json"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            _RUNTIME_CONFIG_PATH = path
+            _RUNTIME_CONFIG_AGENT = agent
+            return path
+        except Exception:
+            return None
+
+
 def _deliver_busy_line(config: Config, chosen: InboundSource) -> bool:
     """Send one short line through the same delivery path as an answer.
 
@@ -2133,23 +2176,30 @@ def _run_agent_once(
 
     effective_model = model if model is not None else config.opencode_model
 
+    runtime_config = _runtime_config_for(config.prompt_agent)
+
     command = [config.opencode_bin, "run"]
     if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
         # Explicitly requested for one debugging run: provider-level detail.
         # It is far too verbose to enable by default.
         command.extend(["--print-logs", "--log-level", "debug"])
-    command.extend(
-        [
-            "--agent",
-            config.prompt_agent,
-            "--model",
-            effective_model,
-            "--",
-            instruction,
-        ]
-    )
+    if runtime_config:
+        command.extend(["--model", effective_model, "--", instruction])
+    else:
+        command.extend(
+            [
+                "--agent",
+                config.prompt_agent,
+                "--model",
+                effective_model,
+                "--",
+                instruction,
+            ]
+        )
 
     environment = _agent_environment(config, chosen, extra_env)
+    if runtime_config:
+        environment["OPENCODE_CONFIG"] = runtime_config
 
     marker = _new_send_marker(config)
     environment["NOTIFY_SEND_MARKER"] = str(marker)

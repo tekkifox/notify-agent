@@ -52,6 +52,24 @@ case "$prompt_mode" in
         ;;
 esac
 
+# Free-model runs: select the notify-free agent without passing --agent <name>.
+# Some OpenCode versions (including 2.2.1) reject custom --agent runs for
+# opencode/zen free models with "Free usage limit reached" while the same
+# model succeeds without --agent. A runtime config that sets default_agent
+# keeps the agent's prompt, permissions, steps and MCP access unchanged.
+# The full (default) prompt path keeps the explicit --agent selection.
+notify_runtime_config=
+if [ "$notify_agent" = "notify-free" ] && command -v jq >/dev/null 2>&1; then
+    notify_runtime_config=$(mktemp "${TMPDIR:-/tmp}/notify-opencode.XXXXXX.json" 2>/dev/null) || notify_runtime_config=
+    if [ -n "$notify_runtime_config" ]; then
+        if ! jq --arg agent "$notify_agent" '. + {default_agent: $agent}' \
+            "${OPENCODE_CONFIG:-${repo_dir}/opencode.json}" >"$notify_runtime_config" 2>/dev/null; then
+            rm -f "$notify_runtime_config"
+            notify_runtime_config=
+        fi
+    fi
+fi
+
 # Set when the self-test fails so the caller can log and report the reason.
 preflight_reason=
 
@@ -61,15 +79,20 @@ preflight_reason=
 # in /tmp.
 chart_dir=
 cleanup_charts() {
-    [ -n "${chart_dir:-}" ] || return 0
-    rm -rf "$chart_dir" 2>/dev/null || true
-    chart_dir=
+    if [ -n "${chart_dir:-}" ]; then
+        rm -rf "$chart_dir" 2>/dev/null || true
+        chart_dir=
+    fi
+    if [ -n "${notify_runtime_config:-}" ]; then
+        rm -f "$notify_runtime_config" 2>/dev/null || true
+        notify_runtime_config=
+    fi
     return 0
 }
 trap cleanup_charts EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'cleanup_charts; exit 130' INT
+trap 'cleanup_charts; exit 143' TERM
+trap 'cleanup_charts; exit 129' HUP
 
 # Single flight: the scheduler and the inbound listener share one lock, so two
 # OpenCode processes never touch the same session database at once. A wait that
@@ -1498,6 +1521,13 @@ run_attempt() {
     attempt_model=$1
     attempt_output=$2
 
+    # Use the runtime config so the selected notify agent is the default for
+    # this run without relying on --agent <name> (see prompt profile setup).
+    if [ -n "${notify_runtime_config:-}" ]; then
+        OPENCODE_CONFIG=$notify_runtime_config
+        export OPENCODE_CONFIG
+    fi
+
     set -- opencode run
     # Hard bound for this attempt, around the agent and (in the transcript
     # path) the capture wrapper. A timeout exits non-zero, so it is handled by
@@ -1512,10 +1542,16 @@ run_attempt() {
     if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
         set -- "$@" --print-logs --log-level debug
     fi
-    set -- "$@" \
-        --agent "$notify_agent" \
-        --model "$attempt_model" \
-        -- "$prompt"
+    if [ -n "${notify_runtime_config:-}" ]; then
+        set -- "$@" \
+            --model "$attempt_model" \
+            -- "$prompt"
+    else
+        set -- "$@" \
+            --agent "$notify_agent" \
+            --model "$attempt_model" \
+            -- "$prompt"
+    fi
 
     if [ -n "$debug_log" ]; then
         attempt_marker=
