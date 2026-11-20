@@ -56,16 +56,31 @@ esac
 # Some OpenCode versions (including 2.2.1) reject custom --agent runs for
 # opencode/zen free models with "Free usage limit reached" while the same
 # model succeeds without --agent. A runtime config that sets default_agent
-# keeps the agent's prompt, permissions, steps and MCP access unchanged.
+# keeps the agent's prompt, permissions, steps and (in full mode) MCP access.
+# For free mode, also strip MCP servers and MCP tool permissions to reduce
+# context overhead that can trigger free-tier limits for Iceman Free; prefetch
+# supplies host/SSH data and the run should not depend on MCP tools.
 # The full (default) prompt path keeps the explicit --agent selection.
 notify_runtime_config=
-if [ "$notify_agent" = "notify-free" ] && command -v jq >/dev/null 2>&1; then
-    notify_runtime_config=$(mktemp "${TMPDIR:-/tmp}/notify-opencode.XXXXXX.json" 2>/dev/null) || notify_runtime_config=
-    if [ -n "$notify_runtime_config" ]; then
-        if ! jq --arg agent "$notify_agent" '. + {default_agent: $agent}' \
-            "${OPENCODE_CONFIG:-${repo_dir}/opencode.json}" >"$notify_runtime_config" 2>/dev/null; then
-            rm -f "$notify_runtime_config"
-            notify_runtime_config=
+if [ "$notify_agent" = "notify-free" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        printf 'run-prompt: warning: jq is required in free mode to strip MCP servers; proceeding without stripping (may hit free-tier limits)\n' >&2
+    else
+        notify_runtime_config=$(mktemp "${TMPDIR:-/tmp}/notify-opencode.XXXXXX.json" 2>/dev/null) || notify_runtime_config=
+        if [ -n "$notify_runtime_config" ]; then
+            if ! jq --arg agent "$notify_agent" '
+                . + {default_agent: $agent}
+                | del(.mcp.servers)
+                | .agent[$agent].permission.oracle_query = "deny"
+                | .agent[$agent].permission.oracle_search_content = "deny"
+                | .agent[$agent].permission.ssh_probe = "deny"
+                | .agent[$agent].permission.bookstack_search = "deny"
+                | .agent[$agent].permission.bookstack_read = "deny"
+              ' \
+                "${OPENCODE_CONFIG:-${repo_dir}/opencode.json}" >"$notify_runtime_config" 2>/dev/null; then
+                rm -f "$notify_runtime_config"
+                notify_runtime_config=
+            fi
         fi
     fi
 fi
