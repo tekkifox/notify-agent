@@ -325,7 +325,7 @@ class PromptContractTests(unittest.TestCase):
             FLAT_PROMPT,
         )
         self.assertIn("STALE means no sample in the last 20 minutes, not 30", FLAT_PROMPT)
-        self.assertIn("average CPU >= 60%", FLAT_PROMPT)
+        self.assertIn("average CPU > 80%", FLAT_PROMPT)
         self.assertIn("average memory >= 85%", FLAT_PROMPT)
         self.assertIn("disk from the latest sample >= 95%", FLAT_PROMPT)
         self.assertIn("load peak >= twice that host's own core count", FLAT_PROMPT)
@@ -454,10 +454,10 @@ class SustainedSignalRuleTests(unittest.TestCase):
 
     #: Every parenthesised threshold in the prompt must be one of the sustained
     #: signals. A CPU peak may appear as context, never as a reason.
-    FLAG_REASON = re.compile(r"\(([^()]*>= [^()]*)\)")
+    FLAG_REASON = re.compile(r"\(([^()]* (?:>=|>) [^()]*)\)")
     ALLOWED_REASON = re.compile(
         r"^(?:"
-        r"CPU avg \d+% >= 60%"
+        r"CPU avg \d+% > 80%"
         r"|memory \d+(?:\.\d+)? GB avg / \d+(?:\.\d+)? GB, \d+% >= 85%"
         r"|memory \d+(?:\.\d+)? GB avg, \d+% >= 85%"
         r"|memory \d+% >= 85%"
@@ -467,7 +467,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
     )
 
     def test_the_four_sustained_signals_are_named_with_their_numbers(self) -> None:
-        self.assertIn("average CPU >= 60%", FLAT_PROMPT)
+        self.assertIn("average CPU > 80%", FLAT_PROMPT)
         self.assertIn("average memory >= 85%", FLAT_PROMPT)
         self.assertIn("disk from the latest sample >= 95%", FLAT_PROMPT)
         self.assertIn(
@@ -498,7 +498,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
 
     def test_flag_reasons_are_the_documented_examples(self) -> None:
         for reason in (
-            "(CPU avg 77% >= 60%)",
+            "(CPU avg 81% > 80%)",
             "(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)",
             "(disk 95% >= 95%)",
             "(load peak 9.00 >= 8.00 (2x4 cores))",
@@ -750,7 +750,7 @@ class FleetDigestScheduleTests(unittest.TestCase):
     def test_sustained_signal_rule_is_documented(self) -> None:
         for label, line in self._digest_lines():
             with self.subTest(schedule=label):
-                self.assertIn("average CPU >= 60", line)
+                self.assertIn("average CPU > 80", line)
                 self.assertIn("average memory >= 85", line)
                 self.assertIn("disk >= 95", line)
                 self.assertIn(
@@ -1112,7 +1112,7 @@ class FreePromptContractTests(unittest.TestCase):
             "STALE means no sample in the last 20 minutes", FLAT_FREE_PROMPT
         )
         for threshold in (
-            "average CPU >= 60%",
+            "average CPU > 80%",
             "average memory >= 85%",
             "latest disk >= 95%",
             "average load >= twice that host's own `cpu_cores`",

@@ -225,20 +225,20 @@ Morning digest:
     `no samples in the last 24h; last-seen unknown` and flag it. A sample
     exactly 20 minutes old is still fresh; stale means older than 20 minutes.
 29. Flag stale hosts and, for the rest, only sustained signals. The
-    thresholds are inclusive and exact: average CPU >= 60%, average memory >=
-    85%, disk from the latest sample >= 95%, or load peak >= twice that host's
-    own core count when core count is known. CPU and load peaks are reported as
-    context but never cause a flag by themselves. A host at or above a sustained
-    threshold gets a `[!]` marker and an inline reason naming the signal and the
-    value. Report percentages without decimals (round to a whole percent), for
-    example `(CPU avg 77% >= 60%)`,
+    thresholds are exact: average CPU > 80%, average memory >= 85%, disk from
+    the latest sample >= 95%, or load peak >= twice that host's own core count
+    when core count is known. CPU and load peaks are reported as context but
+    never cause a flag by themselves. A host that crosses a sustained threshold
+    gets a `[!]` marker and an inline reason naming the signal and the value.
+    Report percentages without decimals (round to a whole percent), for example
+    `(CPU avg 81% > 80%)`,
     `(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)`, `(disk 95% >= 95%)`, or
     `(load peak 9.00 >= 8.00 (2x4 cores))`. The load test compares the load
     peak with twice the core count from `cpu_cores`; when the core count is
     null the load rule cannot apply, so the host is never flagged on load — do
     not guess or invent a core count. Put the reasons after the SSH text in
-    this order: STALE, then average CPU, memory, load, disk. A value one below
-    a threshold is not flagged.
+    this order: STALE, then average CPU, memory, load, disk. A value that does
+    not cross its threshold is not flagged.
 30. Order known hosts first, in the order the instruction lists them, then any
     other hosts found in the data in name order. Never rely on the query's row
     order. Include a line for every known host, even one with no samples.

@@ -106,7 +106,7 @@ class NotifyFlagGuardTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
 
     def test_a_message_with_the_flag_marker_is_sent(self) -> None:
-        message = "- [!] host1.example.com: CPU 61.0% avg >= 60%"
+        message = "- [!] host1.example.com: CPU 81% avg > 80%"
         result = self.run_notify(message, require_flag="1")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "")
