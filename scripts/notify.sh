@@ -199,7 +199,19 @@ fi
 # message and before any target lookup or request; a refusal is a silent skip
 # (exit 0) so the scheduler does not report a broken job. `[!]` is the only
 # marker checked, and the prompt forbids adding it when nothing is flagged.
+# NOTIFY_REQUIRE_FLAG_WHEN_FREE=1 applies the same guard only when
+# NOTIFY_PROMPT_MODE is "free" (case-insensitive), so free-mode runs can be
+# hardened without changing other modes.
+require_flag=0
 if [ "${NOTIFY_REQUIRE_FLAG:-}" = "1" ]; then
+    require_flag=1
+elif [ "${NOTIFY_REQUIRE_FLAG_WHEN_FREE:-}" = "1" ]; then
+    prompt_mode_lc=$(printf '%s' "${NOTIFY_PROMPT_MODE:-}" | tr '[:upper:]' '[:lower:]')
+    case "$prompt_mode_lc" in
+        free) require_flag=1 ;;
+    esac
+fi
+if [ "$require_flag" -eq 1 ]; then
     case "$message" in
         *"[!]"*) ;;
         *)
