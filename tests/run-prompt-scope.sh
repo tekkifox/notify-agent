@@ -1017,7 +1017,7 @@ else
     pass "default mode keeps --agent notify"
 fi
 
-# 21. NOTIFY_PROMPT_MODE=free selects the free-model agent definition.
+# 21. NOTIFY_PROMPT_MODE=free runs as a plain (no custom-agent) free path.
 set +e
 capture "$tmp/agent-free" \
     CAPTURE_ARGS="$tmp/agent-free.args" \
@@ -1028,12 +1028,16 @@ set -e
 agent=$(cat "$tmp/agent-free.args.agent" 2>/dev/null || true)
 if [ "$rc" -ne 0 ]; then
     no "free mode: run-prompt.sh failed: $(cat "$tmp/agent-free.stderr")"
-elif [ "$agent" != "notify-free" ]; then
-    no "free mode: expected notify-free agent, got '$agent'"
 elif grep -qx -- '--agent' "$tmp/agent-free.args" 2>/dev/null; then
-    no "free mode: must not pass --agent when default_agent runtime config is used"
+    no "free mode: must not pass --agent (plain run avoids custom-agent free-tier limits)"
+elif [ -n "$agent" ]; then
+    no "free mode: must not select a custom agent via runtime config, got '$agent'"
+elif ! contains "$(cat "$tmp/agent-free")" 'Compose a status message.'; then
+    no "free mode: instruction was not passed through"
+elif ! contains "$(cat "$tmp/agent-free")" 'You are the notification agent.'; then
+    no "free mode: notify-free prompt instructions were not injected"
 else
-    pass "NOTIFY_PROMPT_MODE=free selects the notify-free agent"
+    pass "NOTIFY_PROMPT_MODE=free runs plain without a custom agent"
 fi
 
 # 22. An unknown prompt profile fails before opencode runs.

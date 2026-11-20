@@ -35,9 +35,8 @@ case "$preflight_retry_delay" in
 esac
 
 # Prompt profile. The full prompt stays the default; "free" selects the
-# shorter agent definition for free or smaller models. Both agents have the
-# same locked-down permission set and are wired to prompts/{notify,notify-free}.md
-# in opencode.json. An unknown value fails before OpenCode starts.
+# shorter prompt and a plain (no custom-agent) run path for free or smaller
+# models. An unknown value fails before OpenCode starts.
 prompt_mode=${NOTIFY_PROMPT_MODE:-}
 case "$prompt_mode" in
     ""|full)
@@ -52,30 +51,25 @@ case "$prompt_mode" in
         ;;
 esac
 
-# Free-model runs: select the notify-free agent without passing --agent <name>.
-# Some OpenCode versions (including 2.2.1) reject custom --agent runs for
-# opencode/zen free models with "Free usage limit reached" while the same
-# model succeeds without --agent. A runtime config that sets default_agent
-# keeps the agent's prompt, permissions, steps and (in full mode) MCP access.
-# For free mode, also strip MCP servers and MCP tool permissions to reduce
-# context overhead that can trigger free-tier limits for Iceman Free; prefetch
-# supplies host/SSH data and the run should not depend on MCP tools.
+# Free-model runs: run as a plain OpenCode invocation without custom agent
+# context. Custom --agent runs and default_agent selections that load a custom
+# agent definition can hit free-tier limits for opencode/iceman-free even when
+# a plain run with the same model succeeds, so free mode strips custom agents
+# and MCP servers from a runtime config and injects the short notify prompt
+# into the user instruction instead. Prefetched host/SSH data (when enabled and
+# available) is appended to the prompt so the run does not depend on MCP tools.
 # The full (default) prompt path keeps the explicit --agent selection.
 notify_runtime_config=
-if [ "$notify_agent" = "notify-free" ]; then
+if [ "$prompt_mode" = "free" ]; then
     if ! command -v jq >/dev/null 2>&1; then
-        printf 'run-prompt: warning: jq is required in free mode to strip MCP servers; proceeding without stripping (may hit free-tier limits)\n' >&2
+        printf 'run-prompt: warning: jq is required in free mode to build a plain runtime config; proceeding without it (may hit free-tier limits)\n' >&2
     else
         notify_runtime_config=$(mktemp "${TMPDIR:-/tmp}/notify-opencode.XXXXXX.json" 2>/dev/null) || notify_runtime_config=
         if [ -n "$notify_runtime_config" ]; then
-            if ! jq --arg agent "$notify_agent" '
-                . + {default_agent: $agent}
-                | del(.mcp.servers)
-                | .agent[$agent].permission.oracle_query = "deny"
-                | .agent[$agent].permission.oracle_search_content = "deny"
-                | .agent[$agent].permission.ssh_probe = "deny"
-                | .agent[$agent].permission.bookstack_search = "deny"
-                | .agent[$agent].permission.bookstack_read = "deny"
+            if ! jq '
+                del(.mcp)
+                | del(.agent)
+                | del(.default_agent)
               ' \
                 "${OPENCODE_CONFIG:-${repo_dir}/opencode.json}" >"$notify_runtime_config" 2>/dev/null; then
                 rm -f "$notify_runtime_config"
@@ -1502,6 +1496,20 @@ ${ssh_prefetch_data}
 Do not call ssh_probe in this run; the data above is complete."
 fi
 
+# Free-mode runs execute without a custom notify agent definition to avoid
+# free-tier custom-agent limits. Prepend the short notify prompt as plain
+# instructions so the model still follows the delivery contract.
+if [ "$prompt_mode" = "free" ]; then
+    free_prompt_file="${repo_dir}/prompts/notify-free.md"
+    if [ -r "$free_prompt_file" ]; then
+        prompt="$(cat "$free_prompt_file")
+
+---
+
+${prompt}"
+    fi
+fi
+
 # OpenCode 2 removed --pure. The run attaches to the container's shared
 # background service rather than passing --standalone to start a private server
 # for this one invocation: the service registers the MCP servers once, so
@@ -1536,8 +1544,9 @@ run_attempt() {
     attempt_model=$1
     attempt_output=$2
 
-    # Use the runtime config so the selected notify agent is the default for
-    # this run without relying on --agent <name> (see prompt profile setup).
+    # Free mode uses a stripped runtime config and no custom agent selection.
+    # Full mode passes --agent so the notify agent's prompt and permissions
+    # apply as defined in opencode.json.
     if [ -n "${notify_runtime_config:-}" ]; then
         OPENCODE_CONFIG=$notify_runtime_config
         export OPENCODE_CONFIG
@@ -1557,7 +1566,7 @@ run_attempt() {
     if [ "${NOTIFY_DEBUG_LLM:-}" = "1" ]; then
         set -- "$@" --print-logs --log-level debug
     fi
-    if [ -n "${notify_runtime_config:-}" ]; then
+    if [ "$prompt_mode" = "free" ]; then
         set -- "$@" \
             --model "$attempt_model" \
             -- "$prompt"

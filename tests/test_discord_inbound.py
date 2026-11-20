@@ -1372,8 +1372,8 @@ class RunAgentTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.env = base_env(self.temp.name)
         self.config = discord_inbound.load_config(self.env)
-        # The runtime config selects the notify agent via default_agent instead
-        # of --agent so custom-agent runs work with opencode/zen free models.
+        # Free-mode runs use a stripped runtime config and run plain (no
+        # custom --agent/default_agent) to avoid free-tier custom-agent limits.
         discord_inbound._RUNTIME_CONFIG_PATH = None
         discord_inbound._RUNTIME_CONFIG_AGENT = None
         self.addCleanup(self._cleanup_runtime_config)
@@ -1447,12 +1447,16 @@ class RunAgentTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         self.assertNotIn("--agent", command)
         self.assertEqual(command[:3], [TRUE_BIN, "run", "--model"])
-        self.assertEqual(command[-2:], ["--", "instruction text"])
-        runtime_config = pathlib.Path(environment["OPENCODE_CONFIG"])
-        self.assertEqual(
-            json.loads(runtime_config.read_text(encoding="utf-8"))["default_agent"],
-            "notify-free",
+        self.assertEqual(command[-3], "test/model")
+        self.assertEqual(command[-2], "--")
+        self.assertIn("instruction text", command[-1])
+        self.assertIn("You are the notification agent.", command[-1])
+        runtime_config = json.loads(
+            pathlib.Path(environment["OPENCODE_CONFIG"]).read_text(encoding="utf-8")
         )
+        self.assertNotIn("default_agent", runtime_config)
+        self.assertNotIn("agent", runtime_config)
+        self.assertNotIn("mcp", runtime_config)
 
     def test_content_flag_is_not_exported_for_an_allowing_target(self) -> None:
         env = dict(self.env)

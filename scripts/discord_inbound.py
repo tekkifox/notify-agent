@@ -2088,18 +2088,17 @@ _RUNTIME_CONFIG_LOCK = threading.Lock()
 
 
 def _runtime_config_for(agent: str) -> str | None:
-    """Return a temp config that makes *agent* the default agent.
+    """Return a temp config for free-model runs.
 
-    Only the free-model agent path uses this: some OpenCode versions reject
-    custom ``--agent`` runs for opencode/zen free models with "Free usage
-    limit reached" while the same model works without ``--agent``. Selecting
-    the agent via ``default_agent`` preserves its prompt, permissions, steps
-    and MCP access. The full (default) prompt path keeps explicit ``--agent``.
+    Free-mode runs use a plain OpenCode invocation without custom agent context:
+    custom --agent/default_agent selections that load a custom agent definition
+    can hit free-tier limits for opencode/iceman-free even when a plain run with
+    the same model succeeds. Strip custom agents and MCP servers from the
+    runtime config and run without --agent; the caller injects the short
+    notify prompt into the instruction.
 
-    For free mode, also strip MCP servers and deny MCP tool permissions to
-    reduce context overhead that can trigger free-tier limits for Iceman Free.
-    Prefetched data is injected into the instruction so the agent does not
-    need MCP tools.
+    The full (default) prompt path keeps explicit ``--agent`` and the normal
+    config.
     """
 
     if agent != "notify-free":
@@ -2117,25 +2116,9 @@ def _runtime_config_for(agent: str) -> str | None:
                 data = json.load(handle)
             if not isinstance(data, dict):
                 return None
-            data["default_agent"] = agent
-            # Strip MCP servers for free mode to reduce context overhead.
-            mcp = data.get("mcp")
-            if isinstance(mcp, dict):
-                mcp.pop("servers", None)
-            agents = data.get("agent")
-            if isinstance(agents, dict):
-                agent_def = agents.get(agent)
-                if isinstance(agent_def, dict):
-                    perm = agent_def.get("permission")
-                    if isinstance(perm, dict):
-                        for tool in (
-                            "oracle_query",
-                            "oracle_search_content",
-                            "ssh_probe",
-                            "bookstack_search",
-                            "bookstack_read",
-                        ):
-                            perm[tool] = "deny"
+            data.pop("default_agent", None)
+            data.pop("agent", None)
+            data.pop("mcp", None)
             fd, path = tempfile.mkstemp(
                 prefix="notify-opencode-", suffix=".json"
             )
@@ -2146,6 +2129,23 @@ def _runtime_config_for(agent: str) -> str | None:
             return path
         except Exception:
             return None
+
+
+_FREE_PROMPT_CACHE: str | None = None
+
+
+def _free_prompt_preamble() -> str:
+    """Return the notify-free prompt text for plain free-mode runs."""
+
+    global _FREE_PROMPT_CACHE
+    if _FREE_PROMPT_CACHE is not None:
+        return _FREE_PROMPT_CACHE
+    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "notify-free.md"
+    try:
+        _FREE_PROMPT_CACHE = prompt_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        _FREE_PROMPT_CACHE = ""
+    return _FREE_PROMPT_CACHE
 
 
 def _deliver_busy_line(config: Config, chosen: InboundSource) -> bool:
@@ -2200,14 +2200,19 @@ def _run_agent_once(
     effective_model = model if model is not None else config.opencode_model
 
     runtime_config = _runtime_config_for(config.prompt_agent)
+    effective_instruction = instruction
+    if config.prompt_agent == "notify-free":
+        preamble = _free_prompt_preamble()
+        if preamble:
+            effective_instruction = f"{preamble}\n\n---\n\n{instruction}"
 
     command = [config.opencode_bin, "run"]
     if os.environ.get("NOTIFY_DEBUG_LLM") == "1":
         # Explicitly requested for one debugging run: provider-level detail.
         # It is far too verbose to enable by default.
         command.extend(["--print-logs", "--log-level", "debug"])
-    if runtime_config:
-        command.extend(["--model", effective_model, "--", instruction])
+    if config.prompt_agent == "notify-free":
+        command.extend(["--model", effective_model, "--", effective_instruction])
     else:
         command.extend(
             [
@@ -2216,7 +2221,7 @@ def _run_agent_once(
                 "--model",
                 effective_model,
                 "--",
-                instruction,
+                effective_instruction,
             ]
         )
 
