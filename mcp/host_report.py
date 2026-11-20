@@ -37,7 +37,7 @@ the date is today, or as the date and time when it differs from today, in
 
 Flagging follows sustained signals only. CPU and load peaks are reported as
 context but never cause a flag by themselves: a host is flagged for stale data
-(no sample in 20 minutes), average CPU >= 60%, average memory >= 85%, disk >=
+(no sample in 20 minutes), average CPU > 80%, average memory >= 85%, disk >=
 95%, or load peak >= twice the host's core count when core count is known.
 
 The prompt asks the agent to run one aggregate SQL query and then render the
@@ -67,10 +67,11 @@ STALE_MINUTES = 20
 #: How much history the report covers.
 WINDOW_HOURS = 24
 
-#: Inclusive sustained-signal thresholds. Exactly at the boundary is a problem.
+#: Sustained-signal thresholds. CPU is flagged only when the average is over
+#: 80%. Memory, disk and load peak (relative to core count) are inclusive.
 #: CPU and load peaks are reported as context and are deliberately not
 #: thresholds on their own.
-CPU_AVG_PERCENT = 60.0
+CPU_AVG_PERCENT = 80.0
 MEMORY_PERCENT = 85.0
 DISK_PERCENT = 95.0
 
@@ -265,9 +266,9 @@ def _summarise(host: str, record: Mapping[str, Any] | None, *, now: datetime, st
 
     if summary.stale:
         summary.flags.append(f"STALE: no sample in the last {stale_minutes}m")
-    if summary.cpu_avg is not None and summary.cpu_avg >= CPU_AVG_PERCENT:
+    if summary.cpu_avg is not None and summary.cpu_avg > CPU_AVG_PERCENT:
         summary.flags.append(
-            f"CPU avg {_percent(summary.cpu_avg)} >= {CPU_AVG_PERCENT:.0f}%"
+            f"CPU avg {_percent(summary.cpu_avg)} > {CPU_AVG_PERCENT:.0f}%"
         )
     if summary.memory_avg is not None and summary.memory_avg >= MEMORY_PERCENT:
         avg_used = _average_memory_used_bytes(summary)

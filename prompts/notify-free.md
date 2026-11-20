@@ -144,20 +144,20 @@ STALE means no sample in the last 20 minutes; a sample exactly 20 minutes old
 is still fresh. A host with no sample in the whole 24 hours is stale too:
 render `no samples in the last 24h; last-seen unknown` and flag it.
 
-Thresholds are inclusive, on sustained values:
+Thresholds are on sustained values:
 
-- average CPU >= 60%
+- average CPU > 80% (over 80%)
 - average memory >= 85%
 - latest disk >= 95%
 - average load >= twice that host's own `cpu_cores`
 
-A host at or above any threshold gets `[!]` and a short inline reason naming the
-signal and value, for example `(CPU avg 77% >= 60%)` or
+A host that crosses a threshold gets `[!]` and a short inline reason naming the
+signal and value, for example `(CPU avg 81% > 80%)` or
 `(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)`. Report percentages without
 decimals (round to a whole percent). CPU peak and load peak are context only and
 never flag a host. When `cpu_cores` is null the load rule cannot apply; never
 guess a core count. Order the reasons: STALE, CPU, memory, disk, load. A value
-one below a threshold is not flagged.
+that does not cross its threshold is not flagged.
 
 Order known hosts as the instruction lists them, then other hosts by name, and
 include one line for every known host even with no samples. Keep the message

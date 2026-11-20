@@ -337,10 +337,11 @@ class ThresholdTests(unittest.TestCase):
         )
 
     def test_cpu_average_boundary(self) -> None:
-        self.assertIn("CPU avg 60% >= 60%", self.assert_flagged(cpu_avg=60.0))
-        text = self.assert_flagged(cpu_avg=59.9)
-        self.assertNotIn("CPU avg 60% >=", text)
+        self.assertIn("CPU avg 81% > 80%", self.assert_flagged(cpu_avg=81.0))
+        text = self.assert_flagged(cpu_avg=80.0)
+        self.assertNotIn("CPU avg", text.split("(", 1)[-1] if "(" in text else "")
         self.assertNotIn("[!]", text)
+        self.assertIn("0 flagged", text)
 
     def test_cpu_peak_alone_never_flags(self) -> None:
         text = self.assert_flagged(cpu_avg=20.0, cpu_peak=117.0)
@@ -396,7 +397,7 @@ class ThresholdTests(unittest.TestCase):
 
     def test_reason_text_uses_whole_percentages_gigabytes_and_cores(self) -> None:
         for values, reason in (
-            ({"cpu_avg": 76.7}, "(CPU avg 77% >= 60%)"),
+            ({"cpu_avg": 81.0}, "(CPU avg 81% > 80%)"),
             (
                 {"memory_avg": 88.0},
                 "(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)",
@@ -412,7 +413,7 @@ class ThresholdTests(unittest.TestCase):
 
     def test_flags_are_inline_and_marker_is_present(self) -> None:
         text = self.assert_flagged(
-            cpu_avg=61.0,
+            cpu_avg=81.0,
             cpu_peak=117.0,
             memory_avg=86.0,
             load_peak=4.5,
@@ -420,7 +421,7 @@ class ThresholdTests(unittest.TestCase):
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
-            "(CPU avg 61% >= 60%; memory 6.88 GB avg / 8.00 GB, 86% >= 85%; "
+            "(CPU avg 81% > 80%; memory 6.88 GB avg / 8.00 GB, 86% >= 85%; "
             "load peak 4.50 >= 4 (2x2 cores); disk 96% >= 95%)",
             text,
         )
@@ -429,7 +430,7 @@ class ThresholdTests(unittest.TestCase):
     def test_stale_still_comes_first(self) -> None:
         text = self.assert_flagged(age=30, cpu_avg=99.0)
         self.assertIn(
-            "(STALE: no sample in the last 20m; CPU avg 99% >= 60%)", text
+            "(STALE: no sample in the last 20m; CPU avg 99% > 80%)", text
         )
 
 
@@ -580,7 +581,7 @@ class ReadmeTests(unittest.TestCase):
         self.assertIn(text, README)
 
     def test_the_readme_states_the_sustained_rule(self) -> None:
-        self.assertIn("average CPU at or above 60 %", FLAT_README)
+        self.assertIn("average CPU over 80 %", FLAT_README)
         self.assertIn("average memory at or above 85 %", FLAT_README)
         self.assertIn("disk from the latest sample at or above 95 %", FLAT_README)
         self.assertIn(
