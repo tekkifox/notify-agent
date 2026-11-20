@@ -16,8 +16,7 @@ Designed for an unattended small VPS: Ubuntu 24.04, x86_64, 2 vCPU, 1.9 GB RAM, 
 | `Dockerfile` | Pinned OpenCode `2.3.2`, supercronic `0.2.51`, non-root uid `10001`. |
 | `.github/workflows/publish-image.yml` | Runs the test suites on pull requests; on `main`, builds and publishes `ghcr.io/tekkifox/notify-agent`, then asks the fleet's Ansible deploy seat to pull and recreate `photos-notify-agent` on `photos`. |
 | `compose.yaml` | One `agent` service with the hardened runtime posture, including the read-only schedule-file mount. |
-| `crontab` | Default supercronic schedules, mirroring `crontab.live`. Also the default host source for the mount; one line per schedule. |
-| `crontab.live` | Byte-for-byte mirror of the live operator schedule on the host. |
+| `crontab` | Default supercronic schedules. Also the default host source for the mount; one line per schedule. |
 | `scripts/notify.sh` | Deterministic delivery. No LLM. |
 | `scripts/run-prompt.sh` | Runs `opencode run` with the locked-down `notify` agent and captures the debug transcript. |
 | `scripts/discord_inbound.py` | Optional inbound listener: polls one or more Discord sources, authorises replies and runs the same agent once each. |
@@ -941,9 +940,9 @@ Both commands send to the real channel. There is no dry-run mode, because a fake
 
 The checked-in crontab carries the same four active schedules as the host: the 09:00 morning digest for `automations` (prefetches host statistics and SSH, always sends), the hourly minute-5 Vortex digest for `admin-chat`, the hourly minute-15 fleet digest for `automations` (sends only when a host is flagged or failed logins are reported), and the 08:00 standalone SSH report for `automations`. It also keeps commented examples to copy: a daily digest at 09:00, a Vortex-only digest at 09:00, a weekday end-of-day wrap-up, a weekly planning reminder, and a monthly maintenance note.
 
-`crontab` is the schedule baked into the image and the default host source for the mount; `crontab.live` is the byte-for-byte mirror of the live operator copy of what actually runs. Both carry the same four active lines. The live copy is deployed at `/home/ross/stacks/notify-agent/crontab` on the photos server, bind-mounted to `/app/crontab`, so editing the image's copy changes nothing on a running deployment. supercronic reads the file at startup, so a change needs a restart — run `docker exec notify-agent supercronic -test /app/crontab` first.
+`crontab` is the schedule baked into the image and the default host source for the mount. The live copy on a deployed host may be bind-mounted over `/app/crontab`, so editing the image's copy changes nothing on a running deployment. supercronic reads the file at startup, so a change needs a restart — run `docker exec notify-agent supercronic -test /app/crontab` first.
 
-To add a schedule, uncomment an example (or write your own line in the same shape) in the host file. The live file is the one on the host, bind-mounted read-only over `/app/crontab`; editing it needs a container restart, not an image rebuild and not a push through GitHub. Mirror the edit back into `crontab` and `crontab.live` so the repository keeps describing what runs.
+To add a schedule, uncomment an example (or write your own line in the same shape) in the host file. If the host file is bind-mounted read-only over `/app/crontab`, editing it needs a container restart, not an image rebuild and not a push through GitHub. Mirror the edit back into `crontab` so the repository keeps describing what runs.
 
 The image still ships `crontab` and compose uses it by default, so a fresh checkout works with `docker compose up` unchanged. To use an operator file, place it in the stack directory (for example `/srv/notify-agent/crontab`) and point `SCHEDULES_FILE` at it, either in `.env` beside `compose.yaml`:
 
@@ -1022,7 +1021,7 @@ the automations channel:
 
 This repository cannot make a new schedule live by itself: the schedule is the
 operator's host file (`SCHEDULES_FILE`, default `./crontab`). Add the line to
-that file, mirror it into the checked-in `crontab` and `crontab.live`, and
+that file, mirror it into the checked-in `crontab`, and
 restart the container. See [Morning digest](#morning-digest) for the
 Vortex-only `admin-chat` variant.
 

@@ -65,6 +65,10 @@ Optional flag guard:
                        script exits 0: a silent skip, not a failure. Unset or
                        any other value keeps the normal behaviour. Scheduled
                        digests set it so a run with nothing flagged cannot post.
+  NOTIFY_REQUIRE_FLAG_WHEN_FREE
+                       when set to exactly 1, applies the same guard only when
+                       NOTIFY_PROMPT_MODE is "free" (case-insensitive). Used to
+                       harden free-mode runs without changing other modes.
 
 Optional Discord attachments:
   NOTIFY_ATTACH_DIR    a directory of chart PNGs to upload with the message.

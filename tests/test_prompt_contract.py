@@ -32,7 +32,7 @@ RUN_PROMPT = (ROOT / "scripts" / "run-prompt.sh").read_text(encoding="utf-8")
 SSH_SERVER = ROOT / "mcp" / "ssh_probe.py"
 CRONTABS = {
     name: (ROOT / name).read_text(encoding="utf-8")
-    for name in ("crontab", "crontab.live")
+    for name in ("crontab",)
 }
 
 
@@ -801,13 +801,7 @@ class FleetDigestScheduleTests(unittest.TestCase):
                     with self.subTest(host=host):
                         self.assertNotIn(host, line)
 
-    def test_live_morning_digest_matches_the_template(self) -> None:
-        self.assertEqual(
-            self._schedule_line("crontab", "0 9 * * * ", "automations"),
-            self._schedule_line("crontab.live", "0 9 * * * ", "automations"),
-        )
-
-    def test_live_hourly_digests_stay_silent_unless_something_is_flagged(
+    def test_hourly_digests_stay_silent_unless_something_is_flagged(
         self,
     ) -> None:
         silence_rule = (
@@ -815,28 +809,31 @@ class FleetDigestScheduleTests(unittest.TestCase):
             "supplied statistics report failed logins; if neither, do not call "
             "notify.sh and do not reply: end the run silently with no output."
         )
-        for schedule, target in (
-            ("5 * * * * ", "admin-chat"),
-            ("15 * * * * ", "automations"),
-        ):
-            with self.subTest(schedule=schedule, target=target):
-                line = self._schedule_line("crontab.live", schedule, target)
-                self.assertIn("/app/scripts/run-prompt.sh", line)
-                self.assertIn(f"-t {target} ", line)
-                self.assertIn(silence_rule, line)
-                self.assertNotIn("If nothing is flagged", line)
+        for name in CRONTABS:
+            for schedule, target in (
+                ("5 * * * * ", "admin-chat"),
+                ("15 * * * * ", "automations"),
+            ):
+                with self.subTest(crontab=name, schedule=schedule, target=target):
+                    line = self._schedule_line(name, schedule, target)
+                    self.assertIn("/app/scripts/run-prompt.sh", line)
+                    self.assertIn(f"-t {target} ", line)
+                    self.assertIn(silence_rule, line)
+                    self.assertNotIn("If nothing is flagged", line)
 
     def test_the_admin_chat_hourly_job_reports_failed_logins(self) -> None:
-        line = self._schedule_line("crontab.live", "5 * * * * ", "admin-chat")
-        self.assertIn("failed logins", line)
-        self.assertIn("top three usernames", line)
-        self.assertIn("Never invent a username or a number", line)
-        self.assertIn(
-            "Call notify.sh only when at least one host is flagged or the "
-            "supplied statistics report failed logins",
-            line,
-        )
-        self.assertIn("if neither, do not call notify.sh", line)
+        for name in CRONTABS:
+            with self.subTest(crontab=name):
+                line = self._schedule_line(name, "5 * * * * ", "admin-chat")
+                self.assertIn("failed logins", line)
+                self.assertIn("top three usernames", line)
+                self.assertIn("Never invent a username or a number", line)
+                self.assertIn(
+                    "Call notify.sh only when at least one host is flagged or the "
+                    "supplied statistics report failed logins",
+                    line,
+                )
+                self.assertIn("if neither, do not call notify.sh", line)
 
     def test_no_scheduled_prompt_asks_for_a_reply(self) -> None:
         for name, text in CRONTABS.items():
@@ -911,11 +908,12 @@ class FlagGuardScheduleTests(unittest.TestCase):
                 self.assertNotIn("NOTIFY_REQUIRE_FLAG", line)
                 self.assertIn("NOTIFY_PREFETCH=host_stats,ssh", line)
 
-    def test_the_admin_chat_hourly_job_does_not_require_a_flag(self) -> None:
+    def test_the_admin_chat_hourly_job_does_not_require_a_flag_unconditionally(self) -> None:
         for name in CRONTABS:
             with self.subTest(crontab=name):
                 line = self._schedule_line(name, "5 * * * * ", "admin-chat")
-                self.assertNotIn("NOTIFY_REQUIRE_FLAG", line)
+                self.assertNotIn("NOTIFY_REQUIRE_FLAG=1", line)
+                self.assertIn("NOTIFY_REQUIRE_FLAG_WHEN_FREE=1", line)
 
     def test_the_prompt_says_the_boundary_refuses_a_message_with_no_flag(
         self,
