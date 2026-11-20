@@ -320,7 +320,19 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Report memory figures in gigabytes", FLAT_PROMPT)
         self.assertIn("Report percentages without decimals", FLAT_PROMPT)
         self.assertIn("formatted `d/m/Y H:i`", FLAT_PROMPT)
+        self.assertIn(
+            "Report CPU and load peaks as context but never flag on a peak alone",
+            FLAT_PROMPT,
+        )
         self.assertIn("STALE means no sample in the last 20 minutes, not 30", FLAT_PROMPT)
+        self.assertIn("average CPU >= 60%", FLAT_PROMPT)
+        self.assertIn("average memory >= 85%", FLAT_PROMPT)
+        self.assertIn("disk from the latest sample >= 95%", FLAT_PROMPT)
+        self.assertIn("load peak >= twice that host's own core count", FLAT_PROMPT)
+        self.assertNotIn(
+            "CPU peak 90%, memory average 90%, load peak 8, disk latest 90%",
+            FLAT_PROMPT,
+        )
         self.assertIn(
             "Order known hosts first, in the order the instruction lists them",
             FLAT_PROMPT,
@@ -433,17 +445,15 @@ class PromptContractTests(unittest.TestCase):
 
 
 class SustainedSignalRuleTests(unittest.TestCase):
-    """Rule 29 flags a host only on a sustained signal, never on a peak alone.
+    """Rule 29 flags a host only on a sustained signal.
 
-    The old rule flagged a host on a 90 % CPU peak, a 90 % memory average, an
-    absolute load peak of 8 and a 90 % disk reading. Those thresholds fired on
-    every host that spiked, so the rule now matches the crontab prompts:
-    average CPU, average memory, the latest disk reading, and average load
-    measured against the host's own core count.
+    CPU peak never flags. Load is flagged only when the load peak is at least
+    twice the host's core count (a cores-relative sustained-capacity signal).
+    Disk uses the latest sample. Memory and CPU use averages.
     """
 
-    #: Every parenthesised threshold in the prompt must be one of the four
-    #: sustained signals. A peak may appear as context, never as a reason.
+    #: Every parenthesised threshold in the prompt must be one of the sustained
+    #: signals. A CPU peak may appear as context, never as a reason.
     FLAG_REASON = re.compile(r"\(([^()]*>= [^()]*)\)")
     ALLOWED_REASON = re.compile(
         r"^(?:"
@@ -452,7 +462,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         r"|memory \d+(?:\.\d+)? GB avg, \d+% >= 85%"
         r"|memory \d+% >= 85%"
         r"|disk \d+% >= 95%"
-        r"|load avg \d+(?:\.\d+)? >= 2x\d+ cores?"
+        r"|load peak \d+(?:\.\d+)? >= \d+(?:\.\d+)? \(2x\d+ cores?\)"
         r")$"
     )
 
@@ -461,7 +471,7 @@ class SustainedSignalRuleTests(unittest.TestCase):
         self.assertIn("average memory >= 85%", FLAT_PROMPT)
         self.assertIn("disk from the latest sample >= 95%", FLAT_PROMPT)
         self.assertIn(
-            "average load >= twice that host's own core count", FLAT_PROMPT
+            "load peak >= twice that host's own core count", FLAT_PROMPT
         )
 
     def test_no_old_cpu_peak_threshold_survives(self) -> None:
@@ -470,37 +480,38 @@ class SustainedSignalRuleTests(unittest.TestCase):
         self.assertNotIn("CPU peak 117.0% >= 90%", FLAT_PROMPT)
 
     def test_no_absolute_load_peak_threshold_survives(self) -> None:
-        # `load avg 8.74 >= 2x2 cores` is allowed; a bare `>= 8` is not.
+        # `load peak 9.00 >= 8.00 (2x4 cores)` is allowed; a bare `>= 8` is not.
         self.assertNotRegex(
-            FLAT_PROMPT, r"load peak [\d.]+ >= [\d.]+(?![x\d])"
+            FLAT_PROMPT, r"load peak [\d.]+ >= [\d.]+(?![.\d]* \()"
         )
         self.assertNotRegex(
             FLAT_PROMPT, r"load avg [\d.]+ >= [\d.]+(?![x\d])"
         )
 
-    def test_no_flag_reason_is_a_peak_alone(self) -> None:
+    def test_no_flag_reason_is_a_cpu_peak(self) -> None:
         reasons = self.FLAG_REASON.findall(PROMPT)
         self.assertTrue(reasons)
         for reason in reasons:
             with self.subTest(reason=reason):
                 self.assertRegex(reason, self.ALLOWED_REASON)
         self.assertNotIn("(CPU peak", FLAT_PROMPT)
-        self.assertNotIn("(load peak", FLAT_PROMPT)
 
     def test_flag_reasons_are_the_documented_examples(self) -> None:
         for reason in (
             "(CPU avg 77% >= 60%)",
             "(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)",
             "(disk 95% >= 95%)",
-            "(load avg 8.74 >= 2x2 cores)",
+            "(load peak 9.00 >= 8.00 (2x4 cores))",
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, FLAT_PROMPT)
 
     def test_the_load_test_uses_the_host_core_count(self) -> None:
-        self.assertIn("average load >= twice that host's own core count", FLAT_PROMPT)
         self.assertIn(
-            "compares the average load with twice the core count from `cpu_cores`",
+            "load peak >= twice that host's own core count", FLAT_PROMPT
+        )
+        self.assertIn(
+            "compares the load peak with twice the core count from `cpu_cores`",
             FLAT_PROMPT,
         )
         self.assertIn(
@@ -513,22 +524,19 @@ class SustainedSignalRuleTests(unittest.TestCase):
 
     def test_peaks_are_context_only(self) -> None:
         self.assertIn(
-            "CPU peak and load peak are context, never a flag on their own",
+            "CPU and load peaks are reported as context but never cause a flag by themselves",
             FLAT_PROMPT,
         )
-        self.assertIn("a CPU peak never flags a host", FLAT_PROMPT)
-        self.assertIn("a load peak never flags one either", FLAT_PROMPT)
 
-    def test_reason_order_is_stale_cpu_memory_disk_load(self) -> None:
+    def test_reason_order_is_stale_cpu_memory_load_disk(self) -> None:
         self.assertIn(
-            "STALE, then average CPU, memory, disk, load", FLAT_PROMPT
+            "STALE, then average CPU, memory, load, disk", FLAT_PROMPT
         )
         self.assertNotIn("STALE, then CPU, memory, load, disk", FLAT_PROMPT)
 
-    def test_worked_example_flags_the_average_not_the_peak(self) -> None:
-        self.assertIn("(load avg 8.74 >= 2x2 cores)", FLAT_PROMPT)
+    def test_worked_example_flags_load_peak_not_cpu_peak(self) -> None:
+        self.assertIn("(load peak 9.50 >= 4 (2x2 cores))", FLAT_PROMPT)
         self.assertIn("load 8.74 avg / 9.50 peak", FLAT_PROMPT)
-        self.assertNotIn("(load peak", FLAT_PROMPT)
         self.assertNotIn("(CPU peak", FLAT_PROMPT)
 
 
@@ -739,30 +747,31 @@ class FleetDigestScheduleTests(unittest.TestCase):
                     line,
                 )
 
-    def test_sustained_signal_rule_is_averages_only(self) -> None:
+    def test_sustained_signal_rule_is_documented(self) -> None:
         for label, line in self._digest_lines():
             with self.subTest(schedule=label):
                 self.assertIn("average CPU >= 60", line)
                 self.assertIn("average memory >= 85", line)
                 self.assertIn("disk >= 95", line)
                 self.assertIn(
-                    "average load >= twice that host's own core count", line
+                    "load peak >= twice the host's core count", line
                 )
-                self.assertIn("Decide every flag from the averages", line)
                 self.assertIn(
-                    "never flag a host because of a peak", line
+                    "Report CPU and load peaks as context but never flag on a peak alone",
+                    line,
                 )
-                self.assertNotIn("load peak >=", line)
                 self.assertIn("Report memory figures in gigabytes", line)
                 self.assertIn("Report percentages without decimals", line)
 
-    def test_no_crontab_rule_flags_on_a_peak(self) -> None:
-        """A peak may be context, never a flag condition or an old rule."""
+    def test_no_crontab_rule_flags_on_a_cpu_peak(self) -> None:
+        """CPU peak is never a flag condition; load peak flags only vs cores."""
         for name, text in CRONTABS.items():
             for number, line in enumerate(text.splitlines(), 1):
                 with self.subTest(crontab=name, line=number):
-                    self.assertNotIn("peak >=", line)
-                    self.assertNotIn("never flag on a peak alone", line)
+                    self.assertNotIn("CPU peak >=", line)
+                    # Cores-relative load peak flagging is allowed.
+                    if "load peak >=" in line:
+                        self.assertIn("core", line)
 
     def test_morning_digest_keeps_its_character_limit(self) -> None:
         line = self._schedule_line("crontab", "0 9 * * * ", "automations")

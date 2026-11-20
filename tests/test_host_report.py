@@ -2,8 +2,8 @@
 """Formatting tests for mcp/host_report.py.
 
 No database is used. The module is a pure formatter, carried over from the old
-``tools/host-report`` service, so ordering, the stale boundary, every threshold
-and the truncation notice are testable with plain dictionaries.
+``tools/host-report`` service, so ordering, the stale boundary, sustained-signal
+thresholds and the truncation notice are testable with plain dictionaries.
 
 Run with:
     python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -139,12 +139,13 @@ class ShapeTests(unittest.TestCase):
     def test_rows_from_oracle_payload(self) -> None:
         rows = host_report.rows_from_oracle(
             {
-                "columns": ["HOST_LABEL", "SAMPLE_COUNT", "LAST_SEEN"],
-                "rows": [["host1.example.com", 3, at(5)]],
+                "columns": ["HOST_LABEL", "SAMPLE_COUNT", "LAST_SEEN", "CPU_CORES"],
+                "rows": [["host1.example.com", 3, at(5), 4]],
             }
         )
         self.assertEqual(rows[0]["host_label"], "host1.example.com")
         self.assertEqual(rows[0]["sample_count"], 3)
+        self.assertEqual(rows[0]["cpu_cores"], 4)
 
 
 class SnapshotFigureTests(unittest.TestCase):
@@ -324,22 +325,29 @@ class StaleTests(unittest.TestCase):
 
 
 class ThresholdTests(unittest.TestCase):
-    """Only sustained signals flag a host; a peak never does, including the
-    load peak, which is compared as an average against the host's own cores."""
+    """Only sustained signals flag a host. CPU and load peaks are reported as
+    context but never flag by themselves; load is flagged only when the load
+    peak is at least twice the host's core count."""
 
     def assert_flagged(self, **values) -> str:
-        text = host_report.build_report(
+        return host_report.build_report(
             [row("host1.example.com", **values)],
             now=NOW,
             known_hosts=("host1.example.com",),
         )
-        return text
 
     def test_cpu_average_boundary(self) -> None:
         self.assertIn("CPU avg 60% >= 60%", self.assert_flagged(cpu_avg=60.0))
         text = self.assert_flagged(cpu_avg=59.9)
         self.assertNotIn("CPU avg 60% >=", text)
         self.assertNotIn("[!]", text)
+
+    def test_cpu_peak_alone_never_flags(self) -> None:
+        text = self.assert_flagged(cpu_avg=20.0, cpu_peak=117.0)
+        self.assertNotIn("[!]", text)
+        self.assertIn("0 flagged", text)
+        self.assertNotIn("CPU peak 117", text.split(" (", 1)[-1] if " (" in text else "")
+        self.assertIn("CPU 20% avg / 117% peak", text)
 
     def test_memory_average_boundary(self) -> None:
         self.assertIn(
@@ -358,48 +366,35 @@ class ThresholdTests(unittest.TestCase):
         # photos sat at 84.8%; a host there must not be flagged.
         text = self.assert_flagged(disk=84.8)
         self.assertNotIn("disk 85% >=", text)
+        self.assertNotIn("disk 95% >=", text)
         self.assertNotIn("[!]", text)
 
-    def test_load_average_boundary_is_twice_the_core_count(self) -> None:
-        text = self.assert_flagged(cpu_cores=2, load_avg=4.0)
-        self.assertIn("load avg 4.00 >= 2x2 cores", text)
-        below = self.assert_flagged(cpu_cores=2, load_avg=3.99)
-        self.assertNotIn("load avg 3.99 >=", below)
+    def test_load_peak_boundary_is_twice_the_core_count(self) -> None:
+        text = self.assert_flagged(cpu_cores=2, load_avg=1.0, load_peak=4.0)
+        self.assertIn("load peak 4.00 >= 4 (2x2 cores)", text)
+        below = self.assert_flagged(cpu_cores=2, load_peak=3.99)
+        self.assertNotIn("load peak 3.99 >=", below)
         self.assertNotIn("[!]", below)
 
     def test_a_bigger_host_gets_a_bigger_load_threshold(self) -> None:
-        # The same average load is a flag on 2 cores and fine on 4.
+        # The same load peak is a flag on 2 cores and fine on 4.
         self.assertIn(
-            "load avg 7.00 >= 2x2 cores",
-            self.assert_flagged(cpu_cores=2, load_avg=7.0),
+            "load peak 7.00 >= 4 (2x2 cores)",
+            self.assert_flagged(cpu_cores=2, load_peak=7.0),
         )
-        self.assertNotIn("[!]", self.assert_flagged(cpu_cores=4, load_avg=7.0))
+        self.assertNotIn("[!]", self.assert_flagged(cpu_cores=4, load_peak=7.0))
         self.assertIn(
-            "load avg 8.00 >= 2x4 cores",
-            self.assert_flagged(cpu_cores=4, load_avg=8.0),
+            "load peak 8.00 >= 8 (2x4 cores)",
+            self.assert_flagged(cpu_cores=4, load_peak=8.0),
         )
 
-    def test_a_huge_load_peak_with_a_modest_average_never_flags(self) -> None:
-        # The reboot burst that started this rule: 27.18 on 8 cores was a peak.
-        text = self.assert_flagged(
-            cpu_cores=8, load_avg=1.5, load_peak=27.18
-        )
+    def test_load_peak_never_flags_without_a_core_count(self) -> None:
+        text = self.assert_flagged(cpu_cores=None, load_peak=99.0)
+        self.assertNotIn("load peak 99.00 >=", text)
         self.assertNotIn("[!]", text)
-        self.assertNotIn("load avg 1.50 >=", text)
-        self.assertIn("load 1.50 avg / 27.18 peak", text)
+        self.assertIn("load 1.00 avg / 99.00 peak", text)
 
-    def test_load_never_flags_without_a_core_count(self) -> None:
-        text = self.assert_flagged(cpu_cores=None, load_avg=99.0)
-        self.assertNotIn("load avg 99.00 >=", text)
-        self.assertNotIn("[!]", text)
-
-    def test_cpu_peak_is_context_and_never_flags(self) -> None:
-        text = self.assert_flagged(cpu_avg=10.0, cpu_peak=437.0)
-        self.assertNotIn("[!]", text)
-        self.assertNotIn("CPU peak", text.split(" (", 1)[-1] if " (" in text else "")
-        self.assertIn("CPU 10% avg / 437% peak", text)
-
-    def test_reason_text_uses_whole_percentages_and_gigabytes(self) -> None:
+    def test_reason_text_uses_whole_percentages_gigabytes_and_cores(self) -> None:
         for values, reason in (
             ({"cpu_avg": 76.7}, "(CPU avg 77% >= 60%)"),
             (
@@ -408,8 +403,8 @@ class ThresholdTests(unittest.TestCase):
             ),
             ({"disk": 95.4}, "(disk 95% >= 95%)"),
             (
-                {"cpu_cores": 2, "load_avg": 8.74},
-                "(load avg 8.74 >= 2x2 cores)",
+                {"cpu_cores": 2, "load_peak": 8.74},
+                "(load peak 8.74 >= 4 (2x2 cores))",
             ),
         ):
             with self.subTest(reason=reason):
@@ -418,16 +413,18 @@ class ThresholdTests(unittest.TestCase):
     def test_flags_are_inline_and_marker_is_present(self) -> None:
         text = self.assert_flagged(
             cpu_avg=61.0,
+            cpu_peak=117.0,
             memory_avg=86.0,
-            load_avg=4.5,
+            load_peak=4.5,
             disk=96.0,
         )
         self.assertIn("- [!] host1.example.com:", text)
         self.assertIn(
             "(CPU avg 61% >= 60%; memory 6.88 GB avg / 8.00 GB, 86% >= 85%; "
-            "disk 96% >= 95%; load avg 4.50 >= 2x2 cores)",
+            "load peak 4.50 >= 4 (2x2 cores); disk 96% >= 95%)",
             text,
         )
+        self.assertNotIn("CPU peak 117% >=", text)
 
     def test_stale_still_comes_first(self) -> None:
         text = self.assert_flagged(age=30, cpu_avg=99.0)
@@ -587,12 +584,9 @@ class ReadmeTests(unittest.TestCase):
         self.assertIn("average memory at or above 85 %", FLAT_README)
         self.assertIn("disk from the latest sample at or above 95 %", FLAT_README)
         self.assertIn(
-            "average load at or above twice that host's own core count",
-            FLAT_README,
+            "load peak at or above twice the host's core count", FLAT_README
         )
-        self.assertIn(
-            "CPU peak and load peak are context and never flag a host", FLAT_README
-        )
+        self.assertIn("CPU peak is never a flag", FLAT_README)
         self.assertIn("memory in gigabytes", FLAT_README.lower())
         self.assertIn("percentages without decimals", FLAT_README.lower())
         self.assertIn("d/m/Y H:i", FLAT_README)

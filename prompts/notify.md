@@ -164,7 +164,8 @@ Morning digest:
 
     **Host report** — dd/mm/YYYY HH:MM UTC
     N/M hosts reported, S stale, F flagged
-    - [!] host1.example.com: 53 samples, last-seen 08:56; 2 cores; CPU 45% avg / 117% peak; mem 1.81 GB avg / 8.00 GB; load 8.74 avg / 9.50 peak; disk 31%; SSH ok (42 ms) (load avg 8.74 >= 2x2 cores)
+    - [!] host1.example.com: 53 samples, last-seen 08:56; 2 cores; CPU 45% avg / 117% peak; mem 1.81 GB avg / 8.00 GB; load 8.74 avg / 9.50 peak; disk 31%; SSH ok (42 ms) (load peak 9.50 >= 4 (2x2 cores))
+    - host2.example.com: 46 samples, last-seen 08:57; 2 cores; CPU 23% avg / 28% peak; mem 2.45 GB avg / 8.00 GB; load 0.23 avg / 0.28 peak; disk 80%; SSH auth_refused (authentication refused)
 
     The header line is the UTC date and time of this run, formatted
     `d/m/Y H:i`. The summary line counts all hosts in the report, including
@@ -191,7 +192,8 @@ Morning digest:
     `logins: n/a`; when the day's total is null write `today: n/a`. When the
     last-hour user breakdown is null, give the count without a user list.
     Never invent a number or a username that is not in the data. Keep the
-    asymmetries: disk is latest only and load has both average and peak. Do not
+    asymmetries: disk is latest only and load has both average and peak. Report
+    CPU and load peaks as context but never flag on a peak alone. Do not
     average everything just because it is tidier.
 27. Use one aggregate query over `NOTIFY_RO.HOST_STATS_V` for the last 24
     hours. Return `host_label`, `sample_count`, `last_seen`, `cpu_cores`,
@@ -222,21 +224,21 @@ Morning digest:
     nothing in the whole 24-hour window is stale too; render it as
     `no samples in the last 24h; last-seen unknown` and flag it. A sample
     exactly 20 minutes old is still fresh; stale means older than 20 minutes.
-29. Thresholds are inclusive and exact, and every one of them is a sustained
-    signal: average CPU >= 60%, average memory >= 85%, disk from the latest
-    sample >= 95%, or average load >= twice that host's own core count, judged
-    from the average load over the window. A host at or above any of them gets
-    a `[!]` marker and an inline reason naming the signal and the value. Report
-    percentages without decimals (round to a whole percent), for example
-    `(CPU avg 77% >= 60%)`, `(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)`,
-    `(disk 95% >= 95%)`, or `(load avg 8.74 >= 2x2 cores)`. CPU peak and load
-    peak are context, never a flag on their own: a CPU peak never flags a host,
-    and a load peak never flags one either. The load test compares the average
-    load with twice the core count from `cpu_cores`, rendered as `2x2 cores`
-    for a 2-core host; when the core count is null the load rule cannot apply,
-    so the host is never flagged on load — do not guess or invent a core count.
-    Put the reasons after the SSH text in this order: STALE, then average CPU,
-    memory, disk, load. A value one below a threshold is not flagged.
+29. Flag stale hosts and, for the rest, only sustained signals. The
+    thresholds are inclusive and exact: average CPU >= 60%, average memory >=
+    85%, disk from the latest sample >= 95%, or load peak >= twice that host's
+    own core count when core count is known. CPU and load peaks are reported as
+    context but never cause a flag by themselves. A host at or above a sustained
+    threshold gets a `[!]` marker and an inline reason naming the signal and the
+    value. Report percentages without decimals (round to a whole percent), for
+    example `(CPU avg 77% >= 60%)`,
+    `(memory 7.04 GB avg / 8.00 GB, 88% >= 85%)`, `(disk 95% >= 95%)`, or
+    `(load peak 9.00 >= 8.00 (2x4 cores))`. The load test compares the load
+    peak with twice the core count from `cpu_cores`; when the core count is
+    null the load rule cannot apply, so the host is never flagged on load — do
+    not guess or invent a core count. Put the reasons after the SSH text in
+    this order: STALE, then average CPU, memory, load, disk. A value one below
+    a threshold is not flagged.
 30. Order known hosts first, in the order the instruction lists them, then any
     other hosts found in the data in name order. Never rely on the query's row
     order. Include a line for every known host, even one with no samples.
