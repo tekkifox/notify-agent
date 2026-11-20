@@ -766,6 +766,14 @@ send_composio() {
     esac
 }
 
+# Idempotent per-run delivery: the listener/runner sets NOTIFY_SEND_MARKER to a
+# path that is touched only on a confirmed 2xx send. A repeated notify.sh call
+# in the same run must not deliver again, so exit 0 without sending when the
+# marker already exists.
+if [ -n "${NOTIFY_SEND_MARKER:-}" ] && [ -f "$NOTIFY_SEND_MARKER" ]; then
+    exit 0
+fi
+
 if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
     if [ -n "$target_name" ]; then
         fail "a target was requested but DISCORD_WEBHOOK_URL is set; a webhook has no targets"
