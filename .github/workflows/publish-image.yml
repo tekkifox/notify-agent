@@ -177,6 +177,7 @@ jobs:
     needs: merge
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Join the tailnet
         uses: tailscale/github-action@v4
