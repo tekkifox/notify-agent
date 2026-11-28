@@ -656,8 +656,9 @@ the Vortex one. That isolation is the point of the change and is asserted in the
 tests.
 
 A wiki also holds deployment inventory (real hostnames, Composio connections,
-channel ids, the Auth0 wiring), so this is deliberately not a general wiki
-client. The target's `books` list names the only books that may be read.
+channel ids, the identity-provider wiring), so this is deliberately not a
+general wiki client. The target's `books` list names the only books that may
+be read.
 
 - Search is issued **per allowed book** (`/api/search/book/{id}`), so a page
   from another book is never fetched, let alone returned. Each result is
