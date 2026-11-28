@@ -9,9 +9,10 @@ because OpenCode names an MCP tool ``<server>_<tool>``:
 * ``read(page)`` fetches one page's text by page id or slug.
 
 A wiki also holds the deployment inventory (real hostnames, channel ids,
-connection ids, the Auth0 wiring). That content must stay unreachable, so this
-is not a general wiki client. Each run is pointed at one target's own instance
-and can see exactly the books named for that run and nothing else:
+connection ids, the identity-provider wiring). That content must stay
+unreachable, so this is not a general wiki client. Each run is pointed at one
+target's own instance and can see exactly the books named for that run and
+nothing else:
 
 * A page is read only after its ``book_id`` is checked against the allowlist.
 * Search is issued per allowed book (``/api/search/book/{id}``), so a result
